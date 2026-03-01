@@ -1,8 +1,9 @@
 // DOM Elements
 const statusIndicator = document.getElementById('statusIndicator');
+const statusIcon = document.getElementById('statusIcon');
 const statusText = document.getElementById('statusText');
 const strategyText = document.getElementById('strategyText');
-const connectBtn = document.getElementById('connectBtn');
+const progressCircle = document.getElementById('progressCircle');
 const minimizeBtn = document.getElementById('minimizeBtn');
 const closeBtn = document.getElementById('closeBtn');
 const platformBadge = document.getElementById('platformBadge');
@@ -14,16 +15,14 @@ const downloadPercent = document.getElementById('downloadPercent');
 const autostartToggle = document.getElementById('autostartToggle');
 const autoconnectToggle = document.getElementById('autoconnectToggle');
 const strategySelect = document.getElementById('strategySelect');
+const progressStatus = document.getElementById('progressStatus');
+const strategyStatus = document.getElementById('strategyStatus');
 
 // New UI elements
 const connectionTimer = document.getElementById('connectionTimer');
 const timerText = document.getElementById('timerText');
-const serviceBadges = document.getElementById('serviceBadges');
-const strategyProgress = document.getElementById('strategyProgress');
-const strategyProgressText = document.getElementById('strategyProgressText');
-const strategyProgressCount = document.getElementById('strategyProgressCount');
-const strategyProgressFill = document.getElementById('strategyProgressFill');
-const strategyProgressName = document.getElementById('strategyProgressName');
+const connectionTimerLarge = document.getElementById('connectionTimerLarge');
+const timerTextLarge = document.getElementById('timerTextLarge');
 const errorCard = document.getElementById('errorCard');
 const errorTitle = document.getElementById('errorTitle');
 const errorMessage = document.getElementById('errorMessage');
@@ -58,6 +57,7 @@ let logCount = 0;
 let domainsOpen = false;
 let customIncludeDomains = [];
 let customExcludeDomains = [];
+let menuOpen = false;
 
 // Update elements
 const updateBanner = document.getElementById('updateBanner');
@@ -81,12 +81,13 @@ async function init() {
   if (typeof window.api === 'undefined') {
     const statusTextEl = document.getElementById('statusText');
     const binaryTextEl = binaryStatus && binaryStatus.querySelector('.binary-text');
-    if (statusTextEl) statusTextEl.textContent = 'Ошибка: приложение не инициализировано';
+    if (statusTextEl) statusTextEl.textContent = 'Ошибка инициализации';
     if (binaryTextEl) binaryTextEl.textContent = 'Перезапустите приложение';
     return;
   }
   try {
     setupEventListeners();
+    ensureCardsInCorrectContainer();
     await Promise.race([
       Promise.all([
         loadSystemInfo(),
@@ -115,7 +116,7 @@ async function init() {
 function setupEventListeners() {
   minimizeBtn.addEventListener('click', () => window.api.minimizeWindow());
   closeBtn.addEventListener('click', () => window.api.closeWindow());
-  connectBtn.addEventListener('click', handleConnectClick);
+  statusIndicator.addEventListener('click', handleConnectClick);
   
   autostartToggle.addEventListener('change', async () => {
     await window.api.setAutoStart(autostartToggle.checked);
@@ -161,29 +162,149 @@ function setupEventListeners() {
     logsOpen = !logsOpen;
     logsBody.style.display = logsOpen ? 'block' : 'none';
     logsChevron.classList.toggle('open', logsOpen);
-    
+
     // Scroll to bottom when opening
     if (logsOpen) {
       logsList.scrollTop = logsList.scrollHeight;
     }
   });
+
+  // Hamburger menu
+  const hamburgerBtn = document.getElementById('hamburgerBtn');
+  const menuPanel = document.getElementById('menuPanel');
+  const menuOverlay = document.getElementById('menuOverlay');
+  const menuClose = document.getElementById('menuClose');
+  const menuContent = document.getElementById('menuContent');
+
+  if (hamburgerBtn && menuPanel) {
+    hamburgerBtn.addEventListener('click', openMenu);
+    menuClose.addEventListener('click', closeMenu);
+    menuOverlay.addEventListener('click', closeMenu);
+
+    // Keyboard support
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && menuOpen) {
+        closeMenu();
+      }
+    });
+  }
 }
+
+function openMenu() {
+  menuOpen = true;
+  const menuPanel = document.getElementById('menuPanel');
+  const menuOverlay = document.getElementById('menuOverlay');
+  const menuContent = document.getElementById('menuContent');
+  const menuClose = document.getElementById('menuClose');
+
+  menuPanel.classList.add('active');
+  menuOverlay.classList.add('active');
+  document.body.classList.add('menu-open');
+
+  // Move sections to menu on small screens (except settings-card which stays on main screen)
+  if (window.innerWidth <= 500) {
+    const domainsCard = document.querySelector('.domains-card');
+    const logsCard = document.querySelector('.logs-card');
+    const infoCard = document.querySelector('.info-card');
+
+    if (domainsCard) menuContent.appendChild(domainsCard);
+    if (logsCard) menuContent.appendChild(logsCard);
+    if (infoCard) menuContent.appendChild(infoCard);
+  }
+
+  // Focus management
+  if (menuClose) menuClose.focus();
+}
+
+function closeMenu() {
+  menuOpen = false;
+  const menuPanel = document.getElementById('menuPanel');
+  const menuOverlay = document.getElementById('menuOverlay');
+  const hamburgerBtn = document.getElementById('hamburgerBtn');
+
+  menuPanel.classList.remove('active');
+  menuOverlay.classList.remove('active');
+  document.body.classList.remove('menu-open');
+
+  // Move sections back to main content (except settings-card which stays on main screen)
+  if (window.innerWidth <= 500) {
+    const contentScroll = document.querySelector('.content-scroll');
+    const domainsCard = document.querySelector('.domains-card');
+    const logsCard = document.querySelector('.logs-card');
+    const infoCard = document.querySelector('.info-card');
+
+    if (contentScroll && domainsCard) contentScroll.appendChild(domainsCard);
+    if (contentScroll && logsCard) contentScroll.appendChild(logsCard);
+    if (contentScroll && infoCard) contentScroll.appendChild(infoCard);
+  }
+
+  // Return focus to hamburger button
+  if (hamburgerBtn) hamburgerBtn.focus();
+}
+
+// Ensure cards are in the correct container based on screen size
+function ensureCardsInCorrectContainer() {
+  const contentScroll = document.querySelector('.content-scroll');
+  const menuContent = document.getElementById('menuContent');
+  const settingsCard = document.querySelector('.settings-card');
+  const domainsCard = document.querySelector('.domains-card');
+  const logsCard = document.querySelector('.logs-card');
+  const infoCard = document.querySelector('.info-card');
+
+  if (window.innerWidth > 500) {
+    // On larger screens, cards should be in main content (settings-card always stays in main content)
+    if (contentScroll && settingsCard && !contentScroll.contains(settingsCard)) {
+      contentScroll.appendChild(settingsCard);
+    }
+    if (contentScroll && domainsCard && !contentScroll.contains(domainsCard)) {
+      contentScroll.appendChild(domainsCard);
+    }
+    if (contentScroll && logsCard && !contentScroll.contains(logsCard)) {
+      contentScroll.appendChild(logsCard);
+    }
+    if (contentScroll && infoCard && !contentScroll.contains(infoCard)) {
+      contentScroll.appendChild(infoCard);
+    }
+  } else {
+    // On small screens, ensure settings-card stays in main content
+    if (contentScroll && settingsCard && !contentScroll.contains(settingsCard)) {
+      contentScroll.appendChild(settingsCard);
+    }
+  }
+}
+
+// Handle window resize
+window.addEventListener('resize', () => {
+  if (window.innerWidth > 500 && menuOpen) {
+    closeMenu();
+  }
+  ensureCardsInCorrectContainer();
+});
 
 async function loadSystemInfo() {
   try {
     const info = await window.api.getSystemInfo();
-    
+
     const platformNames = {
       darwin: 'macOS',
       win32: 'Windows',
       linux: 'Linux'
     };
-    
-    platformBadge.textContent = platformNames[info.platform] || info.platform;
-    
+
+    const platformName = platformNames[info.platform] || info.platform;
+
+    // Update main footer
+    platformBadge.textContent = platformName;
+
     const versionEl = document.getElementById('versionText');
     if (versionEl && info.version) versionEl.textContent = `v${info.version}`;
-    
+
+    // Update menu footer
+    const platformBadgeMenu = document.getElementById('platformBadgeMenu');
+    const versionTextMenu = document.getElementById('versionTextMenu');
+    if (platformBadgeMenu) platformBadgeMenu.textContent = platformName;
+    if (versionTextMenu && info.version) versionTextMenu.textContent = `v${info.version}`;
+
     updateBinaryStatus(info.binaryExists);
   } catch (error) {
     // silently handle
@@ -263,50 +384,50 @@ async function loadLogs() {
 function handleStatusUpdate(status) {
   isConnected = status.connected;
   isDownloading = status.downloading;
-  
+
   // When backend confirms connected, clear local connecting state
   if (isConnected) {
     isConnecting = false;
   }
-  
+
   // Update status indicator
   statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error');
-  connectBtn.classList.remove('connected', 'connecting', 'downloading');
   statusText.classList.remove('error-text');
-  
+
+  // Update footer status
+  const footer = document.getElementById('footer');
+  footer.classList.remove('status-connected', 'status-connecting', 'status-searching', 'status-downloading', 'status-error');
+
   if (isDownloading) {
     statusIndicator.classList.add('downloading');
     statusText.textContent = 'Скачивание...';
-    connectBtn.classList.add('downloading');
-    connectBtn.querySelector('.btn-text').textContent = 'Скачивание...';
+    statusIndicator.setAttribute('aria-label', 'Скачивание...');
     downloadSection.style.display = 'block';
     updateBinaryStatus(false, true);
-    hideStrategyProgress();
+    hideStrategyToolbar();
     hideConnectionTimer();
-    hideServiceBadges();
+    footer.classList.add('status-downloading');
   } else if (status.searching) {
     statusIndicator.classList.add('searching');
     statusText.textContent = 'Поиск стратегии...';
-    connectBtn.classList.add('connecting');
-    connectBtn.querySelector('.btn-text').textContent = 'Поиск...';
+    statusIndicator.setAttribute('aria-label', 'Поиск стратегии...');
     downloadSection.style.display = 'none';
     hideConnectionTimer();
-    hideServiceBadges();
-    
-    // Show strategy progress
+    footer.classList.add('status-searching');
+
+    // Show strategy toolbar
     if (status.strategyProgress) {
-      showStrategyProgress(status.strategyProgress);
+      showStrategyToolbar(status.strategyProgress);
     }
   } else if (isConnected) {
     statusIndicator.classList.add('connected');
     statusText.textContent = 'Защита активна';
-    connectBtn.classList.add('connected');
-    connectBtn.querySelector('.btn-text').textContent = 'Отключить';
+    statusIndicator.setAttribute('aria-label', 'Отключить');
     downloadSection.style.display = 'none';
-    hideStrategyProgress();
+    hideStrategyToolbar();
     hideError();
-    showServiceBadges();
-    
+    footer.classList.add('status-connected');
+
     // Start connection timer
     if (status.connectedSince) {
       startConnectionTimer(status.connectedSince);
@@ -314,33 +435,31 @@ function handleStatusUpdate(status) {
   } else if (isConnecting) {
     statusIndicator.classList.add('connecting');
     statusText.textContent = 'Подключение...';
-    connectBtn.classList.add('connecting');
-    connectBtn.querySelector('.btn-text').textContent = 'Подключение...';
+    statusIndicator.setAttribute('aria-label', 'Подключение...');
     downloadSection.style.display = 'none';
     hideConnectionTimer();
-    hideServiceBadges();
+    footer.classList.add('status-connecting');
   } else {
     // Disconnected state
+    statusIndicator.setAttribute('aria-label', 'Подключить');
     downloadSection.style.display = 'none';
-    hideStrategyProgress();
+    hideStrategyToolbar();
     hideConnectionTimer();
-    hideServiceBadges();
-    
+
     // Check for errors
     if (status.error || status.errorCode) {
       statusIndicator.classList.add('error');
       statusText.textContent = 'Ошибка';
       statusText.classList.add('error-text');
-      connectBtn.querySelector('.btn-text').textContent = 'Подключить';
       showError(status.errorCode, status.error);
+      footer.classList.add('status-error');
     } else if (status.disconnectReason) {
       statusIndicator.classList.add('error');
       statusText.textContent = 'Отключено';
-      connectBtn.querySelector('.btn-text').textContent = 'Подключить';
       showDisconnectReason(status.disconnectReason);
+      footer.classList.add('status-error');
     } else {
       statusText.textContent = 'Отключено';
-      connectBtn.querySelector('.btn-text').textContent = 'Подключить';
     }
   }
   
@@ -359,20 +478,26 @@ function handleStatusUpdate(status) {
   }
 }
 
-// ============= Strategy Progress =============
+// ============= Strategy Toolbar =============
 
-function showStrategyProgress(progress) {
-  strategyProgress.style.display = 'block';
-  strategyProgressText.textContent = 'Тестирование стратегии...';
-  strategyProgressCount.textContent = `${progress.current}/${progress.total}`;
-  strategyProgressName.textContent = progress.name || '';
-  
-  const percent = Math.round((progress.current / progress.total) * 100);
-  strategyProgressFill.style.width = `${percent}%`;
+function showStrategyToolbar(progress) {
+  if (strategyStatus) {
+    strategyStatus.style.display = 'flex';
+    const statusText = strategyStatus.querySelector('.strategy-status-text');
+    if (statusText) {
+      if (progress.name) {
+        statusText.innerHTML = `Тест ${progress.current}/${progress.total} <span class="strategy-badge">${progress.name}</span>`;
+      } else {
+        statusText.textContent = `Тест ${progress.current}/${progress.total}`;
+      }
+    }
+  }
 }
 
-function hideStrategyProgress() {
-  strategyProgress.style.display = 'none';
+function hideStrategyToolbar() {
+  if (strategyStatus) {
+    strategyStatus.style.display = 'none';
+  }
 }
 
 // ============= Connection Timer =============
@@ -380,14 +505,16 @@ function hideStrategyProgress() {
 function startConnectionTimer(sinceTimestamp) {
   connectedSinceTime = sinceTimestamp;
   connectionTimer.style.display = 'flex';
+  connectionTimerLarge.style.display = 'flex';
   updateTimerDisplay();
-  
+
   if (timerInterval) clearInterval(timerInterval);
   timerInterval = setInterval(updateTimerDisplay, 1000);
 }
 
 function hideConnectionTimer() {
   connectionTimer.style.display = 'none';
+  connectionTimerLarge.style.display = 'none';
   if (timerInterval) {
     clearInterval(timerInterval);
     timerInterval = null;
@@ -397,23 +524,15 @@ function hideConnectionTimer() {
 
 function updateTimerDisplay() {
   if (!connectedSinceTime) return;
-  
+
   const elapsed = Math.floor((Date.now() - connectedSinceTime) / 1000);
   const hours = Math.floor(elapsed / 3600);
   const minutes = Math.floor((elapsed % 3600) / 60);
   const seconds = elapsed % 60;
-  
-  timerText.textContent = `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-}
 
-// ============= Service Badges =============
-
-function showServiceBadges() {
-  serviceBadges.style.display = 'flex';
-}
-
-function hideServiceBadges() {
-  serviceBadges.style.display = 'none';
+  const timeStr = `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  timerText.textContent = timeStr;
+  timerTextLarge.textContent = timeStr;
 }
 
 // ============= Error Display =============
@@ -488,6 +607,22 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+// ============= Progress Status =============
+
+function showProgressStatus(text = 'Обработка...') {
+  if (progressStatus) {
+    progressStatus.style.display = 'flex';
+    const progressText = progressStatus.querySelector('.progress-text');
+    if (progressText) progressText.textContent = text;
+  }
+}
+
+function hideProgressStatus() {
+  if (progressStatus) {
+    progressStatus.style.display = 'none';
+  }
+}
+
 // ============= Download Progress =============
 
 function handleDownloadProgress(progress) {
@@ -522,8 +657,7 @@ async function handleConnectClick() {
     statusIndicator.classList.add('connecting');
     statusText.textContent = 'Подключение...';
     statusText.classList.remove('error-text');
-    connectBtn.classList.add('connecting');
-    connectBtn.querySelector('.btn-text').textContent = 'Подключение...';
+    statusIndicator.setAttribute('aria-label', 'Подключение...');
     
     try {
       const result = await window.api.startProxy();
@@ -608,28 +742,32 @@ function handleUpdateDownloadProgress(progress) {
   updateBtn.style.display = 'none';
 }
 
-// Telegram link
 document.getElementById('updateHostsBtn')?.addEventListener('click', async () => {
-  const result = await window.api.updateHostsForDiscord();
-  if (result?.success) {
-    alert('Hosts обновлён. Перезапустите Discord при необходимости.');
-  } else {
-    alert('Ошибка: ' + (result?.error || 'неизвестная ошибка') + '\n\nРазрешите UAC, если запрос прав был отклонён.');
+  showProgressStatus('Обновление hosts...');
+  try {
+    const result = await window.api.updateHostsForDiscord();
+    hideProgressStatus();
+    if (result?.success) {
+      alert('Hosts обновлён. Перезапустите Discord при необходимости.');
+    } else {
+      alert('Ошибка: ' + (result?.error || 'неизвестная ошибка') + '\n\nРазрешите UAC, если запрос прав был отклонён.');
+    }
+  } catch (e) {
+    hideProgressStatus();
+    alert('Ошибка: ' + (e.message || 'неизвестная ошибка'));
   }
 });
 
 document.getElementById('clearDiscordCacheBtn')?.addEventListener('click', async () => {
-  await window.api.clearDiscordCache();
-  alert('Готово. Закройте Discord и запустите снова.');
-});
-
-document.getElementById('tgLink')?.addEventListener('click', (e) => {
-  e.preventDefault();
-  window.api.openExternal('https://t.me/bysonicx');
-});
-
-document.getElementById('promoBtn')?.addEventListener('click', () => {
-  window.api.openExternal('https://t.me/bysonicvpn_bot');
+  showProgressStatus('Очистка кэша...');
+  try {
+    await window.api.clearDiscordCache();
+    hideProgressStatus();
+    alert('Готово. Закройте Discord и запустите снова.');
+  } catch (e) {
+    hideProgressStatus();
+    alert('Ошибка: ' + (e.message || 'неизвестная ошибка'));
+  }
 });
 
 // ============= Custom Domains =============

@@ -15,6 +15,12 @@
         <span class="logo">U</span>
         UnblockPro
       </div>
+      <button class="hamburger-btn" id="hamburgerBtn" aria-label="Открыть меню">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+          <path d="M12 15a3 3 0 100-6 3 3 0 000 6z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
       <div class="window-controls">
         <button class="window-btn minimize" id="minimizeBtn" title="Свернуть">
           <svg width="12" height="12" viewBox="0 0 12 12">
@@ -40,84 +46,37 @@
       <button type="button" class="update-btn" id="updateBtn" title="Перезапустить для установки">Установить</button>
     </div>
 
-    <!-- SonicVPN promo (сверху — видят все) -->
-    <div class="promo-card" id="promoCard">
-      <div class="promo-badge">Рекомендуем</div>
-      <div class="promo-content">
-        <div class="promo-icon">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
-            <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z" stroke="url(#promoGrad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M9 12l2 2 4-4" stroke="url(#promoGrad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            <defs>
-              <linearGradient id="promoGrad" x1="3" y1="2" x2="21" y2="22" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#3b82f6"/>
-                <stop offset="1" stop-color="#06b6d4"/>
-              </linearGradient>
-            </defs>
-          </svg>
-        </div>
-        <div class="promo-text">
-          <div class="promo-title">SonicVPN</div>
-          <div class="promo-desc">Полная защита трафика с шифрованием. UnblockPro обходит блокировки, а VPN — шифрует всё соединение.</div>
-        </div>
-      </div>
-      <button type="button" class="promo-btn" id="promoBtn">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-          <path d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" stroke="currentColor" stroke-width="2"/>
-          <path d="M10 8l6 4-6 4V8z" fill="currentColor"/>
-        </svg>
-        Попробовать бесплатно
-      </button>
-    </div>
-
     <!-- Main content -->
     <div class="main-content">
+      <div class="content-scroll">
       <!-- Status section -->
       <div class="status-section">
-        <div class="status-indicator" id="statusIndicator">
+        <button class="status-indicator" id="statusIndicator" aria-label="Подключить">
+          <svg class="status-progress-ring" viewBox="0 0 130 130">
+            <circle class="status-progress-bg" cx="65" cy="65" r="60" />
+            <circle class="status-progress-bar" cx="65" cy="65" r="60" id="progressCircle" />
+          </svg>
           <div class="status-ring">
-            <div class="status-dot"></div>
+            <div class="status-dot">
+              <svg class="status-icon" id="statusIcon" width="32" height="32" viewBox="0 0 24 24" fill="none">
+                <path d="M5 12.55a11 11 0 0114.08 0M8.5 16.5a6 6 0 017 0M12 20h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
           </div>
           <div class="status-pulse"></div>
-        </div>
+        </button>
         <div class="status-text" id="statusText">Отключено</div>
         <div class="status-strategy" id="strategyText"></div>
-        <!-- Connection timer -->
-        <div class="connection-timer" id="connectionTimer" style="display: none;">
+        <!-- Connection timer (large screens) -->
+        <div class="connection-timer connection-timer-large" id="connectionTimerLarge" style="display: none;">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
             <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
             <path d="M12 6v6l4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
-          <span id="timerText">0:00:00</span>
-        </div>
-        <!-- Service badges -->
-        <div class="service-badges" id="serviceBadges" style="display: none;">
-          <span class="service-badge discord">
-            <svg width="16" height="12" viewBox="0 0 71 55" fill="currentColor">
-              <path d="M60.1 4.9A58.5 58.5 0 0045.4.2a.2.2 0 00-.2.1 40.8 40.8 0 00-1.8 3.7 54 54 0 00-16.2 0A37.4 37.4 0 0025.4.3a.2.2 0 00-.2-.1A58.4 58.4 0 0010.5 5a.2.2 0 00-.1 0C1.5 18.7-.9 32 .3 45.2v.1a58.7 58.7 0 0017.7 9 .2.2 0 00.3-.1 42 42 0 003.6-5.9.2.2 0 00-.1-.3 38.7 38.7 0 01-5.5-2.6.2.2 0 01 0-.4l1.1-.9a.2.2 0 01.2 0 41.9 41.9 0 0035.6 0 .2.2 0 01.2 0l1.1.9a.2.2 0 010 .3 36.3 36.3 0 01-5.5 2.7.2.2 0 00-.1.3 47.2 47.2 0 003.6 5.9.2.2 0 00.3.1A58.5 58.5 0 0070.3 45.3v-.1C71.7 30.1 67.8 17 60.2 5a.2.2 0 000 0zM23.7 37.1c-3.5 0-6.4-3.2-6.4-7.1s2.8-7.1 6.4-7.1 6.5 3.2 6.4 7.1c0 3.9-2.8 7.1-6.4 7.1zm23.6 0c-3.5 0-6.4-3.2-6.4-7.1s2.8-7.1 6.4-7.1 6.5 3.2 6.4 7.1c0 3.9-2.9 7.1-6.4 7.1z"/>
-            </svg>
-            Discord
-          </span>
-          <span class="service-badge youtube">
-            <svg width="16" height="12" viewBox="0 0 24 18" fill="currentColor">
-              <path d="M23.5 2.8A3 3 0 0021.4.7C19.5.2 12 .2 12 .2S4.5.2 2.6.7A3 3 0 00.5 2.8 31.4 31.4 0 000 9a31.4 31.4 0 00.5 6.2A3 3 0 002.6 17.3c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 002.1-2.1A31.4 31.4 0 0024 9a31.4 31.4 0 00-.5-6.2zM9.6 12.8V5.2L15.8 9l-6.2 3.8z"/>
-            </svg>
-            YouTube
-          </span>
+          <span id="timerTextLarge">0:00:00</span>
         </div>
       </div>
 
-      <!-- Strategy progress -->
-      <div class="strategy-progress" id="strategyProgress" style="display: none;">
-        <div class="strategy-progress-header">
-          <span class="strategy-progress-text" id="strategyProgressText">Тестирование стратегии...</span>
-          <span class="strategy-progress-count" id="strategyProgressCount">0/0</span>
-        </div>
-        <div class="strategy-progress-bar">
-          <div class="strategy-progress-fill" id="strategyProgressFill"></div>
-        </div>
-        <div class="strategy-progress-name" id="strategyProgressName"></div>
-      </div>
 
       <!-- Error card -->
       <div class="error-card" id="errorCard" style="display: none;">
@@ -155,11 +114,6 @@
         </div>
         <div class="download-percent" id="downloadPercent">0%</div>
       </div>
-
-      <!-- Connect button -->
-      <button class="connect-btn" id="connectBtn">
-        <span class="btn-text">Подключить</span>
-      </button>
 
       <!-- Settings -->
       <div class="settings-card">
@@ -303,18 +257,63 @@
         </div>
       </div>
 
+      </div>
+    </div>
+
+    <!-- Strategy toolbar -->
+    <div class="strategy-toolbar" id="strategyToolbar" style="display: none;">
+      <span class="strategy-toolbar-text" id="strategyToolbarText">Тестирование стратегии...</span>
+      <span class="strategy-toolbar-info" id="strategyToolbarInfo"></span>
     </div>
 
     <!-- Footer -->
-    <div class="footer">
+    <div class="footer" id="footer">
+      <div class="status-group">
+        <div class="connection-timer" id="connectionTimer" style="display: none;">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2"/>
+            <path d="M12 6v6l4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <span id="timerText">0:00:00</span>
+        </div>
+        <div class="strategy-status" id="strategyStatus" style="display: none;">
+          <span class="strategy-dot"></span>
+          <span class="strategy-status-text">Тестирование...</span>
+        </div>
+        <div class="progress-status" id="progressStatus" style="display: none;">
+          <span class="progress-dot"></span>
+          <span class="progress-text">Обработка...</span>
+        </div>
+      </div>
       <div class="system-info" id="systemInfo">
         <span class="platform-badge" id="platformBadge">--</span>
         <span class="version" id="versionText">v1.1.0</span>
       </div>
-      <span class="credit">by sonic · <a href="#" id="tgLink" class="tg-link">Telegram</a></span>
       <div class="binary-status" id="binaryStatus">
         <span class="binary-dot"></span>
         <span class="binary-text">Проверка...</span>
+      </div>
+    </div>
+
+    <!-- Menu overlay -->
+    <div class="menu-overlay" id="menuOverlay"></div>
+
+    <!-- Slide-out menu -->
+    <div class="menu-panel" id="menuPanel">
+      <div class="menu-header">
+        <span class="menu-title">Настройки</span>
+        <button class="menu-close" id="menuClose" aria-label="Закрыть меню">
+          <svg width="16" height="16" viewBox="0 0 14 14">
+            <path d="M1 1L13 13M13 1L1 13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div class="menu-content" id="menuContent">
+        <!-- Sections will be moved here dynamically -->
+      </div>
+      <div class="menu-footer">
+        <span class="platform-badge" id="platformBadgeMenu">--</span>
+        <span class="version" id="versionTextMenu">v1.1.0</span>
       </div>
     </div>
   </div>
