@@ -268,6 +268,10 @@
 
     <!-- Footer -->
     <div class="footer" id="footer">
+      <div class="system-info" id="systemInfo">
+        <span class="platform-badge" id="platformBadge">--</span>
+        <span class="version" id="versionText">v1.1.0</span>
+      </div>
       <div class="status-group">
         <div class="connection-timer" id="connectionTimer" style="display: none;">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
@@ -275,6 +279,9 @@
             <path d="M12 6v6l4 2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
           <span id="timerText">0:00:00</span>
+        </div>
+        <div class="footer-strategy" id="footerStrategy" style="display: none;">
+          <span class="strategy-name" id="strategyName"></span>
         </div>
         <div class="strategy-status" id="strategyStatus" style="display: none;">
           <span class="strategy-dot"></span>
@@ -284,10 +291,6 @@
           <span class="progress-dot"></span>
           <span class="progress-text">Обработка...</span>
         </div>
-      </div>
-      <div class="system-info" id="systemInfo">
-        <span class="platform-badge" id="platformBadge">--</span>
-        <span class="version" id="versionText">v1.1.0</span>
       </div>
       <div class="binary-status" id="binaryStatus">
         <span class="binary-dot"></span>

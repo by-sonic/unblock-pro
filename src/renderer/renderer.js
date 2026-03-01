@@ -3,6 +3,8 @@ const statusIndicator = document.getElementById('statusIndicator');
 const statusIcon = document.getElementById('statusIcon');
 const statusText = document.getElementById('statusText');
 const strategyText = document.getElementById('strategyText');
+const footerStrategy = document.getElementById('footerStrategy');
+const strategyName = document.getElementById('strategyName');
 const progressCircle = document.getElementById('progressCircle');
 const minimizeBtn = document.getElementById('minimizeBtn');
 const closeBtn = document.getElementById('closeBtn');
@@ -421,7 +423,7 @@ function handleStatusUpdate(status) {
     }
   } else if (isConnected) {
     statusIndicator.classList.add('connected');
-    statusText.textContent = 'Защита активна';
+    statusText.textContent = 'Обход активен';
     statusIndicator.setAttribute('aria-label', 'Отключить');
     downloadSection.style.display = 'none';
     hideStrategyToolbar();
@@ -462,14 +464,27 @@ function handleStatusUpdate(status) {
       statusText.textContent = 'Отключено';
     }
   }
-  
+
   // Update strategy text
   if (status.strategy) {
-    strategyText.textContent = `Стратегия: ${status.strategy}`;
+    strategyText.innerHTML = `Стратегия: <span class="strategy-badge">${status.strategy}</span>`;
+    // Show strategy name in footer toolbar
+    if (footerStrategy && strategyName) {
+      strategyName.textContent = status.strategy;
+      footerStrategy.style.display = 'flex';
+    }
   } else if (status.strategyProgress && status.strategyProgress.name) {
     strategyText.textContent = '';
+    // Hide footer strategy during testing
+    if (footerStrategy) {
+      footerStrategy.style.display = 'none';
+    }
   } else {
     strategyText.textContent = '';
+    // Hide footer strategy when disconnected
+    if (footerStrategy) {
+      footerStrategy.style.display = 'none';
+    }
   }
   
   // Update binary status

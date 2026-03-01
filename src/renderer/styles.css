@@ -50,9 +50,18 @@ body {
   width: 100%;
   height: 100vh;
   background:
-    radial-gradient(ellipse at 20% 20%, rgba(59, 130, 246, 0.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 80%, rgba(99, 102, 241, 0.12) 0%, transparent 50%),
-    linear-gradient(135deg, #0a0f1a 0%, #1a1f2e 50%, #0f1419 100%);
+    radial-gradient(circle at 15% 15%, rgba(59, 130, 246, 0.2) 0%, transparent 40%),
+    radial-gradient(circle at 85% 20%, rgba(139, 92, 246, 0.15) 0%, transparent 45%),
+    radial-gradient(circle at 70% 85%, rgba(16, 185, 129, 0.12) 0%, transparent 40%),
+    radial-gradient(ellipse at 30% 70%, rgba(99, 102, 241, 0.1) 0%, transparent 50%),
+    repeating-linear-gradient(
+      45deg,
+      transparent,
+      transparent 100px,
+      rgba(59, 130, 246, 0.02) 100px,
+      rgba(59, 130, 246, 0.02) 200px
+    ),
+    linear-gradient(135deg, #0a0f1a 0%, #1a1f2e 30%, #0f1419 70%, #12161f 100%);
   border-radius: 16px;
   display: flex;
   flex-direction: column;
@@ -60,7 +69,9 @@ body {
   border: 1px solid rgba(59, 130, 246, 0.15);
   min-height: 450px;
   min-width: 320px;
-  box-shadow: 0 0 60px rgba(59, 130, 246, 0.1) inset;
+  box-shadow:
+    0 0 60px rgba(59, 130, 246, 0.1) inset,
+    0 0 100px rgba(139, 92, 246, 0.05) inset;
 }
 
 /* Update banner */
@@ -154,7 +165,7 @@ body {
   height: clamp(24px, 5vw, 28px);
   border-radius: 8px;
   border: none;
-  background: var(--bg-tertiary);
+  background: linear-gradient(135deg, rgba(26, 26, 37, 0.6) 0%, rgba(26, 26, 37, 0.4) 100%);
   color: var(--text-secondary);
   cursor: pointer;
   display: flex;
@@ -295,11 +306,12 @@ body {
   width: clamp(70px, 14vh, 95px);
   height: clamp(70px, 14vh, 95px);
   border-radius: 50%;
-  background: linear-gradient(145deg, #2a2a3a, #1f1f2a);
+  background: linear-gradient(145deg, rgba(42, 42, 58, 0.9), rgba(31, 31, 42, 0.9));
   transition: all var(--transition-normal);
   box-shadow:
     inset 0 2px 8px rgba(0, 0, 0, 0.5),
     0 2px 8px rgba(0, 0, 0, 0.3),
+    0 0 20px rgba(59, 130, 246, 0.1);
     0 0 0 2px rgba(255, 255, 255, 0.05);
   display: flex;
   align-items: center;
@@ -560,6 +572,21 @@ body {
   animation: fadeIn 0.3s ease;
 }
 
+/* Footer strategy name */
+.footer-strategy {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  animation: fadeIn 0.3s ease;
+}
+
+.strategy-name {
+  color: var(--accent-green);
+  font-size: clamp(10px, 2vh, 12px);
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-weight: 500;
+}
+
 /* Connection timer in status section (large screens) */
 .connection-timer-large {
   padding: 3px 10px;
@@ -810,7 +837,7 @@ body {
 
 .strategy-select:hover {
   border-color: var(--accent-blue);
-  background-color: var(--bg-tertiary);
+  background: linear-gradient(135deg, rgba(59, 130, 246, 0.15) 0%, rgba(59, 130, 246, 0.1) 100%);
 }
 
 .strategy-select:focus {
@@ -819,7 +846,7 @@ body {
 }
 
 .strategy-select option {
-  background: var(--bg-secondary);
+  background: linear-gradient(135deg, #12121a 0%, #1a1a25 100%);
   color: var(--text-primary);
   padding: 6px;
 }
@@ -1355,7 +1382,7 @@ body {
 /* Footer */
 .footer {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: center;
   padding: clamp(8px, 1.5vh, 10px) clamp(12px, 3vw, 14px);
   background: linear-gradient(0deg, rgba(59, 130, 246, 0.06) 0%, rgba(0, 0, 0, 0.3) 100%);
@@ -1363,6 +1390,10 @@ body {
   flex-shrink: 0;
   gap: 8px;
   transition: background var(--transition-normal), border-color var(--transition-normal);
+}
+
+.binary-status {
+  margin-left: auto;
 }
 
 /* Footer status colors */
@@ -1624,7 +1655,7 @@ body {
   height: 32px;
   border-radius: 8px;
   border: none;
-  background: var(--bg-tertiary);
+  background: linear-gradient(135deg, rgba(26, 26, 37, 0.6) 0%, rgba(26, 26, 37, 0.4) 100%);
   color: var(--text-secondary);
   cursor: pointer;
   align-items: center;
@@ -1647,12 +1678,12 @@ body {
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(10, 15, 26, 0.75);
   opacity: 0;
   visibility: hidden;
   transition: opacity var(--transition-normal), visibility var(--transition-normal);
   z-index: 998;
-  backdrop-filter: blur(2px);
+  backdrop-filter: blur(4px);
 }
 
 .menu-overlay.active {
@@ -1704,7 +1735,7 @@ body {
   height: 28px;
   border-radius: 6px;
   border: none;
-  background: var(--bg-tertiary);
+  background: linear-gradient(135deg, rgba(26, 26, 37, 0.6) 0%, rgba(26, 26, 37, 0.4) 100%);
   color: var(--text-secondary);
   cursor: pointer;
   display: flex;
