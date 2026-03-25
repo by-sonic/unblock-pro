@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "electron-updater": "^6.7.3",
-    "sudo-prompt": "^9.2.1"
+    "@vscode/sudo-prompt": "^9.3.1"
   },
   "build": {
     "appId": "com.sonic.unblockpro",
