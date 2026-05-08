@@ -1,3 +1,35 @@
+
+<div align="right">
+  <details>
+    <summary >🌐 Language</summary>
+    <div>
+      <div align="center">
+        <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=en">English</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=zh-CN">简体中文</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=zh-TW">繁體中文</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=ja">日本語</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=ko">한국어</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=hi">हिन्दी</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=th">ไทย</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=fr">Français</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=de">Deutsch</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=es">Español</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=it">Italiano</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=ru">Русский</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=pt">Português</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=nl">Nederlands</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=pl">Polski</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=ar">العربية</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=fa">فارسی</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=tr">Türkçe</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=vi">Tiếng Việt</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=id">Bahasa Indonesia</a>
+        | <a href="https://openaitx.github.io/view.html?user=by-sonic&project=unblock-pro&lang=as">অসমীয়া</
+      </div>
+    </div>
+  </details>
+</div>
+
 # UnblockPro — Обход блокировок Discord и YouTube
 
 
