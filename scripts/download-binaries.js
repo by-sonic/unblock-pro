@@ -1,169 +1,116 @@
-const https = require('https');
+#!/usr/bin/env node
+'use strict';
+
+const crypto = require('crypto');
 const fs = require('fs');
+const https = require('https');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 
-const ZAPRET_VERSION = 'v72.9';
-const ZAPRET_RELEASE_URL = `https://github.com/bol-van/zapret/releases/download/${ZAPRET_VERSION}`;
+const {
+  FLOWSEAL_BUNDLE_MARKER,
+  FLOWSEAL_BUNDLE_SHA256,
+  FLOWSEAL_BUNDLE_URL,
+  FLOWSEAL_BUNDLE_VERSION,
+  FLOWSEAL_REQUIRED_WINDOWS_FILES
+} = require('../src/main/flowseal-bundle');
+const { isMachOBinary } = require('../src/main/binary-format');
 
-const BINARIES = {
-  darwin: {
-    name: 'tpws',
-    url: `${ZAPRET_RELEASE_URL}/zapret-${ZAPRET_VERSION}.tar.gz`,
-    extractPath: `zapret-${ZAPRET_VERSION}/binaries/aarch64/tpws`,
-    extractPathX64: `zapret-${ZAPRET_VERSION}/binaries/x86_64/tpws`
-  },
-  win32: {
-    name: 'winws.exe',
-    url: `${ZAPRET_RELEASE_URL}/zapret-${ZAPRET_VERSION}.zip`,
-    extractPath: `zapret-${ZAPRET_VERSION}/binaries/win64/winws.exe`
-  }
-};
+const ZAPRET_MACOS_COMMIT = '1a1fc38c8ea05b481eebcbd338df48cdcca23c15';
+const repoRoot = path.join(__dirname, '..');
+const binRoot = path.join(repoRoot, 'bin');
+const tempRoot = path.join(repoRoot, 'temp', 'runtime-build');
 
-const binDir = path.join(__dirname, '..', 'bin');
-const tempDir = path.join(__dirname, '..', 'temp');
-
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-function downloadFile(url, dest) {
+function download(url, destination, redirects = 5) {
   return new Promise((resolve, reject) => {
-    console.log(`Downloading: ${url}`);
-    
-    const file = fs.createWriteStream(dest);
-    
-    const request = https.get(url, (response) => {
-      if (response.statusCode === 302 || response.statusCode === 301) {
-        // Handle redirect
-        file.close();
-        fs.unlinkSync(dest);
-        downloadFile(response.headers.location, dest).then(resolve).catch(reject);
+    const request = https.get(url, { headers: { 'User-Agent': 'UnblockPro' } }, (response) => {
+      if ([301, 302, 307, 308].includes(response.statusCode) && response.headers.location && redirects > 0) {
+        response.resume();
+        download(response.headers.location, destination, redirects - 1).then(resolve, reject);
         return;
       }
-      
       if (response.statusCode !== 200) {
-        reject(new Error(`HTTP ${response.statusCode}`));
+        response.resume();
+        reject(new Error(`Download failed with HTTP ${response.statusCode}`));
         return;
       }
-      
-      const totalSize = parseInt(response.headers['content-length'], 10);
-      let downloadedSize = 0;
-      
-      response.on('data', (chunk) => {
-        downloadedSize += chunk.length;
-        const percent = ((downloadedSize / totalSize) * 100).toFixed(1);
-        process.stdout.write(`\rProgress: ${percent}%`);
-      });
-      
+      const file = fs.createWriteStream(destination);
       response.pipe(file);
-      
-      file.on('finish', () => {
-        file.close();
-        console.log('\nDownload complete');
-        resolve();
-      });
+      file.on('finish', () => file.close(resolve));
+      file.on('error', reject);
     });
-    
-    request.on('error', (err) => {
-      fs.unlink(dest, () => {});
-      reject(err);
-    });
+    request.on('error', reject);
   });
 }
 
-function extractArchive(archivePath, extractTo, platform) {
-  console.log(`Extracting: ${archivePath}`);
-  
-  if (platform === 'darwin' || archivePath.endsWith('.tar.gz')) {
-    execSync(`tar -xzf "${archivePath}" -C "${extractTo}"`, { stdio: 'inherit' });
-  } else if (archivePath.endsWith('.zip')) {
-    // Windows or zip file
-    try {
-      execSync(`unzip -o "${archivePath}" -d "${extractTo}"`, { stdio: 'inherit' });
-    } catch (e) {
-      // Try powershell on Windows
-      execSync(`powershell -command "Expand-Archive -Path '${archivePath}' -DestinationPath '${extractTo}' -Force"`, { stdio: 'inherit' });
-    }
-  }
+function resetTempDir() {
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+  fs.mkdirSync(tempRoot, { recursive: true });
 }
 
-async function downloadBinaries() {
-  console.log('='.repeat(50));
-  console.log('UnblockPro Binary Downloader');
-  console.log('='.repeat(50));
-  
-  ensureDir(binDir);
-  ensureDir(tempDir);
-  
-  const platforms = process.argv[2] ? [process.argv[2]] : ['darwin', 'win32'];
-  
-  for (const platform of platforms) {
-    const config = BINARIES[platform];
-    if (!config) {
-      console.log(`Skipping unknown platform: ${platform}`);
-      continue;
-    }
-    
-    const platformDir = path.join(binDir, platform);
-    ensureDir(platformDir);
-    
-    const destBinary = path.join(platformDir, config.name);
-    
-    if (fs.existsSync(destBinary)) {
-      console.log(`Binary already exists: ${destBinary}`);
-      continue;
-    }
-    
-    console.log(`\nDownloading binaries for: ${platform}`);
-    
-    const archiveExt = config.url.endsWith('.tar.gz') ? '.tar.gz' : '.zip';
-    const archivePath = path.join(tempDir, `zapret-${platform}${archiveExt}`);
-    
-    try {
-      await downloadFile(config.url, archivePath);
-      
-      extractArchive(archivePath, tempDir, platform);
-      
-      // Copy binary
-      let sourcePath = path.join(tempDir, config.extractPath);
-      
-      // For macOS, check architecture
-      if (platform === 'darwin' && !fs.existsSync(sourcePath)) {
-        sourcePath = path.join(tempDir, config.extractPathX64);
-      }
-      
-      if (fs.existsSync(sourcePath)) {
-        fs.copyFileSync(sourcePath, destBinary);
-        
-        // Make executable on Unix
-        if (platform !== 'win32') {
-          fs.chmodSync(destBinary, '755');
-        }
-        
-        console.log(`Binary installed: ${destBinary}`);
-      } else {
-        console.error(`Binary not found in archive: ${sourcePath}`);
-      }
-      
-    } catch (error) {
-      console.error(`Error downloading ${platform}: ${error.message}`);
-    }
+async function buildWindowsRuntime() {
+  const archive = path.join(tempRoot, 'flowseal.zip');
+  const extractDir = path.join(tempRoot, 'flowseal');
+  const destination = path.join(binRoot, 'win32');
+  await download(FLOWSEAL_BUNDLE_URL, archive);
+
+  const hash = crypto.createHash('sha256').update(fs.readFileSync(archive)).digest('hex');
+  if (hash !== FLOWSEAL_BUNDLE_SHA256) {
+    throw new Error(`Flowseal checksum mismatch: ${hash}`);
   }
-  
-  // Cleanup
-  console.log('\nCleaning up...');
-  try {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  } catch (e) {
-    console.log('Cleanup skipped');
+
+  execFileSync('powershell', [
+    '-NoProfile',
+    '-Command',
+    `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`
+  ], { stdio: 'inherit' });
+
+  const source = path.join(extractDir, `zapret-discord-youtube-${FLOWSEAL_BUNDLE_VERSION}`, 'bin');
+  fs.mkdirSync(destination, { recursive: true });
+  for (const file of FLOWSEAL_REQUIRED_WINDOWS_FILES) {
+    fs.copyFileSync(path.join(source, file), path.join(destination, file));
   }
-  
-  console.log('\nDone!');
-  console.log('='.repeat(50));
+  fs.writeFileSync(path.join(destination, FLOWSEAL_BUNDLE_MARKER), FLOWSEAL_BUNDLE_VERSION, 'utf8');
+  console.log(`Windows runtime ${FLOWSEAL_BUNDLE_VERSION}: ${destination}`);
 }
 
-// Run
-downloadBinaries().catch(console.error);
+function buildMacRuntime() {
+  if (process.platform !== 'darwin') {
+    throw new Error('The macOS runtime must be compiled on macOS with Xcode Command Line Tools.');
+  }
+
+  const source = path.join(tempRoot, 'zapret');
+  const destination = path.join(binRoot, 'darwin', 'tpws');
+  fs.mkdirSync(source, { recursive: true });
+  execFileSync('git', ['init'], { cwd: source, stdio: 'inherit' });
+  execFileSync('git', ['fetch', '--depth', '1', 'https://github.com/bol-van/zapret.git', ZAPRET_MACOS_COMMIT], {
+    cwd: source,
+    stdio: 'inherit'
+  });
+  execFileSync('git', ['checkout', '--detach', 'FETCH_HEAD'], { cwd: source, stdio: 'inherit' });
+  execFileSync('make', ['-C', path.join(source, 'tpws'), 'mac'], {
+    stdio: 'inherit',
+    env: { ...process.env, OPTIMIZE: '-O2' }
+  });
+
+  const compiled = path.join(source, 'tpws', 'tpws');
+  if (!isMachOBinary(compiled)) throw new Error('Compiled tpws is not a Mach-O binary');
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(compiled, destination);
+  fs.chmodSync(destination, 0o755);
+  console.log(`macOS universal runtime ${ZAPRET_MACOS_COMMIT}: ${destination}`);
+}
+
+async function main() {
+  resetTempDir();
+  const target = process.argv[2] || process.platform;
+  if (target === 'win32') await buildWindowsRuntime();
+  else if (target === 'darwin') buildMacRuntime();
+  else throw new Error(`Unsupported target: ${target}`);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
+}
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});

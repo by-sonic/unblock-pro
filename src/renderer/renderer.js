@@ -543,13 +543,26 @@ async function handleConnectClick() {
 // ============= Auto-update handlers =============
 
 let updateDownloadedVersion = null;
+let manualUpdateUrl = null;
 
 function handleUpdateStatus(data) {
   const { status, version } = data;
   
   switch (status) {
+    case 'manual-available':
+      updateDownloadedVersion = version;
+      manualUpdateUrl = 'https://github.com/by-sonic/unblock-pro/releases/latest';
+      updateBanner.style.display = 'flex';
+      updateBanner.classList.remove('downloading');
+      updateText.textContent = `Доступно обновление v${version}`;
+      updateBtn.textContent = 'Скачать';
+      updateBtn.style.display = 'block';
+      updateBtn.disabled = false;
+      updateBtn.title = 'Открыть страницу релиза';
+      break;
     case 'available':
       updateDownloadedVersion = null;
+      manualUpdateUrl = null;
       updateBanner.style.display = 'flex';
       updateBanner.classList.remove('downloading');
       updateText.textContent = `Обновление v${version} загружается...`;
@@ -557,6 +570,7 @@ function handleUpdateStatus(data) {
       break;
     case 'downloaded':
       updateDownloadedVersion = version;
+      manualUpdateUrl = null;
       updateBanner.style.display = 'flex';
       updateBanner.classList.remove('downloading');
       updateText.textContent = `Обновление v${version} готово`;
@@ -574,12 +588,17 @@ function handleUpdateStatus(data) {
     case 'not-available':
     case 'checking':
       updateDownloadedVersion = null;
+      manualUpdateUrl = null;
       break;
   }
 }
 
 async function handleUpdateBtnClick() {
   if (!updateDownloadedVersion || !window.api) return;
+  if (manualUpdateUrl) {
+    await window.api.openExternal(manualUpdateUrl);
+    return;
+  }
   try {
     updateBtn.disabled = true;
     updateBtn.textContent = 'Перезапуск...';

@@ -5,6 +5,8 @@ on:
     branches: [main]
     tags:
       - 'v*'
+  pull_request:
+    branches: [main]
   workflow_dispatch:  # Ручной запуск: Actions → Build & Release → Run workflow
 
 permissions:
@@ -28,10 +30,10 @@ jobs:
           node-version: 22
           cache: 'npm'
 
-      - name: Bump version or read tag
+      - name: Prepare build version
         id: outputs
         run: |
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
             OLD_VERSION=$(node -p "require('./package.json').version")
             npm version patch --no-git-tag-version
             VERSION=$(node -p "require('./package.json').version")
@@ -47,8 +49,12 @@ jobs:
               echo "should_build=true" >> $GITHUB_OUTPUT
               echo "version=$VERSION" >> $GITHUB_OUTPUT
             fi
-          else
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(node -p "require('./package.json').version")
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
@@ -75,8 +81,23 @@ jobs:
           retry_wait_seconds: 30
           command: npm ci
 
+      - name: Run tests
+        run: npm test
+
       - name: Create bin directory
         run: mkdir -p bin/darwin
+
+      - name: Build universal macOS tpws
+        shell: bash
+        run: |
+          mkdir -p temp/zapret
+          git -C temp/zapret init
+          git -C temp/zapret fetch --depth 1 https://github.com/bol-van/zapret.git 1a1fc38c8ea05b481eebcbd338df48cdcca23c15
+          git -C temp/zapret checkout --detach FETCH_HEAD
+          OPTIMIZE=-O2 make -C temp/zapret/tpws mac
+          cp temp/zapret/tpws/tpws bin/darwin/tpws
+          chmod 755 bin/darwin/tpws
+          file bin/darwin/tpws | grep -q 'Mach-O universal binary'
 
       - name: Build macOS
         uses: nick-fields/retry@v3
@@ -124,9 +145,27 @@ jobs:
           retry_wait_seconds: 30
           command: npm ci
 
+      - name: Run tests
+        run: npm test
+
       - name: Create bin directory
         run: mkdir bin\win32
         shell: cmd
+
+      - name: Bundle audited Flowseal runtime
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.9.9c/zapret-discord-youtube-1.9.9c.zip'
+          $archive = Join-Path $env:RUNNER_TEMP 'flowseal.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'flowseal'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($hash -ne '6064e4b26ed7358961a0b978fbb6263b119d8d7a5a06bb4a6454aeb855cf63e9') {
+            throw "Flowseal checksum mismatch: $hash"
+          }
+          Expand-Archive -Path $archive -DestinationPath $extract
+          Copy-Item -Path "$extract\zapret-discord-youtube-1.9.9c\bin\*" -Destination 'bin\win32' -Recurse
+          Set-Content -Path 'bin\win32\flowseal-bundle-version.txt' -Value '1.9.9c' -NoNewline
 
       - name: Build Windows
         uses: nick-fields/retry@v3
@@ -155,6 +194,7 @@ jobs:
   release:
     needs: [build-mac, build-windows, prepare]
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     steps:
       - uses: actions/checkout@v4
         with:
