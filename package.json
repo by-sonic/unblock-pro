@@ -5,6 +5,8 @@
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
+    "sync:flowseal": "node scripts/sync-flowseal-strategies.js",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
     "build:win": "electron-builder --win",

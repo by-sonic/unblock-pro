@@ -3,9 +3,28 @@ const path = require('path');
 const { spawn, exec, execSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
+const crypto = require('crypto');
 const dns = require('dns');
 const tls = require('tls');
 const sudo = require('sudo-prompt');
+const { isMachOBinary } = require('./binary-format');
+const {
+  REQUIRED_DISCORD_ENDPOINTS,
+  REQUIRED_YOUTUBE_ENDPOINTS
+} = require('./connectivity-probes');
+const {
+  FLOWSEAL_BUNDLE_MARKER,
+  FLOWSEAL_BUNDLE_SHA256,
+  FLOWSEAL_BUNDLE_URL,
+  FLOWSEAL_BUNDLE_VERSION,
+  FLOWSEAL_REQUIRED_WINDOWS_FILES,
+  installBundledFlowsealBundle,
+  isFlowsealBundleCurrent
+} = require('./flowseal-bundle');
+const {
+  FLOWSEAL_AUTO_ORDER,
+  buildFlowsealStrategies
+} = require('./flowseal-strategies');
 
 dns.setDefaultResultOrder('ipv4first');
 const ipv4Lookup = (host, opts, cb) => dns.lookup(host, { family: 4 }, cb);
@@ -128,10 +147,17 @@ function getBinaryPath() {
   const binDir = getResourcePath();
   
   if (process.platform === 'darwin') {
-    // Check for architecture-specific binary
+    if (app.isPackaged) {
+      const bundledBinary = path.join(process.resourcesPath, 'bin', 'tpws');
+      if (isMachOBinary(bundledBinary)) return bundledBinary;
+    }
+
+    // Fall back to a previously downloaded or development binary.
     const arch = process.arch === 'arm64' ? 'arm64' : 'x86_64';
     const archBinary = path.join(binDir, `tpws_${arch}`);
-    if (fs.existsSync(archBinary)) return archBinary;
+    if (isMachOBinary(archBinary)) return archBinary;
+    const binary = path.join(binDir, 'tpws');
+    if (isMachOBinary(binary)) return binary;
     return path.join(binDir, 'tpws');
   } else if (process.platform === 'win32') {
     return path.join(binDir, 'winws.exe');
@@ -140,9 +166,14 @@ function getBinaryPath() {
   return null;
 }
 
+function isWindowsBundleCurrent(platformDir = getResourcePath()) {
+  if (process.platform !== 'win32') return true;
+  return isFlowsealBundleCurrent(platformDir);
+}
+
 // ============= HOST LISTS & PATTERN FILES =============
 
-// Domain lists matching Flowseal/zapret-discord-youtube v1.9.6
+// Domain lists matching Flowseal/zapret-discord-youtube v1.9.9c.
 // IMPORTANT: list-general = Discord + Cloudflare ONLY (no YouTube!)
 // YouTube goes in list-google with separate filter rules
 const HOST_LIST_GENERAL = [
@@ -150,27 +181,23 @@ const HOST_LIST_GENERAL = [
   'cloudflarebolt.com', 'cloudflareclient.com', 'cloudflareinsights.com', 'cloudflareok.com',
   'cloudflarepartners.com', 'cloudflareportal.com', 'cloudflarepreview.com', 'cloudflareresolve.com',
   'cloudflaressl.com', 'cloudflarestatus.com', 'cloudflarestorage.com', 'cloudflarestream.com',
-  'cloudflaretest.com', 'dis.gd', 'discord-attachments-uploads-prd.storage.googleapis.com',
+  'cloudflaretest.com', 'cloudfront.net', 'dis.gd', 'discord-attachments-uploads-prd.storage.googleapis.com',
   'discord.app', 'discord.co', 'discord.com', 'discord.design', 'discord.dev', 'discord.gift',
   'discord.gifts', 'discord.gg', 'discord.media', 'discord.new', 'discord.store', 'discord.status',
   'discord-activities.com', 'discordactivities.com', 'discordapp.com', 'discordapp.net',
   'discordcdn.com', 'discordmerch.com', 'discordpartygames.com', 'discordsays.com',
   'discordsez.com', 'discordstatus.com',
-  'gateway.discord.gg', 'cdn.discordapp.com', 'media.discordapp.net',
-  'images-ext-1.discordapp.net', 'images-ext-2.discordapp.net',
-  'dl.discordapp.net', 'updates.discord.com', 'router.discordapp.net',
-  'sentry.io', 'sentry-cdn.com',
   'frankerfacez.com', 'ffzap.com', 'betterttv.net',
-  '7tv.app', '7tv.io', 'localizeapi.com'
+  '7tv.app', '7tv.io', 'localizeapi.com', 'klipy.com'
 ].join('\n');
 
 const HOST_LIST_GOOGLE = [
   'yt3.ggpht.com', 'yt4.ggpht.com', 'yt3.googleusercontent.com',
   'googlevideo.com', 'jnn-pa.googleapis.com', 'stable.dl2.discordapp.net',
   'wide-youtube.l.google.com', 'youtube-nocookie.com', 'youtube-ui.l.google.com',
-  'youtube.com', 'youtubeembeddedplayer.googleapis.com', 'youtubekids.com',
+  'youtube.com', 'youtubeembeddedplayer.googleapis.com', 'youtubekids.com', 'youtube.googleapis.com',
   'youtubei.googleapis.com', 'youtu.be', 'yt-video-upload.l.google.com',
-  'ytimg.com', 'ytimg.l.google.com'
+  'ytimg.com', 'ytimg.l.google.com', 'play.google.com', 'google.ru'
 ].join('\n');
 
 // Discord-only list: apply gentler desync to Discord TLS first, syndata for the rest
@@ -188,11 +215,29 @@ const HOST_LIST_DISCORD = [
 // Exclude list — Russian/local services that should NOT be processed by DPI bypass
 const HOST_LIST_EXCLUDE = [
   'pusher.com', 'live-video.net', 'ttvnw.net', 'twitch.tv',
-  'mail.ru', 'citilink.ru', 'yandex.com', 'nvidia.com', 'donationalerts.com',
-  'vk.com', 'yandex.kz', 'mts.ru', 'multimc.org', 'ya.ru', 'dns-shop.ru',
-  'habr.com', '3dnews.ru', 'sberbank.ru', 'ozon.ru', 'wildberries.ru',
-  'microsoft.com', 'msi.com', 'akamaitechnologies.com', '2ip.ru', 'yandex.ru',
-  'boosty.to', 'tanki.su', 'lesta.ru', 'korabli.su', 'tanksblitz.ru', 'reg.ru'
+  'mail.ru', 'citilink.ru', 'yandex.com', 'yandex.net', 'yandex.org', 'yandex.md',
+  'yandex.ru', 'yandexadexchange.net', 'yandexcloud.net', 'yandexcom.net',
+  'yandexmetrica.com', 'yandexwebcache.net', 'yandexwebcache.org', 'yastat.net',
+  'yastatic-net.ru', 'yastatic.net', 'ya.ru', 'adfox.ru', 'admetrica.ru',
+  'naydex.net', 'rostaxi.org', 'turbopages.org', 'webvisor.com', 'webvisor.org',
+  'nvidia.com', 'donationalerts.com', 'vk.com', 'yandex.kz', 'mts.ru', 'multimc.org',
+  'dns-shop.ru', 'habr.com', '3dnews.ru', 'microsoft.com', 'microsoftonline.com',
+  'live.com', 'sharepoint.com', 'minecraft.net', 'xboxlive.com',
+  'akamaitechnologies.com', 'msi.com', '2ip.ru', 'boosty.to', 'tanki.su',
+  'lesta.ru', 'korabli.su', 'tanksblitz.ru', 'reg.ru', 'epicgames.dev',
+  'epicgames.com', 'unrealengine.com', 'riotgames.com', 'riotcdn.net',
+  'leagueoflegends.com', 'playvalorant.com', 'marketplace.visualstudio.com',
+  'gallery.vsassets.io', 'gallerycdn.vsassets.io', 'gosuslugi.ru', 'gov.ru',
+  'nalog.ru', 'spb.ru', 'mos.ru', 'vk.ru', 'vk.me', 'vkvideo.ru', 'ok.ru',
+  'mycdn.me', 'okcdn.ru', 'odkl.ru', 'wb.ru', 'geobasket.ru', 'paywb.com',
+  'rwb.ru', 'wb-basket.ru', 'wbbasket.ru', 'wbpay.ru', 'wibes.ru',
+  'wildberries.ru', 'ozon.by', 'ozon.com', 'ozon.com.by', 'ozon.com.kz',
+  'ozon.kz', 'ozon.ru', 'ozon.tm', 'ozone.ru', 'ozonru.me',
+  'ozonusercontent.com', 'alfabank.ru', 'gazprombank.ru', 'gpb.ru',
+  'dbo-dengi.online', 'mtsdengi.ru', 'psbank.ru', 'bankline.ru', 'rosbank.ru',
+  'abr.ru', 'rshb.ru', 'sber.ru', 'sberbank.com', 'sberbank.ru',
+  'cdn-tinkoff.ru', 'tbank-online.com', 'tbank.ru', 't-bank-app.ru',
+  'tochka-tech.com', 'tochka.com', 'vtb.ru', 'steamcommunity.com'
 ].join('\n');
 
 // Private/reserved IP ranges to exclude from processing
@@ -474,7 +519,7 @@ function buildWin32Strategies(binDir, listsDir) {
   const tls4 = q('tls_clienthello_4pda_to.bin');
   const tlsM = q('tls_clienthello_max_ru.bin');
 
-  return [
+  const legacyStrategies = [
     // ========== Flowseal reference strategies (8-rule architecture) ==========
 
     // general.bat (Flowseal default) — multisplit 681/568 with pattern
@@ -570,15 +615,6 @@ function buildWin32Strategies(binDir, listsDir) {
       ['--dpi-desync-repeats=6', '--dpi-desync-fooling=badseq', '--dpi-desync-badseq-increment=10000000', `--dpi-desync-fake-tls=${tlsG}`],
       ['--dpi-desync-repeats=6', '--dpi-desync-fooling=badseq', '--dpi-desync-badseq-increment=10000000', `--dpi-desync-fake-tls=${tlsG}`, `--dpi-desync-fake-http=${tlsM}`],
       ['--dpi-desync-repeats=6', '--dpi-desync-fooling=badseq', '--dpi-desync-badseq-increment=10000000', `--dpi-desync-fake-tls=${tlsG}`, `--dpi-desync-fake-http=${tlsM}`],
-      { cutoff: 'n2' })
-    },
-
-    // ALT9 — hostfakesplit ts
-    { name: 'ALT9', args: std8('hostfakesplit',
-      ['--dpi-desync-repeats=4', '--dpi-desync-fooling=ts', '--dpi-desync-hostfakesplit-mod=host=www.google.com'],
-      ['--dpi-desync-repeats=4', '--dpi-desync-fooling=ts', '--dpi-desync-hostfakesplit-mod=host=www.google.com'],
-      ['--dpi-desync-repeats=4', '--dpi-desync-fooling=ts,md5sig', '--dpi-desync-hostfakesplit-mod=host=ozon.ru'],
-      ['--dpi-desync-repeats=4', '--dpi-desync-fooling=ts', '--dpi-desync-hostfakesplit-mod=host=ozon.ru'],
       { cutoff: 'n2' })
     },
 
@@ -985,6 +1021,13 @@ function buildWin32Strategies(binDir, listsDir) {
       { cutoff: 'n2' })
     },
   ];
+
+  const flowsealStrategies = buildFlowsealStrategies(binDir, listsDir);
+  const flowsealNames = new Set(flowsealStrategies.map((strategy) => strategy.name));
+  return [
+    ...flowsealStrategies,
+    ...legacyStrategies.filter((strategy) => !flowsealNames.has(strategy.name))
+  ];
 }
 
 // DPI bypass strategies — based on Flowseal/zapret-discord-youtube (22k+ stars)
@@ -1107,6 +1150,7 @@ function buildDarwinStrategies(listsDir) {
 // Proven strategies ordered by speed (tested Feb 2026 on TSPU SNI-filtering DPI).
 // Auto-select tries them in order, so fastest/most reliable go first.
 const WIN32_PRIORITY_ORDER = [
+  ...FLOWSEAL_AUTO_ORDER,
   'multisplit-seqovl-2', 'disorder-midsld', 'combo:syndata+md5sig',
   'combo:syndata+hostfake-md5sig', 'ALT10', 'syndata-only',
   'combo:syndata+badseq', 'combo:syndata+multisplit', 'ALT5',
@@ -1310,8 +1354,11 @@ async function downloadAndExtractBinaries() {
       throw new Error(`Unsupported platform: ${process.platform}`);
     }
     
-    // Get latest zapret release URL dynamically
-    const downloadUrl = await getLatestZapretUrl();
+    // Windows strategies are audited against the pinned Flowseal bundle.
+    // macOS continues to use the latest upstream zapret release for tpws.
+    const downloadUrl = process.platform === 'win32'
+      ? FLOWSEAL_BUNDLE_URL
+      : await getLatestZapretUrl();
     
     const zipPath = path.join(tempDir, 'zapret.zip');
     
@@ -1320,6 +1367,13 @@ async function downloadAndExtractBinaries() {
     
     // Download
     await downloadFile(downloadUrl, zipPath);
+
+    if (process.platform === 'win32') {
+      const archiveHash = crypto.createHash('sha256').update(fs.readFileSync(zipPath)).digest('hex');
+      if (archiveHash !== FLOWSEAL_BUNDLE_SHA256) {
+        throw new Error(`Flowseal bundle checksum mismatch: ${archiveHash}`);
+      }
+    }
     
     // Extract
     if (process.platform === 'win32') {
@@ -1399,6 +1453,18 @@ async function downloadAndExtractBinaries() {
         
         // Generate any missing pattern files
         ensureBinPatternFiles(platformDir);
+
+        const missingFiles = FLOWSEAL_REQUIRED_WINDOWS_FILES.filter(
+          (file) => !fs.existsSync(path.join(platformDir, file))
+        );
+        if (missingFiles.length > 0) {
+          throw new Error(`Flowseal bundle is incomplete: ${missingFiles.join(', ')}`);
+        }
+        fs.writeFileSync(
+          path.join(platformDir, FLOWSEAL_BUNDLE_MARKER),
+          `${FLOWSEAL_BUNDLE_VERSION}\n`,
+          'utf8'
+        );
       } else {
         throw new Error('winws.exe not found in archive');
       }
@@ -1414,58 +1480,27 @@ async function downloadAndExtractBinaries() {
         ? path.join(tempDir, zapretDirs[0]) 
         : tempDir;
       
-      // Find tpws binary dynamically via recursive search
-      const possiblePaths = [];
-      let found = false;
-      
-      const binariesDir = path.join(zapretDir, 'binaries');
-      if (fs.existsSync(binariesDir)) {
-        const archs = fs.readdirSync(binariesDir);
-        // Prioritize macOS binary (mac64 = universal arm64+x86_64)
-        const sorted = archs.sort((a, b) => {
-          const aMatch = a.includes('mac') || a.includes('mach') || a.includes('darwin') ? -1 : 1;
-          const bMatch = b.includes('mac') || b.includes('mach') || b.includes('darwin') ? -1 : 1;
-          return aMatch - bMatch;
+      // Upstream prebuilt aarch64/x86_64 files are Linux ELF binaries. Always
+      // compile the dedicated universal macOS target instead of copying them.
+      const tpwsSrcDir = path.join(zapretDir, 'tpws');
+      const compiledPath = path.join(tpwsSrcDir, 'tpws');
+      try {
+        execSync('make mac', {
+          cwd: tpwsSrcDir,
+          stdio: 'pipe',
+          timeout: 300000,
+          env: { ...process.env, OPTIMIZE: '-O2' }
         });
-        for (const arch of sorted) {
-          const tpwsPath = path.join(binariesDir, arch, 'tpws');
-          if (fs.existsSync(tpwsPath)) {
-            possiblePaths.push(tpwsPath);
-          }
-        }
+      } catch (e) {
+        throw new Error('tpws macOS compilation failed. Install Xcode Command Line Tools.');
       }
-      
-      for (const srcPath of possiblePaths) {
-        if (fs.existsSync(srcPath)) {
-          const destPath = path.join(platformDir, 'tpws');
-          fs.copyFileSync(srcPath, destPath);
-          fs.chmodSync(destPath, '755');
-          found = true;
-          break;
-        }
-      }
-      
-      if (!found) {
-        // Try to compile from source as fallback
-        const tpwsSrcDir = path.join(zapretDir, 'tpws');
-        if (fs.existsSync(tpwsSrcDir)) {
-          try {
-            execSync('make', { cwd: tpwsSrcDir, stdio: 'pipe' });
-            const compiledPath = path.join(tpwsSrcDir, 'tpws');
-            if (fs.existsSync(compiledPath)) {
-              fs.copyFileSync(compiledPath, path.join(platformDir, 'tpws'));
-              fs.chmodSync(path.join(platformDir, 'tpws'), '755');
-              found = true;
-            }
-          } catch (e) {
-            // Compilation failed silently
-          }
-        }
-      }
-      
-      if (!found) {
+
+      if (!isMachOBinary(compiledPath)) {
         throw new Error('tpws binary not found and compilation failed. Please install Xcode Command Line Tools.');
       }
+      const destination = path.join(platformDir, 'tpws');
+      fs.copyFileSync(compiledPath, destination);
+      fs.chmodSync(destination, '755');
     }
     
     // Cleanup
@@ -1673,35 +1708,20 @@ function testSingleConnection(port, timeoutSec, url) {
 }
 
 async function testProxyConnection(port = 1080, timeoutSec = 8) {
-  // Test YouTube + Discord API + Discord CDN in parallel
-  const [ytOk, dcApiOk, dcCdnOk] = await Promise.all([
-    testSingleConnection(port, timeoutSec, 'https://www.youtube.com/'),
-    testSingleConnection(port, timeoutSec, 'https://discord.com/api/v10/gateway'),
-    testSingleConnection(port, timeoutSec, 'https://cdn.discordapp.com/')
-  ]);
-
-  if (ytOk && dcApiOk && dcCdnOk) return true;
-
-  let ytPassed = ytOk;
-  let dcPassed = dcApiOk || dcCdnOk;
-
-  if (!ytPassed) {
-    ytPassed = await testSingleConnection(port, timeoutSec, 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg');
-    if (!ytPassed) {
-      sendLog({ type: 'warning', message: 'YouTube не прошёл через прокси — стратегия не подходит' });
-      return false;
-    }
+  const youtubeResults = await Promise.all(
+    REQUIRED_YOUTUBE_ENDPOINTS.map((url) => testSingleConnection(port, timeoutSec, url))
+  );
+  if (!youtubeResults.every(Boolean)) {
+    sendLog({ type: 'warning', message: 'YouTube Web/video не прошли через прокси — стратегия не подходит' });
+    return false;
   }
 
-  if (!dcPassed) {
-    // Try more Discord endpoints
-    const dcMedia = await testSingleConnection(port, timeoutSec, 'https://media.discordapp.net/');
-    const dcGateway = await testSingleConnection(port, timeoutSec, 'https://gateway.discord.gg/');
-    dcPassed = dcMedia || dcGateway;
-    if (!dcPassed) {
-      sendLog({ type: 'warning', message: 'Discord (API + CDN + media + gateway) не прошёл — стратегия не подходит' });
-      return false;
-    }
+  const discordResults = await Promise.all(
+    REQUIRED_DISCORD_ENDPOINTS.map((url) => testSingleConnection(port, timeoutSec, url))
+  );
+  if (!discordResults.every(Boolean)) {
+    sendLog({ type: 'warning', message: 'Discord API/CDN не прошли через прокси — стратегия не подходит' });
+    return false;
   }
 
   return true;
@@ -1782,17 +1802,8 @@ async function testDirectConnection(timeoutSec = 10) {
   // IMPORTANT: Must verify BOTH YouTube AND Discord work, including Discord media
   // ports (2053,8443 etc.) which are needed for voice/video calls.
   
-  const youtubeEndpoints = [
-    'https://www.youtube.com/',
-    'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg',
-    'https://youtubei.googleapis.com/youtubei/v1/player'
-  ];
-  
-  const discordEndpoints = [
-    'https://discord.com/api/v10/gateway',
-    'https://cdn.discordapp.com/',
-    'https://discord.com/app'
-  ];
+  const youtubeEndpoints = REQUIRED_YOUTUBE_ENDPOINTS;
+  const discordEndpoints = REQUIRED_DISCORD_ENDPOINTS;
   
   // Discord media — test TLS on the voice/media ports that DPI often blocks
   const discordMediaEndpoints = [
@@ -1800,33 +1811,23 @@ async function testDirectConnection(timeoutSec = 10) {
     'https://discord.gg/'
   ];
   
-  // Test YouTube FIRST (hardest to unblock)
-  let youtubeOk = false;
-  for (const url of youtubeEndpoints) {
-    if (await testSingleDirectConnection(url, timeoutSec)) {
-      youtubeOk = true;
-      break;
-    }
-  }
+  // Require both the site and the video delivery path. A reachable thumbnail
+  // alone is a common false positive while actual playback remains blocked.
+  const youtubeResults = await Promise.all(
+    youtubeEndpoints.map((url) => testSingleDirectConnection(url, timeoutSec))
+  );
+  const youtubeOk = youtubeResults.every(Boolean);
   
   if (!youtubeOk) {
     sendLog({ type: 'warning', message: 'YouTube TLS не прошёл — стратегия не подходит' });
     return false;
   }
   
-  // Test Discord API/web
-  let discordOk = false;
-  for (const url of discordEndpoints) {
-    if (await testSingleDirectConnection(url, timeoutSec)) {
-      discordOk = true;
-      break;
-    }
-  }
-  
-  if (!discordOk) {
-    // Retry once
-    discordOk = await testSingleDirectConnection(discordEndpoints[0], timeoutSec);
-  }
+  // Require API and CDN so a partially working Discord route is not accepted.
+  const requiredDiscordResults = await Promise.all(
+    discordEndpoints.slice(0, 2).map((url) => testSingleDirectConnection(url, timeoutSec))
+  );
+  const discordOk = requiredDiscordResults.every(Boolean);
   
   if (!discordOk) {
     sendLog({ type: 'warning', message: 'Discord API не прошёл — стратегия не подходит' });
@@ -1975,27 +1976,36 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
     bat += `cd /d "${binDirectory}"\r\n`;
     bat += `start "" /b "${finalBinaryPath}" ${quotedArgs}\r\n`;
     bat += 'timeout /t 4 /nobreak >nul\r\n';
-    // Test connectivity: YouTube TLS FIRST (harder to unblock), then Discord.
-    // A strategy must unblock YouTube to be accepted — Discord alone is not enough.
+    // Require YouTube web and video delivery. Testing only a thumbnail produces
+    // false positives when the interface loads but playback is still blocked.
     bat += 'set "YT_OK=0"\r\n';
-    bat += `powershell -command "try { $r = Invoke-WebRequest -Uri 'https://www.youtube.com/' -TimeoutSec 12 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
+    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_YOUTUBE_ENDPOINTS[0]}' -TimeoutSec 12 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
     bat += 'if !errorlevel! equ 0 set "YT_OK=1"\r\n';
-    bat += 'if "!YT_OK!"=="0" (\r\n';
-    // YouTube main failed, try thumbnail CDN
-    bat += `  powershell -command "try { $r = Invoke-WebRequest -Uri 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg' -TimeoutSec 12 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
-    bat += '  if !errorlevel! equ 0 set "YT_OK=1"\r\n';
-    bat += ')\r\n';
-    // If YouTube failed completely, skip this strategy
     bat += 'if "!YT_OK!"=="0" (\r\n';
     bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
     bat += '  timeout /t 1 /nobreak >nul\r\n';
     bat += '  goto :strat_next_' + i + '\r\n';
     bat += ')\r\n';
-    // Require Discord API
+    bat += 'set "YT_VIDEO_OK=0"\r\n';
+    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_YOUTUBE_ENDPOINTS[1]}' -TimeoutSec 12 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -lt 500) { exit 0 }; exit 1 }"\r\n`;
+    bat += 'if !errorlevel! equ 0 set "YT_VIDEO_OK=1"\r\n';
+    bat += 'if "!YT_VIDEO_OK!"=="0" (\r\n';
+    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
+    bat += '  timeout /t 1 /nobreak >nul\r\n';
+    bat += '  goto :strat_next_' + i + '\r\n';
+    bat += ')\r\n';
+    // Require Discord API and a real CDN asset.
     bat += 'set "DC_OK=0"\r\n';
-    bat += `powershell -command "try { $r = Invoke-WebRequest -Uri 'https://discord.com/api/v10/gateway' -TimeoutSec 10 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
+    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_DISCORD_ENDPOINTS[0]}' -TimeoutSec 10 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
     bat += 'if !errorlevel! equ 0 set "DC_OK=1"\r\n';
     bat += 'if "!DC_OK!"=="0" (\r\n';
+    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
+    bat += '  goto :strat_next_' + i + '\r\n';
+    bat += ')\r\n';
+    bat += 'set "DC_CDN_OK=0"\r\n';
+    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_DISCORD_ENDPOINTS[1]}' -TimeoutSec 10 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
+    bat += 'if !errorlevel! equ 0 set "DC_CDN_OK=1"\r\n';
+    bat += 'if "!DC_CDN_OK!"=="0" (\r\n';
     bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
     bat += '  goto :strat_next_' + i + '\r\n';
     bat += ')\r\n';
@@ -2119,11 +2129,30 @@ async function startProxy() {
   strategyProgress = null;
   sendLog({ type: 'info', message: 'Начало подключения...' });
 
+  if (process.platform === 'win32' && app.isPackaged && !isWindowsBundleCurrent()) {
+    try {
+      const bundledDir = path.join(process.resourcesPath, 'bin');
+      if (installBundledFlowsealBundle(bundledDir, getResourcePath())) {
+        sendLog({ type: 'info', message: `Windows runtime Flowseal ${FLOWSEAL_BUNDLE_VERSION} установлен из приложения` });
+      }
+    } catch (e) {
+      sendLog({ type: 'warning', message: `Не удалось распаковать встроенный Windows runtime: ${e.message}` });
+    }
+  }
+
   const binaryPath = getBinaryPath();
-  
-  // Auto-download if binary not found
-  if (!binaryPath || !fs.existsSync(binaryPath)) {
-    sendLog({ type: 'info', message: 'Бинарник не найден, начинаю скачивание...' });
+
+  const binaryMissing = !binaryPath || !fs.existsSync(binaryPath);
+  const windowsBundleStale = process.platform === 'win32' && !isWindowsBundleCurrent();
+  const macBinaryInvalid = process.platform === 'darwin' && !isMachOBinary(binaryPath);
+
+  // Refresh existing Windows installs too: older runtimes do not include the
+  // Discord/STUN payload used by the current Flowseal strategies.
+  if (binaryMissing || windowsBundleStale || macBinaryInvalid) {
+    const downloadMessage = windowsBundleStale
+      ? `Обновляю Windows runtime до Flowseal ${FLOWSEAL_BUNDLE_VERSION}...`
+      : 'Бинарник не найден, начинаю скачивание...';
+    sendLog({ type: 'info', message: downloadMessage });
     const downloadResult = await downloadAndExtractBinaries();
     if (!downloadResult.success) {
       lastError = `Не удалось скачать бинарники: ${downloadResult.error}`;
@@ -2302,7 +2331,7 @@ async function startProxy() {
         proxyProcess.stderr.on('data', () => {});
         proxyProcess.on('error', () => {});
         
-        proxyProcess.on('close', (code) => {
+        proxyProcess.on('close', (code, signal) => {
           proxyProcess = null;
           if (isConnected) {
             isConnected = false;
@@ -2310,14 +2339,15 @@ async function startProxy() {
             currentStrategy = null;
             connectedSince = null;
             disconnectReason = code === 0 ? 'PROCESS_EXITED' : 'PROCESS_CRASHED';
+            const exitDetail = code === null ? `сигнал: ${signal || 'неизвестен'}` : `код: ${code}`;
             lastError = code === 0 
               ? 'Процесс обхода завершился' 
-              : `Процесс обхода завершился с ошибкой (код: ${code})`;
+              : `Процесс обхода завершился с ошибкой (${exitDetail})`;
             lastErrorCode = 'PROCESS_CRASHED';
             disableSystemProxy();
             restoreDns();
             updateTrayMenu();
-            sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу (код: ${code})` });
+            sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу (${exitDetail})` });
             sendStatus();
           }
         });
@@ -2611,15 +2641,16 @@ function createTray() {
 function setupAutoUpdater() {
   if (isDev) return; // Don't check for updates in dev mode
   
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
+  const manualInstall = process.platform === 'darwin';
+  autoUpdater.autoDownload = !manualInstall;
+  autoUpdater.autoInstallOnAppQuit = !manualInstall;
   
   autoUpdater.on('checking-for-update', () => {
     sendUpdateStatus('checking');
   });
   
   autoUpdater.on('update-available', (info) => {
-    sendUpdateStatus('available', info.version);
+    sendUpdateStatus(manualInstall ? 'manual-available' : 'available', info.version);
   });
   
   autoUpdater.on('update-not-available', () => {
@@ -2924,6 +2955,14 @@ ipcMain.handle('get-settings', () => {
 ipcMain.handle('install-update', async () => {
   if (isDev) {
     return { ok: false, error: 'В режиме разработки обновление недоступно' };
+  }
+
+  if (process.platform === 'darwin') {
+    return {
+      ok: false,
+      manual: true,
+      url: 'https://github.com/by-sonic/unblock-pro/releases/latest'
+    };
   }
 
   if (mainWindow && mainWindow.webContents) {
