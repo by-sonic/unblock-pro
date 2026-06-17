@@ -1,6 +1,6 @@
 {
   "name": "unblock-pro",
-  "version": "2.0.16",
+  "version": "2.0.17",
   "description": "Обход блокировок Discord и YouTube в России — автоматический DPI bypass для macOS и Windows",
   "main": "src/main/main.js",
   "scripts": {
