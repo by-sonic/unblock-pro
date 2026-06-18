@@ -13,6 +13,7 @@ const progressFill = document.getElementById('progressFill');
 const downloadPercent = document.getElementById('downloadPercent');
 const autostartToggle = document.getElementById('autostartToggle');
 const autoconnectToggle = document.getElementById('autoconnectToggle');
+const autoupdateToggle = document.getElementById('autoupdateToggle');
 const strategySelect = document.getElementById('strategySelect');
 
 // New UI elements
@@ -123,6 +124,10 @@ function setupEventListeners() {
   
   autoconnectToggle.addEventListener('change', async () => {
     await window.api.setAutoConnect(autoconnectToggle.checked);
+  });
+
+  autoupdateToggle.addEventListener('change', async () => {
+    await window.api.setAutoUpdate(autoupdateToggle.checked);
   });
   
   // Strategy selector
@@ -237,6 +242,7 @@ async function loadSettings() {
     const settings = await window.api.getSettings();
     autostartToggle.checked = settings.autoStart || false;
     autoconnectToggle.checked = settings.autoConnect || false;
+    autoupdateToggle.checked = settings.autoUpdate !== false;
     
     // Set strategy selector
     if (settings.selectedStrategy && settings.selectedStrategy !== 'auto') {
