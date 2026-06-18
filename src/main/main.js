@@ -29,6 +29,7 @@ const {
 dns.setDefaultResultOrder('ipv4first');
 const ipv4Lookup = (host, opts, cb) => dns.lookup(host, { family: 4 }, cb);
 const { autoUpdater } = require('electron-updater');
+const { resolveUpdateMode } = require('./update-mode');
 
 let mainWindow;
 let tray;
@@ -56,7 +57,7 @@ function loadSettings() {
       return JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
     }
   } catch (e) {}
-  return { autoStart: false, autoConnect: false, selectedStrategy: 'auto', lastWorkingStrategy: null };
+  return { autoStart: false, autoConnect: false, selectedStrategy: 'auto', lastWorkingStrategy: null, autoUpdate: true };
 }
 
 function saveSettings(settings) {
@@ -2641,7 +2642,8 @@ function createTray() {
 function setupAutoUpdater() {
   if (isDev) return; // Don't check for updates in dev mode
   
-  const manualInstall = process.platform === 'darwin';
+  const settings = loadSettings();
+  const { manualInstall } = resolveUpdateMode({ platform: process.platform, autoUpdate: settings.autoUpdate });
   autoUpdater.autoDownload = !manualInstall;
   autoUpdater.autoInstallOnAppQuit = !manualInstall;
   
@@ -2957,7 +2959,9 @@ ipcMain.handle('install-update', async () => {
     return { ok: false, error: 'В режиме разработки обновление недоступно' };
   }
 
-  if (process.platform === 'darwin') {
+  const updateSettings = loadSettings();
+  const { manualInstall } = resolveUpdateMode({ platform: process.platform, autoUpdate: updateSettings.autoUpdate });
+  if (manualInstall) {
     return {
       ok: false,
       manual: true,
@@ -3012,6 +3016,13 @@ ipcMain.handle('set-auto-start', (event, enabled) => {
 ipcMain.handle('set-auto-connect', (event, enabled) => {
   const settings = loadSettings();
   settings.autoConnect = enabled;
+  saveSettings(settings);
+  return { success: true };
+});
+
+ipcMain.handle('set-auto-update', (event, enabled) => {
+  const settings = loadSettings();
+  settings.autoUpdate = enabled;
   saveSettings(settings);
   return { success: true };
 });
