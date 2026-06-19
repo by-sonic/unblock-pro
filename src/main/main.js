@@ -9,6 +9,7 @@ const tls = require('tls');
 const sudo = require('sudo-prompt');
 const { isMachOBinary } = require('./binary-format');
 const { copyFileResilient } = require('./safe-copy');
+const { buildMirrorUrls } = require('./mirror-urls');
 const {
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS
@@ -1304,23 +1305,40 @@ function downloadFileDirect(url, dest, timeoutMs = 120000) {
 async function downloadFile(url, dest) {
   const MAX_RETRIES = 3;
   const TIMEOUTS = [120000, 180000, 300000];
+  // If GitHub is blocked by the ISP (ECONNRESET), fall back to public GitHub
+  // proxies. The bundle is SHA256-verified after download, so a bad mirror
+  // response cannot result in installing tampered binaries.
+  const candidates = buildMirrorUrls(url);
   let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delaySec = attempt * 3;
-        sendLog({ type: 'info', message: `Повторная попытка скачивания (${attempt + 1}/${MAX_RETRIES}) через ${delaySec}с...` });
-        await new Promise(r => setTimeout(r, delaySec * 1000));
-        try { fs.unlinkSync(dest); } catch (e) {}
-      }
-      await downloadFileDirect(url, dest, TIMEOUTS[attempt] || 300000);
-      return;
-    } catch (err) {
-      lastError = err;
-      const retryable = ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'Timeout', 'socket hang up'].some(s => (err.message || '').includes(s));
-      if (!retryable || attempt === MAX_RETRIES - 1) throw err;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    const viaMirror = i > 0;
+    if (viaMirror) {
+      sendLog({ type: 'info', message: `GitHub недоступен напрямую — пробуем зеркало (${i}/${candidates.length - 1})...` });
     }
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delaySec = attempt * 3;
+          sendLog({ type: 'info', message: `Повторная попытка скачивания (${attempt + 1}/${MAX_RETRIES}) через ${delaySec}с...` });
+          await new Promise(r => setTimeout(r, delaySec * 1000));
+        }
+        try { fs.unlinkSync(dest); } catch (e) {}
+        await downloadFileDirect(candidate, dest, TIMEOUTS[attempt] || 300000);
+        return;
+      } catch (err) {
+        lastError = err;
+        const retryable = ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'Timeout', 'socket hang up'].some(s => (err.message || '').includes(s));
+        // Stop retrying THIS url if the error isn't transient; move to the next
+        // candidate (mirror) instead.
+        if (!retryable) break;
+      }
+    }
+    // This candidate exhausted — try the next mirror, if any.
   }
+
   throw lastError;
 }
 
