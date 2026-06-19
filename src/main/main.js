@@ -8,6 +8,8 @@ const dns = require('dns');
 const tls = require('tls');
 const sudo = require('sudo-prompt');
 const { isMachOBinary } = require('./binary-format');
+const { copyFileResilient } = require('./safe-copy');
+const { buildMirrorUrls } = require('./mirror-urls');
 const {
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS
@@ -1303,23 +1305,40 @@ function downloadFileDirect(url, dest, timeoutMs = 120000) {
 async function downloadFile(url, dest) {
   const MAX_RETRIES = 3;
   const TIMEOUTS = [120000, 180000, 300000];
+  // If GitHub is blocked by the ISP (ECONNRESET), fall back to public GitHub
+  // proxies. The bundle is SHA256-verified after download, so a bad mirror
+  // response cannot result in installing tampered binaries.
+  const candidates = buildMirrorUrls(url);
   let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delaySec = attempt * 3;
-        sendLog({ type: 'info', message: `Повторная попытка скачивания (${attempt + 1}/${MAX_RETRIES}) через ${delaySec}с...` });
-        await new Promise(r => setTimeout(r, delaySec * 1000));
-        try { fs.unlinkSync(dest); } catch (e) {}
-      }
-      await downloadFileDirect(url, dest, TIMEOUTS[attempt] || 300000);
-      return;
-    } catch (err) {
-      lastError = err;
-      const retryable = ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'Timeout', 'socket hang up'].some(s => (err.message || '').includes(s));
-      if (!retryable || attempt === MAX_RETRIES - 1) throw err;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
+    const viaMirror = i > 0;
+    if (viaMirror) {
+      sendLog({ type: 'info', message: `GitHub недоступен напрямую — пробуем зеркало (${i}/${candidates.length - 1})...` });
     }
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delaySec = attempt * 3;
+          sendLog({ type: 'info', message: `Повторная попытка скачивания (${attempt + 1}/${MAX_RETRIES}) через ${delaySec}с...` });
+          await new Promise(r => setTimeout(r, delaySec * 1000));
+        }
+        try { fs.unlinkSync(dest); } catch (e) {}
+        await downloadFileDirect(candidate, dest, TIMEOUTS[attempt] || 300000);
+        return;
+      } catch (err) {
+        lastError = err;
+        const retryable = ['ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'Timeout', 'socket hang up'].some(s => (err.message || '').includes(s));
+        // Stop retrying THIS url if the error isn't transient; move to the next
+        // candidate (mirror) instead.
+        if (!retryable) break;
+      }
+    }
+    // This candidate exhausted — try the next mirror, if any.
   }
+
   throw lastError;
 }
 
@@ -1400,20 +1419,30 @@ async function downloadAndExtractBinaries() {
         || candidates[0];
       
       if (winwsPath) {
-        fs.copyFileSync(winwsPath, path.join(platformDir, 'winws.exe'));
-        
+        // Release the WinDivert driver before overwriting its files. If the
+        // engine (winws.exe) is still running, WinDivert64.sys at the
+        // destination is locked and copying it throws EBUSY. Best-effort: the
+        // driver auto-unloads once winws exits, and copyFileResilient retries
+        // through the brief unload window.
+        try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe', timeout: 3000 }); } catch (e) {}
+
+        await copyFileResilient(winwsPath, path.join(platformDir, 'winws.exe'));
+
         // Copy ALL required files from the same directory as winws.exe:
         // - WinDivert driver files (WinDivert.dll, WinDivert64.sys, WinDivert32.sys)
         // - Cygwin runtime DLLs (cygwin1.dll, cygstdc++-6.dll, cyggcc_s-seh-1.dll, etc.)
         const winwsDir = path.dirname(winwsPath);
         const dirFiles = fs.readdirSync(winwsDir);
-        
+
         for (const file of dirFiles) {
           if (file === 'winws.exe') continue; // already copied
           const src = path.join(winwsDir, file);
           const stat = fs.statSync(src);
           if (stat.isFile()) {
-            fs.copyFileSync(src, path.join(platformDir, file));
+            // Resilient against the WinDivert-driver-locked case: the pinned
+            // bundle's destination files are byte-identical, so a locked-but-
+            // identical WinDivert64.sys is skipped instead of failing.
+            await copyFileResilient(src, path.join(platformDir, file));
           }
         }
         
@@ -1521,6 +1550,8 @@ async function downloadAndExtractBinaries() {
       errorMsg = 'Соединение сброшено — провайдер мог заблокировать GitHub. Попробуйте через VPN или мобильный интернет';
     } else if (error.message.includes('ENOTFOUND') || error.message.includes('getaddrinfo')) {
       errorMsg = 'Нет доступа к серверу — проверьте интернет-соединение';
+    } else if (error.message.includes('EBUSY') || error.code === 'EBUSY') {
+      errorMsg = 'Файл драйвера WinDivert занят. Отключите обход (кнопка «Стоп»), закройте другие приложения обхода блокировок и антивирус, затем повторите';
     } else if (error.message.includes('EPERM') || error.message.includes('EACCES')) {
       errorMsg = 'Нет прав для записи файлов — запустите от администратора';
     } else if (error.message.includes('Cannot write')) {

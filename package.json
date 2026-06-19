@@ -65,6 +65,13 @@
       "icon": "assets/sonic-icon.icns",
       "target": [
         {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
           "target": "zip",
           "arch": [
             "x64",
@@ -75,6 +82,21 @@
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "artifactName": "UnblockPro-${version}-mac-${arch}.${ext}"
+    },
+    "dmg": {
+      "artifactName": "UnblockPro-${version}-mac-${arch}.${ext}",
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
     },
     "win": {
       "icon": "assets/sonic-icon.png",
