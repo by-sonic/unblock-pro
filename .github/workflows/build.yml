@@ -117,6 +117,7 @@ jobs:
         with:
           name: mac-build
           path: |
+            dist/*.dmg
             dist/*.zip
             dist/*.yml
             dist/*.blockmap
@@ -224,8 +225,8 @@ jobs:
             
             | Платформа | Файл | Описание |
             |-----------|------|----------|
-            | **macOS** Apple Silicon (M1/M2/M3/M4) | `UnblockPro-*-mac-arm64.zip` | Для Mac с M-процессором |
-            | **macOS** Intel | `UnblockPro-*-mac-x64.zip` | Для Mac с Intel |
+            | **macOS** Apple Silicon (M1/M2/M3/M4) | `UnblockPro-*-mac-arm64.dmg` | Для Mac с M-процессором |
+            | **macOS** Intel | `UnblockPro-*-mac-x64.dmg` | Для Mac с Intel |
             | **Windows** | `UnblockPro-*-win-setup.exe` | Установщик |
             | **Windows** | `UnblockPro-*-win-portable.exe` | Портативная версия |
             
