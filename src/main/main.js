@@ -2704,12 +2704,14 @@ function createWindow() {
 
   mainWindow = new BrowserWindow({
     width: 420,
-    // Tall enough that the settings card and the "Свои домены" section are
-    // reachable without resizing. At 560px the promo card pushed them below the
-    // fold, and the 6px scrollbar gave no hint that anything was there.
+    // The promo card lives outside .main-content, so it permanently consumes
+    // ~145px that never scrolls away. Measured in the real renderer: at 560px
+    // the connect button itself ended up 8px below the fold, and "Свои домены"
+    // 216px below it. 680/600 keeps the connect button and the domains header
+    // visible at every allowed size.
     height: 680,
     minWidth: 380,
-    minHeight: 560,
+    minHeight: 600,
     frame: false,
     transparent: true,
     resizable: true,
