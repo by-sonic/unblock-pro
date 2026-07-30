@@ -1,0 +1,2 @@
+# Shell scripts must keep LF: a CRLF checkout makes bash fail on the \r.
+*.sh text eol=lf
