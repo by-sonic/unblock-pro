@@ -99,6 +99,29 @@ jobs:
           chmod 755 bin/darwin/tpws
           file bin/darwin/tpws | grep -q 'Mach-O universal binary'
 
+      # The runtime arch check gates every launch: if it rejected the binary we
+      # ship, every Mac would fall through to the "recompile locally" path and
+      # break. Assert against the real artifact, not a synthetic header.
+      - name: Verify arch validation accepts the bundled tpws
+        run: |
+          node -e "
+          const { getMachOCpuTypes, isMachOBinaryRunnable } = require('./src/main/binary-format');
+          const target = 'bin/darwin/tpws';
+          const types = getMachOCpuTypes(target);
+          console.log('detected cpu types:', types.map((t) => '0x' + t.toString(16)).join(', ') || '(none)');
+          if (types.length < 2) {
+            console.error('expected a universal binary with at least 2 slices');
+            process.exit(1);
+          }
+          for (const arch of ['x64', 'arm64']) {
+            if (!isMachOBinaryRunnable(target, arch)) {
+              console.error('REJECTED the shipped binary on ' + arch);
+              process.exit(1);
+            }
+            console.log('accepted on', arch);
+          }
+          "
+
       - name: Build macOS
         uses: nick-fields/retry@v3
         with:
