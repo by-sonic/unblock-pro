@@ -23,6 +23,7 @@ const {
   waitForPortState
 } = require('./process-lifecycle');
 const { buildMirrorUrls } = require('./mirror-urls');
+const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
 const {
   BODY_SAMPLE_BYTES,
   ORDERED_ENDPOINTS,
@@ -104,57 +105,10 @@ function applyAutoStart(enabled) {
   });
 }
 
-const ZAPRET_FALLBACK_URL = 'https://github.com/bol-van/zapret/releases/download/v70.6/zapret-v70.6.zip';
-
-// Dynamically fetch the latest zapret release URL from GitHub API, fallback to known version
-async function getLatestZapretUrl() {
-  try {
-    return await new Promise((resolve, reject) => {
-      const req = https.get('https://api.github.com/repos/bol-van/zapret/releases/latest', {
-        family: 4, lookup: ipv4Lookup,
-        headers: { 'User-Agent': 'UnblockPro' },
-        timeout: 30000
-      }, (res) => {
-        if (res.statusCode === 302 || res.statusCode === 301) {
-          const rReq = https.get(res.headers.location, { family: 4, lookup: ipv4Lookup, headers: { 'User-Agent': 'UnblockPro' }, timeout: 30000 }, (r) => {
-            let data = '';
-            r.on('data', chunk => data += chunk);
-            r.on('end', () => {
-              try { resolve(findZipAsset(JSON.parse(data))); } catch (e) { reject(e); }
-            });
-          });
-          rReq.on('error', reject);
-          rReq.on('timeout', () => { rReq.destroy(); reject(new Error('Timeout')); });
-          return;
-        }
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(findZipAsset(JSON.parse(data))); } catch (e) { reject(e); }
-        });
-      });
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-    });
-  } catch (e) {
-    sendLog({ type: 'warn', message: `GitHub API недоступен (${e.message}), используем запасную ссылку` });
-    return ZAPRET_FALLBACK_URL;
-  }
-}
-
-function findZipAsset(release) {
-  // Find the main zapret-*.zip (not openwrt, not tar.gz)
-  const assets = release.assets || [];
-  const zipAsset = assets.find(a =>
-    a.name.endsWith('.zip') &&
-    !a.name.includes('openwrt') &&
-    a.name.startsWith('zapret-')
-  );
-  if (zipAsset) return zipAsset.browser_download_url;
-  // Fallback: construct URL from tag name
-  const tag = release.tag_name;
-  return `https://github.com/bol-van/zapret/releases/download/${tag}/zapret-${tag}.zip`;
-}
+// The macOS runtime is compiled from a pinned zapret commit — see
+// src/main/zapret-source.js for why. Resolving "releases/latest" at runtime
+// meant the strategy list was validated against one tpws and users could be
+// running another.
 
 function getResourcePath() {
   if (isDev) {
@@ -1417,7 +1371,7 @@ async function downloadAndExtractBinaries() {
     // macOS continues to use the latest upstream zapret release for tpws.
     const downloadUrl = process.platform === 'win32'
       ? FLOWSEAL_BUNDLE_URL
-      : await getLatestZapretUrl();
+      : ZAPRET_MACOS_ARCHIVE_URL;
     
     const zipPath = path.join(tempDir, 'zapret.zip');
     
@@ -1541,18 +1495,26 @@ async function downloadAndExtractBinaries() {
     } else if (process.platform === 'darwin') {
       execSync(`unzip -o "${zipPath}" -d "${tempDir}"`, { stdio: 'pipe' });
       
-      // Find the zapret-* directory dynamically (version-independent)
-      const zapretDirs = fs.readdirSync(tempDir).filter(f => 
+      // The pinned archive expands to zapret-<commit>/. Requiring the commit in
+      // the name is the integrity check: it fails loudly if the download was not
+      // the source we intend to compile.
+      const zapretDirs = fs.readdirSync(tempDir).filter(f =>
         f.startsWith('zapret-') && fs.statSync(path.join(tempDir, f)).isDirectory()
       );
-      const zapretDir = zapretDirs.length > 0 
-        ? path.join(tempDir, zapretDirs[0]) 
-        : tempDir;
-      
+      const pinnedDir = zapretDirs.find(f => f.includes(ZAPRET_MACOS_COMMIT));
+      if (!pinnedDir) {
+        throw new Error(
+          `Скачанный архив не соответствует закреплённому коммиту ${ZAPRET_MACOS_COMMIT.slice(0, 12)} ` +
+          `(получено: ${zapretDirs.join(', ') || 'ничего'})`
+        );
+      }
+      const zapretDir = path.join(tempDir, pinnedDir);
+
       // Upstream prebuilt aarch64/x86_64 files are Linux ELF binaries. Always
       // compile the dedicated universal macOS target instead of copying them.
       const tpwsSrcDir = path.join(zapretDir, 'tpws');
       const compiledPath = path.join(tpwsSrcDir, 'tpws');
+      sendLog({ type: 'info', message: `Собираю tpws из zapret ${ZAPRET_MACOS_COMMIT.slice(0, 12)}...` });
       try {
         execSync('make mac', {
           cwd: tpwsSrcDir,
@@ -1561,7 +1523,18 @@ async function downloadAndExtractBinaries() {
           env: { ...process.env, OPTIMIZE: '-O2' }
         });
       } catch (e) {
-        throw new Error('tpws macOS compilation failed. Install Xcode Command Line Tools.');
+        // Do not flatten every cause into "install Xcode". A missing toolchain, a
+        // real compile error and a timeout need different actions from the user,
+        // and the previous message hid all three.
+        const stderr = (e.stderr ? e.stderr.toString() : '').trim();
+        const lastLine = stderr.split('\n').filter(Boolean).pop() || '';
+        const looksLikeMissingToolchain =
+          /make: (command )?not found|xcode-select|no developer tools|clang: (command )?not found/i.test(stderr);
+        throw new Error(
+          looksLikeMissingToolchain
+            ? 'Не найдены инструменты сборки. Установите их командой: xcode-select --install'
+            : `Сборка tpws не удалась: ${lastLine || e.message}`
+        );
       }
 
       if (!isMachOBinaryRunnable(compiledPath)) {
