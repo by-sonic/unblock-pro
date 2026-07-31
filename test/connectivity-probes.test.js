@@ -4,7 +4,12 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  ORDERED_ENDPOINTS,
+  PATIENT_TIMEOUTS,
+  PROBE_TIMEOUTS,
   PROBE_RULES,
+  REMAINING_ENDPOINTS,
+  SCREENING_ENDPOINTS,
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS,
   buildPowerShellProbeScript,
@@ -99,4 +104,78 @@ test('the generated PowerShell probe covers every rule and stays in sync', () =>
     assert.ok(kind, `no probe kind for ${url}`);
     assert.ok(script.includes(`'${kind}'`), `script has no branch for ${kind}`);
   }
+});
+
+test('tiering reorders probes without dropping or duplicating any', () => {
+  // The whole point of screening is speed, not leniency: acceptance still needs
+  // every probe. If a probe fell out of both tiers it would silently stop being
+  // verified, and a strategy could be accepted while that service stays broken.
+  const required = [...REQUIRED_YOUTUBE_ENDPOINTS, ...REQUIRED_DISCORD_ENDPOINTS];
+
+  assert.deepEqual(
+    [...ORDERED_ENDPOINTS].sort(),
+    [...required].sort(),
+    'screen + remaining must cover exactly the required endpoints'
+  );
+  assert.equal(new Set(ORDERED_ENDPOINTS).size, ORDERED_ENDPOINTS.length, 'no duplicates');
+  assert.deepEqual(ORDERED_ENDPOINTS, [...SCREENING_ENDPOINTS, ...REMAINING_ENDPOINTS]);
+
+  // Both tiers must be non-empty, else the split is pointless in one direction.
+  assert.ok(SCREENING_ENDPOINTS.length > 0, 'need at least one cheap screen');
+  assert.ok(REMAINING_ENDPOINTS.length > 0);
+
+  // No endpoint may appear in both tiers.
+  const overlap = SCREENING_ENDPOINTS.filter((u) => REMAINING_ENDPOINTS.includes(u));
+  assert.deepEqual(overlap, []);
+});
+
+test('the screen covers both services, so neither is verified late', () => {
+  // Screening on Discord alone would still be correct, but a strategy that only
+  // breaks YouTube would then pay the full battery before being rejected.
+  const kinds = SCREENING_ENDPOINTS.map(probeKind);
+
+  assert.ok(kinds.some((k) => k.startsWith('youtube')), `screen has no YouTube probe: ${kinds}`);
+  assert.ok(kinds.some((k) => k.startsWith('discord')), `screen has no Discord probe: ${kinds}`);
+});
+
+test('every probe rule declares a tier the splitter understands', () => {
+  for (const rule of PROBE_RULES) {
+    assert.ok(['screen', 'full'].includes(rule.tier), `${rule.kind}: bad tier ${rule.tier}`);
+  }
+});
+
+test('the expensive YouTube shell is never in the screening tier', () => {
+  // ~1 MB through the SOCKS proxy per strategy is what made the sweep slow.
+  assert.ok(
+    !SCREENING_ENDPOINTS.includes('https://www.youtube.com/'),
+    'youtube.com must stay in the full tier'
+  );
+});
+
+test('probe budgets are ordered so screening is the cheap phase', () => {
+  assert.ok(
+    PROBE_TIMEOUTS.screenTimeoutSec < PROBE_TIMEOUTS.fullTimeoutSec,
+    'the screen must be stricter than the full check, or tiering buys nothing'
+  );
+  // Patient budget is for the one strategy we have reason to believe in; it must
+  // never be tighter than the default or the "preferred" path would be worse off.
+  assert.ok(PATIENT_TIMEOUTS.screenTimeoutSec >= PROBE_TIMEOUTS.screenTimeoutSec);
+  assert.ok(PATIENT_TIMEOUTS.fullTimeoutSec >= PROBE_TIMEOUTS.fullTimeoutSec);
+});
+
+test('a full sweep of hung strategies stays in minutes, not a quarter hour', () => {
+  // Every timeout here is a wait on an answer that never comes. This is the
+  // regression guard for the real cost driver: at the old 15s budget, ~50
+  // strategies rejected on the screen was ~12.5 minutes of dead waiting.
+  const STRATEGIES = 50;
+  const OLD_BUDGET_SEC = 15;
+
+  const worstNow = STRATEGIES * PROBE_TIMEOUTS.screenTimeoutSec;
+  const worstBefore = STRATEGIES * OLD_BUDGET_SEC;
+
+  assert.ok(
+    worstNow <= 360,
+    `a doomed sweep must stay under 6 minutes of probe waiting, got ${worstNow}s`
+  );
+  assert.ok(worstNow < worstBefore / 2, 'must be at least a 2x improvement');
 });

@@ -25,8 +25,11 @@ const {
 const { buildMirrorUrls } = require('./mirror-urls');
 const {
   BODY_SAMPLE_BYTES,
-  REQUIRED_DISCORD_ENDPOINTS,
-  REQUIRED_YOUTUBE_ENDPOINTS,
+  ORDERED_ENDPOINTS,
+  PROBE_TIMEOUTS,
+  PATIENT_TIMEOUTS,
+  REMAINING_ENDPOINTS,
+  SCREENING_ENDPOINTS,
   buildPowerShellProbeScript,
   probeKind,
   probeLabel,
@@ -1837,11 +1840,18 @@ async function runProbeGroup(urls, groupLabel, runProbe) {
   return true;
 }
 
-async function testProxyConnection(port = TPWS_PORT, timeoutSec = 8) {
-  const probe = (url) => testSingleConnection(port, timeoutSec, url);
+async function testProxyConnection(port = TPWS_PORT, timeouts = PROBE_TIMEOUTS) {
+  const { screenTimeoutSec, fullTimeoutSec } = timeouts;
 
-  if (!await runProbeGroup(REQUIRED_YOUTUBE_ENDPOINTS, 'YouTube', probe)) return false;
-  if (!await runProbeGroup(REQUIRED_DISCORD_ENDPOINTS, 'Discord', probe)) return false;
+  // Cheapest probes first, on a short budget. Acceptance still requires every
+  // probe to pass, so this changes nothing about which strategy wins — it only
+  // stops a doomed strategy from costing a full YouTube page download and a
+  // 15-second hang before it is rejected.
+  const screen = (url) => testSingleConnection(port, screenTimeoutSec, url);
+  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
+
+  const full = (url) => testSingleConnection(port, fullTimeoutSec, url);
+  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', full)) return false;
 
   return true;
 }
@@ -1941,31 +1951,31 @@ function testDiscordWebSocketGateway(timeoutSec = 12) {
   });
 }
 
-async function testDirectConnection(timeoutSec = 10) {
+async function testDirectConnection(timeouts = PROBE_TIMEOUTS) {
+  const { screenTimeoutSec, fullTimeoutSec } = timeouts;
   // winws works at driver level — test with direct HTTPS requests (no SOCKS proxy)
   // IMPORTANT: Must verify BOTH YouTube AND Discord work, including Discord media
   // ports (2053,8443 etc.) which are needed for voice/video calls.
-  
-  const youtubeEndpoints = REQUIRED_YOUTUBE_ENDPOINTS;
-  const discordEndpoints = REQUIRED_DISCORD_ENDPOINTS;
   
   // Discord media — test TLS on the voice/media ports that DPI often blocks
   const discordMediaEndpoints = [
     'https://discord.media:443/',
     'https://discord.gg/'
   ];
-  
-  const probe = (url) => testSingleDirectConnection(url, timeoutSec);
 
-  // Require both the site and the video delivery path. A reachable thumbnail
-  // alone is a common false positive while actual playback remains blocked.
-  if (!await runProbeGroup(youtubeEndpoints, 'YouTube', probe)) return false;
+  // Cheapest probes first on a short budget — a doomed strategy is rejected on a
+  // few bytes instead of a full YouTube page plus a long hang. Acceptance still
+  // requires all of them, so the verdict is unchanged; only the order and the
+  // budget are. Covers YouTube web + video delivery and Discord API + CDN, so a
+  // partially working route is still not accepted.
+  const screen = (url) => testSingleDirectConnection(url, screenTimeoutSec);
+  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
 
-  // Require API and CDN so a partially working Discord route is not accepted.
-  if (!await runProbeGroup(discordEndpoints, 'Discord', probe)) return false;
+  const probe = (url) => testSingleDirectConnection(url, fullTimeoutSec);
+  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', probe)) return false;
 
   // CRITICAL: Test WebSocket to gateway — Discord app uses this to load. If broken, app stays on "Проблемы с подключением".
-  const gatewayWsOk = await testDiscordWebSocketGateway(timeoutSec);
+  const gatewayWsOk = await testDiscordWebSocketGateway(fullTimeoutSec);
   if (!gatewayWsOk) {
     sendLog({ type: 'warning', message: 'Discord gateway (WebSocket) не прошёл — приложение не загрузится' });
     return false;
@@ -1974,7 +1984,7 @@ async function testDirectConnection(timeoutSec = 10) {
   // Test Discord media (voice/video)
   let discordMediaOk = false;
   for (const url of discordMediaEndpoints) {
-    if (await testSingleDirectConnection(url, timeoutSec)) {
+    if (await testSingleDirectConnection(url, fullTimeoutSec)) {
       discordMediaOk = true;
       break;
     }
@@ -2114,9 +2124,14 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
     // notice page answering 200 used to be accepted and the strategy enabled
     // while nothing actually worked. Rules come from connectivity-probes.js so
     // this path and the Node path cannot diverge.
-    for (const url of [...REQUIRED_YOUTUBE_ENDPOINTS, ...REQUIRED_DISCORD_ENDPOINTS]) {
+    for (const url of ORDERED_ENDPOINTS) {
       bat += `:: probe ${probeLabel(url)}\r\n`;
-      bat += `powershell -ExecutionPolicy Bypass -NoProfile -File "${probeScript}" -Url "${url}" -Kind "${probeKind(url)}" -TimeoutSec 12\r\n`;
+      // Same tiering as the Node path: the cheap screening probes get the short
+      // budget, so a strategy DPI will break is rejected in seconds.
+      const probeTimeout = SCREENING_ENDPOINTS.includes(url)
+        ? PROBE_TIMEOUTS.screenTimeoutSec
+        : PROBE_TIMEOUTS.fullTimeoutSec;
+      bat += `powershell -ExecutionPolicy Bypass -NoProfile -File "${probeScript}" -Url "${url}" -Kind "${probeKind(url)}" -TimeoutSec ${probeTimeout}\r\n`;
       bat += 'if !errorlevel! neq 0 (\r\n';
       bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
       bat += '  timeout /t 1 /nobreak >nul\r\n';
@@ -2366,12 +2381,17 @@ async function startProxy() {
   const settings = loadSettings();
   let strategies = allStrategies;
   let singleStrategy = false;
-  
+  // True when strategies[0] is a deliberate choice — the user's pick, or the one
+  // that worked last time — rather than just the head of the default list. Those
+  // get the generous probe budget; the rest get the impatient one.
+  let firstIsPreferred = false;
+
   if (settings.selectedStrategy && settings.selectedStrategy !== 'auto') {
     const selected = allStrategies.find(s => s.name === settings.selectedStrategy);
     if (selected) {
       strategies = [selected];
       singleStrategy = true;
+      firstIsPreferred = true;
       sendLog({ type: 'info', message: `Выбрана стратегия: ${selected.name}` });
     }
   } else if (settings.lastWorkingStrategy) {
@@ -2380,6 +2400,7 @@ async function startProxy() {
     if (lastWorking) {
       const rest = allStrategies.filter(s => s.name !== settings.lastWorkingStrategy);
       strategies = [lastWorking, ...rest];
+      firstIsPreferred = true;
       sendLog({ type: 'info', message: `Сначала пробуем последнюю рабочую: ${lastWorking.name}` });
     }
   }
@@ -2474,7 +2495,11 @@ async function startProxy() {
 
   for (let i = 0; i < strategies.length; i++) {
     const strategy = strategies[i];
-    
+    // Only the deliberately-preferred first strategy waits the long budget. For
+    // the rest, a hung probe used to cost 15s each — over ~50 strategies that was
+    // most of a quarter-hour spent waiting on answers that never come.
+    const timeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
+
     // Update strategy progress
     strategyProgress = { current: i + 1, total: totalStrategies, name: strategy.name };
     sendStatus({ searching: true });
@@ -2567,7 +2592,7 @@ async function startProxy() {
         enableSystemProxy(TPWS_PORT);
 
         // Actually test if connection works through the proxy
-        const works = await testProxyConnection(TPWS_PORT, 10);
+        const works = await testProxyConnection(TPWS_PORT, timeouts);
 
         if (works) {
           // Strategy verified working
@@ -2636,7 +2661,7 @@ async function startProxy() {
         }
 
         // winws is running — test if DPI bypass actually works
-        const works = await testDirectConnection(10);
+        const works = await testDirectConnection(timeouts);
         
         if (works) {
           // Strategy verified working!

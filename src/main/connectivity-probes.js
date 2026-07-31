@@ -35,6 +35,7 @@ const BLOCK_NOTICE_PATTERN = 'blocked|\\u0437\\u0430\\u0431\\u043b\\u043e\\u043a
 const PROBE_RULES = Object.freeze([
   Object.freeze({
     kind: 'youtube-home',
+    tier: 'full',  // ~1 MB of HTML — never pay for it on a doomed strategy
     url: 'https://www.youtube.com/',
     label: 'YouTube Web',
     statuses: Object.freeze([200]),
@@ -43,6 +44,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'youtube-video',
+    tier: 'screen',  // 404 + empty body, a few bytes
     url: 'https://redirector.googlevideo.com/',
     label: 'YouTube video (googlevideo)',
     // This host has no index document — 404 is the healthy answer and proves the
@@ -53,6 +55,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'discord-api',
+    tier: 'screen',  // tiny JSON
     url: 'https://discord.com/api/v10/gateway',
     label: 'Discord API',
     statuses: Object.freeze([200]),
@@ -62,6 +65,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'discord-cdn',
+    tier: 'full',  // small PNG, but still a real download
     url: 'https://cdn.discordapp.com/embed/avatars/0.png',
     label: 'Discord CDN',
     statuses: Object.freeze([200]),
@@ -71,6 +75,42 @@ const PROBE_RULES = Object.freeze([
 ]);
 
 const RULES_BY_URL = new Map(PROBE_RULES.map((rule) => [rule.url, rule]));
+
+// Verification requires every probe to pass, so failing any one is already enough
+// to reject a strategy. That makes the order free to choose — and cheapest-first
+// matters a lot: with ~50 strategies, downloading the YouTube shell for every
+// doomed one is most of the wait. Screening probes answer in bytes.
+const SCREENING_ENDPOINTS = Object.freeze(
+  PROBE_RULES.filter((rule) => rule.tier === 'screen').map((rule) => rule.url)
+);
+const REMAINING_ENDPOINTS = Object.freeze(
+  PROBE_RULES.filter((rule) => rule.tier !== 'screen').map((rule) => rule.url)
+);
+
+// Cheapest-first order for callers that run the probes as one sequence, such as
+// the elevated Windows batch.
+const ORDERED_ENDPOINTS = Object.freeze([...SCREENING_ENDPOINTS, ...REMAINING_ENDPOINTS]);
+
+// Where the sweep time actually goes. Body size is a rounding error next to
+// waiting on a probe that will never answer: at 15s per hung probe, ~50
+// strategies is a quarter of an hour, which is what the old 15s budget cost
+// whenever nothing worked.
+//
+// Measured unproxied on a clean link, the screening probes answer in 53-82 ms
+// and the YouTube shell in ~295 ms, so 6s is roughly 20x headroom over a healthy
+// response — impatient with a hung strategy, not with a slow one.
+const PROBE_TIMEOUTS = Object.freeze({
+  screenTimeoutSec: 6,
+  fullTimeoutSec: 12
+});
+
+// The strategy that worked last time is tried first and deserves the old
+// generous budget: being wrong about it costs a reconnect, and it is one
+// strategy's worth of waiting, not fifty.
+const PATIENT_TIMEOUTS = Object.freeze({
+  screenTimeoutSec: 15,
+  fullTimeoutSec: 15
+});
 
 function matches(pattern, text) {
   return new RegExp(pattern, 'i').test(text);
@@ -185,7 +225,12 @@ function buildPowerShellProbeScript() {
 
 module.exports = {
   BODY_SAMPLE_BYTES,
+  ORDERED_ENDPOINTS,
+  PATIENT_TIMEOUTS,
   PROBE_RULES,
+  PROBE_TIMEOUTS,
+  REMAINING_ENDPOINTS,
+  SCREENING_ENDPOINTS,
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS,
   buildPowerShellProbeScript,
