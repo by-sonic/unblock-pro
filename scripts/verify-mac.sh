@@ -120,11 +120,25 @@ grep -hE 'tpws не запускается|отклонила подпись|П�
 echo
 
 echo "--- 7. cleanup check ---"
+# `npm start &` gives us npm's pid, not Electron's — killing npm alone leaves the
+# app running, which made the checks below measure a live app and report pf as
+# still enabled. Terminate Electron itself so this section means something.
 kill "$APP_PID" 2>/dev/null
-sleep 3
+pkill -f "Electron.*$PWD" 2>/dev/null
+pkill -f "electron .*$PWD" 2>/dev/null
+sleep 1
+
+APP_GONE=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if ! pgrep -f "Electron.*$PWD" >/dev/null 2>&1; then APP_GONE=1; break; fi
+  sleep 1
+done
+printf 'app actually terminated:      %s\n' "$([ "$APP_GONE" = "1" ] && echo yes || echo 'NO - readings below are unreliable')"
+
 LEAKED="$(pgrep -x tpws | wc -l | tr -d ' ')"
 printf 'tpws still alive after quit:  %s   <-- must be 0\n' "$LEAKED"
 printf 'pf status:                    %s\n' "$(sudo pfctl -s info 2>/dev/null | head -1 || echo 'skipped (no sudo)')"
+printf 'pf references (must be 0):    %s\n' "$(sudo pfctl -s References 2>/dev/null | head -1 || echo 'skipped (no sudo)')"
 printf 'system SOCKS proxy:           %s\n' "$(networksetup -getsocksfirewallproxy Wi-Fi 2>/dev/null | head -1)"
 [ "$LEAKED" != "0" ] && pkill -x tpws 2>/dev/null
 
