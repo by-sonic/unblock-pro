@@ -122,6 +122,34 @@ jobs:
           }
           "
 
+      # A binary that passes every static check and still gets SIGKILLed on exec
+      # is exactly what was reported on Apple Silicon (M4, macOS 27): universal,
+      # both slices present, dead the moment it runs. The runner is arm64, so
+      # actually running it here turns that report into a build gate.
+      - name: Verify the bundled tpws can actually execute
+        shell: bash
+        run: |
+          echo "runner arch: $(uname -m), macOS $(sw_vers -productVersion)"
+
+          echo "--- signature ---"
+          codesign -dv --verbose=4 bin/darwin/tpws 2>&1 | sed 's/^/  /' || echo "  (codesign reported nothing)"
+
+          echo "--- exec (no GNU timeout on the runner, so watchdog it) ---"
+          bin/darwin/tpws --help >"$RUNNER_TEMP/tpws-help.txt" 2>&1 &
+          pid=$!
+          ( sleep 10; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
+          watchdog=$!
+          wait $pid 2>/dev/null
+          code=$?
+          kill $watchdog 2>/dev/null
+
+          head -3 "$RUNNER_TEMP/tpws-help.txt" 2>/dev/null | sed 's/^/  /'
+          if [ "$code" -ge 128 ]; then
+            echo "FAIL: killed by signal $((code - 128)) on $(uname -m) — the shipped binary cannot run"
+            exit 1
+          fi
+          echo "ok: exited with code $code on $(uname -m)"
+
       - name: Build macOS
         uses: nick-fields/retry@v3
         with:
