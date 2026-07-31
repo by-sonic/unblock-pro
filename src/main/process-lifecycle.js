@@ -13,6 +13,7 @@
 //     traffic it never handled.
 
 const net = require('net');
+const { spawn } = require('child_process');
 
 const DEFAULT_PROBE_TIMEOUT_MS = 700;
 const DEFAULT_POLL_INTERVAL_MS = 150;
@@ -46,11 +47,15 @@ function probePort(port, { host = '127.0.0.1', timeoutMs = DEFAULT_PROBE_TIMEOUT
 
 // Poll until the port reaches the wanted state. Resolves false on timeout so
 // callers decide whether that is fatal.
+// `shouldAbort` lets the caller stop waiting the moment the wait is pointless —
+// e.g. the process that was supposed to bind the port has already died. Without
+// it, a process that dies instantly still costs the full timeout per attempt.
 async function waitForPortState(port, wantOpen, timeoutMs, options = {}) {
   const {
     host = '127.0.0.1',
     intervalMs = DEFAULT_POLL_INTERVAL_MS,
     probe = probePort,
+    shouldAbort = null,
     sleep = delay,
     now = Date.now
   } = options;
@@ -58,6 +63,7 @@ async function waitForPortState(port, wantOpen, timeoutMs, options = {}) {
   const deadline = now() + timeoutMs;
   for (;;) {
     if (await probe(port, { host }) === wantOpen) return true;
+    if (shouldAbort && shouldAbort()) return false;
     if (now() >= deadline) return false;
     await sleep(intervalMs);
   }
@@ -107,10 +113,74 @@ function terminateChild(child, options = {}) {
   });
 }
 
+// Turns a dead child into something a user or a bug report can act on.
+// A signal is not an exit code: reporting `код: null` for a SIGKILLed process
+// hid the real cause, which on Apple Silicon is almost always the kernel
+// refusing to run an unsigned binary.
+function describeChildExit(child, stderrTail = '', platform = process.platform) {
+  const stderrLine = String(stderrTail).trim().split('\n').filter(Boolean).pop();
+  if (stderrLine) return stderrLine;
+
+  const signal = child.signalCode;
+  if (!signal) return `код выхода: ${child.exitCode}`;
+
+  if (signal === 'SIGKILL' && platform === 'darwin') {
+    return 'убит системой (SIGKILL) — вероятно, macOS отклонила подпись бинарника';
+  }
+  return `сигнал: ${signal}`;
+}
+
+// Runs the binary once before the strategy loop. If it cannot execute at all,
+// iterating dozens of strategies just repeats the same failure and reports it as
+// "ни одна стратегия не сработала", which sends everyone looking at the wrong
+// thing. A non-zero exit still counts as success — it proves the binary ran.
+function probeBinaryRuns(binaryPath, options = {}) {
+  const { args = ['--help'], timeoutMs = 5000, platform = process.platform } = options;
+
+  return new Promise((resolve) => {
+    let stderrTail = '';
+    let killedByUs = false;
+    let child;
+
+    try {
+      child = spawn(binaryPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      resolve({ ok: false, reason: e.message });
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      killedByUs = true;
+      try { child.kill('SIGKILL'); } catch (e) {}
+    }, timeoutMs);
+
+    child.stdout.on('data', () => {});
+    child.stderr.on('data', (d) => { stderrTail = (stderrTail + d.toString()).slice(-500); });
+    child.on('error', (err) => { clearTimeout(timer); resolve({ ok: false, reason: err.message }); });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      // Our own timeout kill means it ran (and hung), which is not the failure
+      // this check is looking for.
+      if (signal && !killedByUs) {
+        resolve({
+          ok: false,
+          signal,
+          reason: describeChildExit({ exitCode: code, signalCode: signal }, stderrTail, platform)
+        });
+        return;
+      }
+      resolve({ ok: true });
+    });
+  });
+}
+
 module.exports = {
   DEFAULT_GRACE_MS,
   DEFAULT_KILL_TIMEOUT_MS,
+  describeChildExit,
   hasExited,
+  probeBinaryRuns,
   probePort,
   terminateChild,
   waitForPortState

@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require('electron');
 const path = require('path');
-const { spawn, exec, execFile, execSync } = require('child_process');
+const { spawn, exec, execFile, execFileSync, execSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
@@ -16,7 +16,9 @@ const {
 } = require('./system-files');
 const { copyFileResilient } = require('./safe-copy');
 const {
+  describeChildExit,
   hasExited,
+  probeBinaryRuns,
   terminateChild,
   waitForPortState
 } = require('./process-lifecycle');
@@ -2230,6 +2232,22 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
 
 // ============= PROXY CONTROL =============
 
+// Ad-hoc signing is the standard remedy when Apple Silicon refuses to run a
+// binary the app compiled or downloaded itself. Only attempted after an actual
+// SIGKILL, never pre-emptively.
+async function adHocSignBinary(binaryPath) {
+  if (process.platform !== 'darwin') return false;
+  try {
+    execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', binaryPath], {
+      stdio: 'pipe',
+      timeout: 20000
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // Kill tpws instances this app left behind (previous crash, or a strategy that
 // ignored SIGTERM). `pkill -x` matches the executable name exactly, so it can
 // never hit an unrelated process that merely has "tpws" somewhere in its
@@ -2312,6 +2330,27 @@ async function startProxy() {
     // A crash or forced quit can leave tpws holding port 1080, which would make
     // every strategy in this run fail to bind.
     await killStrayTpws();
+
+    // Verify tpws can execute at all before blaming the strategies for failing.
+    let runCheck = await probeBinaryRuns(finalBinaryPath);
+    if (!runCheck.ok && runCheck.signal === 'SIGKILL') {
+      sendLog({ type: 'warning', message: 'tpws убит системой — подписываю бинарник ad-hoc и пробую снова' });
+      if (await adHocSignBinary(finalBinaryPath)) {
+        runCheck = await probeBinaryRuns(finalBinaryPath);
+        if (runCheck.ok) {
+          sendLog({ type: 'success', message: 'Подпись исправлена, tpws запускается' });
+        }
+      }
+    }
+    if (!runCheck.ok) {
+      lastError = `tpws не запускается: ${runCheck.reason}. Перебор стратегий не поможет — проблема в самом бинарнике.`;
+      lastErrorCode = 'BINARY_NOT_EXECUTABLE';
+      sendLog({ type: 'error', message: lastError });
+      strategyProgress = null;
+      sendStatus({ searching: false });
+      return { success: false, error: lastError };
+    }
+
     // Set clean DNS (1.1.1.1, 8.8.8.8) to avoid ISP DNS poisoning for Discord
     setCleanDns(services);
     sendLog({ type: 'info', message: 'DNS установлен на 1.1.1.1 / 8.8.8.8 (защита от подмены)' });
@@ -2501,12 +2540,18 @@ async function startProxy() {
           }
         });
 
-        // Wait for tpws to bind, instead of hoping 2s was enough.
-        const listening = await waitForPortState(TPWS_PORT, true, 8000);
+        // Wait for tpws to bind, instead of hoping 2s was enough. Aborts the
+        // moment the process dies, so an instantly-failing binary costs
+        // milliseconds per strategy rather than the full timeout.
+        const listening = await waitForPortState(TPWS_PORT, true, 8000, {
+          shouldAbort: () => hasExited(child)
+        });
 
         if (hasExited(child)) {
-          const detail = stderrTail.trim().split('\n').pop() || `код: ${child.exitCode}`;
-          sendLog({ type: 'warning', message: `${strategy.name}: процесс не запустился — ${detail}` });
+          sendLog({
+            type: 'warning',
+            message: `${strategy.name}: процесс не запустился — ${describeChildExit(child, stderrTail)}`
+          });
           if (generation === proxyGeneration) proxyProcess = null;
           continue; // Process died, try next strategy
         }
