@@ -302,6 +302,10 @@ jobs:
             
             ---
             **by sonic**
+          # The block above is the same in every release, so on its own it never
+          # told anyone what actually changed. GitHub appends the real commit and
+          # PR list underneath it.
+          generate_release_notes: true
           draft: false
           prerelease: false
           files: |
