@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
+  <!-- img-src allows data: because the strategy dropdown draws its arrow from an
+       inline SVG. Without it the policy blocked the image and the select rendered
+       with no arrow at all. Kept narrow: only images, and no remote origin. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
   <title>UnblockPro</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -161,49 +164,6 @@
         <span class="btn-text">Подключить</span>
       </button>
 
-      <!-- Settings -->
-      <div class="settings-card">
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-label">Стратегия</span>
-            <span class="setting-desc">Выберите вручную, если авто не подошло</span>
-          </div>
-          <select class="strategy-select" id="strategySelect">
-            <option value="auto">Автоподбор</option>
-          </select>
-        </div>
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-label">Автозапуск</span>
-            <span class="setting-desc">Запускать при старте системы</span>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="autostartToggle">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-label">Автоподключение</span>
-            <span class="setting-desc">Подключаться при запуске</span>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="autoconnectToggle">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-        <div class="setting-row">
-          <div class="setting-info">
-            <span class="setting-label">Обновлять автоматически</span>
-            <span class="setting-desc">Выкл — только уведомлять, ставить вручную</span>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="autoupdateToggle">
-            <span class="toggle-slider"></span>
-          </label>
-        </div>
-      </div>
-
       <!-- Custom domains -->
       <div class="domains-card" id="domainsCard">
         <button class="domains-header" id="domainsToggle">
@@ -268,6 +228,49 @@
             </svg>
             Переподключитесь после изменения списков
           </div>
+        </div>
+      </div>
+
+      <!-- Settings -->
+      <div class="settings-card">
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-label">Стратегия</span>
+            <span class="setting-desc">Выберите вручную, если авто не подошло</span>
+          </div>
+          <select class="strategy-select" id="strategySelect">
+            <option value="auto">Автоподбор</option>
+          </select>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-label">Автозапуск</span>
+            <span class="setting-desc">Запускать при старте системы</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="autostartToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-label">Автоподключение</span>
+            <span class="setting-desc">Подключаться при запуске</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="autoconnectToggle">
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="setting-row">
+          <div class="setting-info">
+            <span class="setting-label">Обновлять автоматически</span>
+            <span class="setting-desc">Выкл — только уведомлять, ставить вручную</span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="autoupdateToggle">
+            <span class="toggle-slider"></span>
+          </label>
         </div>
       </div>
 

@@ -90,14 +90,77 @@ jobs:
       - name: Build universal macOS tpws
         shell: bash
         run: |
+          # Single source of truth for which zapret source we compile — the app
+          # pins the same commit for its runtime download, so a shipped runtime
+          # and a locally built one are the same code.
+          COMMIT="$(node -p "require('./src/main/zapret-source').ZAPRET_MACOS_COMMIT")"
+          echo "zapret commit: $COMMIT"
           mkdir -p temp/zapret
           git -C temp/zapret init
-          git -C temp/zapret fetch --depth 1 https://github.com/bol-van/zapret.git 1a1fc38c8ea05b481eebcbd338df48cdcca23c15
+          git -C temp/zapret fetch --depth 1 https://github.com/bol-van/zapret.git "$COMMIT"
           git -C temp/zapret checkout --detach FETCH_HEAD
           OPTIMIZE=-O2 make -C temp/zapret/tpws mac
           cp temp/zapret/tpws/tpws bin/darwin/tpws
           chmod 755 bin/darwin/tpws
           file bin/darwin/tpws | grep -q 'Mach-O universal binary'
+
+      # The runtime arch check gates every launch: if it rejected the binary we
+      # ship, every Mac would fall through to the "recompile locally" path and
+      # break. Assert against the real artifact, not a synthetic header.
+      - name: Verify arch validation accepts the bundled tpws
+        run: |
+          node -e "
+          const { getMachOCpuTypes, isMachOBinaryRunnable } = require('./src/main/binary-format');
+          const target = 'bin/darwin/tpws';
+          const types = getMachOCpuTypes(target);
+          console.log('detected cpu types:', types.map((t) => '0x' + t.toString(16)).join(', ') || '(none)');
+          if (types.length < 2) {
+            console.error('expected a universal binary with at least 2 slices');
+            process.exit(1);
+          }
+          for (const arch of ['x64', 'arm64']) {
+            if (!isMachOBinaryRunnable(target, arch)) {
+              console.error('REJECTED the shipped binary on ' + arch);
+              process.exit(1);
+            }
+            console.log('accepted on', arch);
+          }
+          "
+
+      # A binary that passes every static check and still gets SIGKILLed on exec
+      # is exactly what was reported on Apple Silicon (M4, macOS 27): universal,
+      # both slices present, dead the moment it runs. The runner is arm64, so
+      # actually running it here turns that report into a build gate.
+      - name: Verify the bundled tpws can actually execute
+        shell: bash
+        run: |
+          echo "runner arch: $(uname -m), macOS $(sw_vers -productVersion)"
+
+          echo "--- signature ---"
+          codesign -dv --verbose=4 bin/darwin/tpws 2>&1 | sed 's/^/  /' || echo "  (codesign reported nothing)"
+
+          echo "--- exec (no GNU timeout on the runner, so watchdog it) ---"
+          bin/darwin/tpws --help >"$RUNNER_TEMP/tpws-help.txt" 2>&1 &
+          pid=$!
+          ( sleep 10; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
+          watchdog=$!
+          # Actions runs bash with -e, and `wait` returns the child's status, so
+          # a non-zero exit would abort the step before the verdict is printed.
+          code=0
+          wait $pid 2>/dev/null || code=$?
+          kill $watchdog 2>/dev/null || true
+
+          echo "  exit status: $code"
+          echo "  output:"
+          head -5 "$RUNNER_TEMP/tpws-help.txt" 2>/dev/null | sed 's/^/    /' || true
+
+          # A non-zero exit is fine — plenty of tools return non-zero for --help.
+          # Only being killed by a signal means the binary cannot run at all.
+          if [ "$code" -ge 128 ]; then
+            echo "FAIL: killed by signal $((code - 128)) on $(uname -m) — the shipped binary cannot run"
+            exit 1
+          fi
+          echo "ok: tpws executes on $(uname -m)"
 
       - name: Build macOS
         uses: nick-fields/retry@v3
@@ -239,6 +302,10 @@ jobs:
             
             ---
             **by sonic**
+          # The block above is the same in every release, so on its own it never
+          # told anyone what actually changed. GitHub appends the real commit and
+          # PR list underneath it.
+          generate_release_notes: true
           draft: false
           prerelease: false
           files: |

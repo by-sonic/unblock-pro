@@ -7,6 +7,7 @@
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
     "sync:flowseal": "node scripts/sync-flowseal-strategies.js",
+    "build:icons": "electron scripts/build-icons.js",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
     "build:win": "electron-builder --win",
@@ -62,7 +63,7 @@
     ],
     "mac": {
       "category": "public.app-category.utilities",
-      "icon": "assets/sonic-icon.icns",
+      "icon": "assets/icon.icns",
       "target": [
         {
           "target": "dmg",
@@ -99,7 +100,7 @@
       ]
     },
     "win": {
-      "icon": "assets/sonic-icon.png",
+      "icon": "assets/icon.ico",
       "target": [
         {
           "target": "nsis",

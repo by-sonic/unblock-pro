@@ -33,12 +33,24 @@
 
 | Платформа | Файл | Описание |
 |-----------|------|----------|
-| **macOS** Apple Silicon (M1/M2/M3/M4) | [UnblockPro-mac-arm64.zip](https://github.com/by-sonic/unblock-pro/releases/latest) | Для Mac с M-процессором |
-| **macOS** Intel | [UnblockPro-mac-x64.zip](https://github.com/by-sonic/unblock-pro/releases/latest) | Для Mac с Intel |
+| **macOS** Apple Silicon (M1/M2/M3/M4) | [UnblockPro-mac-arm64.dmg / .zip](https://github.com/by-sonic/unblock-pro/releases/latest) | Для Mac с M-процессором |
+| **macOS** Intel | [UnblockPro-mac-x64.dmg / .zip](https://github.com/by-sonic/unblock-pro/releases/latest) | Для Mac с Intel |
 | **Windows** | [UnblockPro-win-setup.exe](https://github.com/by-sonic/unblock-pro/releases/latest) | Установщик |
 | **Windows** | [UnblockPro-win-portable.exe](https://github.com/by-sonic/unblock-pro/releases/latest) | Портативная версия (без установки) |
 
 > Перейдите в [Releases](https://github.com/by-sonic/unblock-pro/releases/latest) и скачайте версию для вашей ОС
+
+### Системные требования
+
+- **Windows 10 / 11 (x64).** Windows 7 и 8 не поддерживаются: движок обхода (WinDivert + runtime сборки Flowseal) использует системные API, которых там нет. Для Win7 смотрите [ByeDPI Manager](https://github.com/BDManual/ByeDPIManager-Manual/blob/main/win7.md).
+- **macOS 11 Big Sur или новее**, Intel и Apple Silicon (universal-бинарник `tpws` вложен в приложение).
+
+### Другие платформы
+
+Версии под Android и Linux не планируются — приложение написано на Electron и завязано на десктопные механизмы обхода. Готовые решения на том же принципе:
+
+- **Android:** [ByeDPI для Android](https://github.com/dovecoteescapee/ByeDPIAndroid), порты [zapret](https://github.com/bol-van/zapret) под Android
+- **Linux:** оригинальный [bol-van/zapret](https://github.com/bol-van/zapret) (nfqws/tpws, ставится скриптом `install_easy.sh`)
 
 ---
 
@@ -180,7 +192,16 @@ npm run build:mac
 
 # Собрать для Windows
 npm run build:win
+
+# Перерисовать иконки из assets/*.svg (нужно после правки знака)
+npm run build:icons
 ```
+
+### Иконки
+
+Знак живёт в трёх SVG в `assets/`: `icon.svg` (приложение), `tray-icon.svg` (строка меню macOS, чёрный по прозрачному — template image) и `tray-badge.svg` (трей Windows). Геометрия нарисована на сетке 16 единиц и только масштабируется, поэтому края попадают на целый пиксель во всех размерах.
+
+`npm run build:icons` растеризует их через Electron и пакует `.ico`/`.icns` — сторонних зависимостей не нужно. Результаты коммитятся в репозиторий: сборка иконки не рисует. Контрольный лист всех размеров — `assets/icon-preview.html`.
 
 ---
 

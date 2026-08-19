@@ -15,8 +15,8 @@ const {
   FLOWSEAL_REQUIRED_WINDOWS_FILES
 } = require('../src/main/flowseal-bundle');
 const { isMachOBinary } = require('../src/main/binary-format');
+const { ZAPRET_MACOS_COMMIT } = require('../src/main/zapret-source');
 
-const ZAPRET_MACOS_COMMIT = '1a1fc38c8ea05b481eebcbd338df48cdcca23c15';
 const repoRoot = path.join(__dirname, '..');
 const binRoot = path.join(repoRoot, 'bin');
 const tempRoot = path.join(repoRoot, 'temp', 'runtime-build');

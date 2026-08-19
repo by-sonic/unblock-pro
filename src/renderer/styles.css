@@ -1326,6 +1326,22 @@ body {
   border-radius: 3px;
 }
 
+/* The scroll area is always taller than the window, and a 6px thumb was not
+   enough of a hint — users reported the domains section as missing rather than
+   scrolled off. Keep the thumb permanently visible inside the settings list. */
+.main-content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.main-content::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+}
+
+.main-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.15);
 }

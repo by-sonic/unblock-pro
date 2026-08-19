@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- Windows/Linux tray badge. There is no template-image mechanism outside
+       macOS, and the taskbar may be light or dark, so a bare monochrome glyph
+       would vanish on one of them. The coloured tile stays legible on both.
+
+       Tighter padding than the app icon on purpose: at 32px the tile is already
+       small, so the glyph has to work harder. -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="55%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <mask id="breach">
+      <rect x="0" y="0" width="16" height="16" fill="#ffffff"/>
+      <rect x="3" y="6" width="8" height="4" rx="1" fill="#000000"/>
+    </mask>
+  </defs>
+
+  <rect width="32" height="32" rx="7" fill="url(#bg)"/>
+
+  <!-- 16-unit glyph at 82% of the tile, centred: scale 1.64, offset 2.88. -->
+  <g transform="translate(2.88 2.88) scale(1.64)" fill="#ffffff">
+    <rect x="5" y="0" width="3" height="16" rx="0.6" mask="url(#breach)"/>
+    <rect x="0" y="7" width="11" height="2" rx="1"/>
+    <path d="M9.5 4 L16 8 L9.5 12 Z"/>
+  </g>
+</svg>

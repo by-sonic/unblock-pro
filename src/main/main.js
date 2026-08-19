@@ -1,18 +1,42 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require('electron');
 const path = require('path');
-const { spawn, exec, execSync } = require('child_process');
+const { spawn, exec, execFile, execFileSync, execSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
 const tls = require('tls');
 const sudo = require('sudo-prompt');
-const { isMachOBinary } = require('./binary-format');
-const { copyFileResilient } = require('./safe-copy');
-const { buildMirrorUrls } = require('./mirror-urls');
+const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
 const {
-  REQUIRED_DISCORD_ENDPOINTS,
-  REQUIRED_YOUTUBE_ENDPOINTS
+  collectBlockHostnames,
+  hasCurrentBlock,
+  isSafeHostsRewrite,
+  parsePfEnableToken,
+  replaceMarkedBlock
+} = require('./system-files');
+const { copyFileResilient } = require('./safe-copy');
+const {
+  describeChildExit,
+  hasExited,
+  probeBinaryRuns,
+  terminateChild,
+  waitForPortState,
+  waitForStartupWindow
+} = require('./process-lifecycle');
+const { buildMirrorUrls } = require('./mirror-urls');
+const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
+const {
+  BODY_SAMPLE_BYTES,
+  ORDERED_ENDPOINTS,
+  PROBE_TIMEOUTS,
+  PATIENT_TIMEOUTS,
+  REMAINING_ENDPOINTS,
+  SCREENING_ENDPOINTS,
+  buildPowerShellProbeScript,
+  probeKind,
+  probeLabel,
+  validateProbe
 } = require('./connectivity-probes');
 const {
   FLOWSEAL_BUNDLE_MARKER,
@@ -36,6 +60,25 @@ const { resolveUpdateMode } = require('./update-mode');
 let mainWindow;
 let tray;
 let proxyProcess = null;
+// Incremented for every spawn attempt. A process that dies after the loop has
+// moved on must not touch shared state that now belongs to a newer attempt.
+let proxyGeneration = 0;
+// Makes probe temp-file names unique across concurrent probes.
+let probeCounter = 0;
+// A strategy search owns the bypass process, the SOCKS port and the system proxy
+// for minutes at a time. Two searches running at once fight over all three: each
+// kills the other's process and can credit a strategy for traffic the other one
+// carried. The generation token cannot help there — both loops share it.
+let isSearching = false;
+// Set when the user asks to disconnect or quit while a search is running. The
+// loop yields on every probe, so without this it would keep spawning processes
+// (or commit a "working" strategy, re-enabling the system proxy) after the user
+// has already left.
+let cancelRequested = false;
+// How long winws gets to install its WinDivert filters before it counts as up.
+const WINWS_STARTUP_MS = 3000;
+let warnedAboutBundledArch = false;
+const TPWS_PORT = 1080;
 let isConnected = false;
 let isDownloading = false;
 let currentStrategy = null;
@@ -76,57 +119,10 @@ function applyAutoStart(enabled) {
   });
 }
 
-const ZAPRET_FALLBACK_URL = 'https://github.com/bol-van/zapret/releases/download/v70.6/zapret-v70.6.zip';
-
-// Dynamically fetch the latest zapret release URL from GitHub API, fallback to known version
-async function getLatestZapretUrl() {
-  try {
-    return await new Promise((resolve, reject) => {
-      const req = https.get('https://api.github.com/repos/bol-van/zapret/releases/latest', {
-        family: 4, lookup: ipv4Lookup,
-        headers: { 'User-Agent': 'UnblockPro' },
-        timeout: 30000
-      }, (res) => {
-        if (res.statusCode === 302 || res.statusCode === 301) {
-          const rReq = https.get(res.headers.location, { family: 4, lookup: ipv4Lookup, headers: { 'User-Agent': 'UnblockPro' }, timeout: 30000 }, (r) => {
-            let data = '';
-            r.on('data', chunk => data += chunk);
-            r.on('end', () => {
-              try { resolve(findZipAsset(JSON.parse(data))); } catch (e) { reject(e); }
-            });
-          });
-          rReq.on('error', reject);
-          rReq.on('timeout', () => { rReq.destroy(); reject(new Error('Timeout')); });
-          return;
-        }
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(findZipAsset(JSON.parse(data))); } catch (e) { reject(e); }
-        });
-      });
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-    });
-  } catch (e) {
-    sendLog({ type: 'warn', message: `GitHub API недоступен (${e.message}), используем запасную ссылку` });
-    return ZAPRET_FALLBACK_URL;
-  }
-}
-
-function findZipAsset(release) {
-  // Find the main zapret-*.zip (not openwrt, not tar.gz)
-  const assets = release.assets || [];
-  const zipAsset = assets.find(a =>
-    a.name.endsWith('.zip') &&
-    !a.name.includes('openwrt') &&
-    a.name.startsWith('zapret-')
-  );
-  if (zipAsset) return zipAsset.browser_download_url;
-  // Fallback: construct URL from tag name
-  const tag = release.tag_name;
-  return `https://github.com/bol-van/zapret/releases/download/${tag}/zapret-${tag}.zip`;
-}
+// The macOS runtime is compiled from a pinned zapret commit — see
+// src/main/zapret-source.js for why. Resolving "releases/latest" at runtime
+// meant the strategy list was validated against one tpws and users could be
+// running another.
 
 function getResourcePath() {
   if (isDev) {
@@ -150,17 +146,28 @@ function getBinaryPath() {
   const binDir = getResourcePath();
   
   if (process.platform === 'darwin') {
+    // Require a slice for this CPU, not just a valid Mach-O header. A bundle
+    // built for the other architecture would otherwise be selected and then
+    // fail at exec time with a null exit code.
     if (app.isPackaged) {
       const bundledBinary = path.join(process.resourcesPath, 'bin', 'tpws');
-      if (isMachOBinary(bundledBinary)) return bundledBinary;
+      if (isMachOBinaryRunnable(bundledBinary)) return bundledBinary;
+      // getBinaryPath() runs on every status update, so warn only once.
+      if (!warnedAboutBundledArch && isMachOBinary(bundledBinary)) {
+        warnedAboutBundledArch = true;
+        sendLog({
+          type: 'warning',
+          message: `Встроенный tpws собран под другую архитектуру (нужна ${process.arch}) — пересоберу локально`
+        });
+      }
     }
 
     // Fall back to a previously downloaded or development binary.
     const arch = process.arch === 'arm64' ? 'arm64' : 'x86_64';
     const archBinary = path.join(binDir, `tpws_${arch}`);
-    if (isMachOBinary(archBinary)) return archBinary;
+    if (isMachOBinaryRunnable(archBinary)) return archBinary;
     const binary = path.join(binDir, 'tpws');
-    if (isMachOBinary(binary)) return binary;
+    if (isMachOBinaryRunnable(binary)) return binary;
     return path.join(binDir, 'tpws');
   } else if (process.platform === 'win32') {
     return path.join(binDir, 'winws.exe');
@@ -1227,9 +1234,23 @@ function updateTrayMenu() {
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Открыть', click: () => mainWindow.show() },
     { type: 'separator' },
-    { label: isConnected ? '● Подключено' : '○ Отключено', enabled: false },
-    { label: 'Подключить', click: () => startProxy(), enabled: !isConnected && !isDownloading },
-    { label: 'Отключить', click: () => stopProxy(), enabled: isConnected },
+    {
+      label: isConnected ? '● Подключено' : (isSearching ? '◌ Подбор стратегии…' : '○ Отключено'),
+      enabled: false
+    },
+    // Disabled while a search runs: the search owns the bypass process, the port
+    // and the system proxy for minutes, and a second one would fight it for all
+    // three. The renderer guards its own button, but the tray is a separate path.
+    {
+      label: 'Подключить',
+      click: () => { startProxy().catch((e) => sendLog({ type: 'error', message: `Ошибка подключения: ${e.message}` })); },
+      enabled: !isConnected && !isDownloading && !isSearching
+    },
+    {
+      label: isSearching && !isConnected ? 'Отменить подбор' : 'Отключить',
+      click: () => stopProxy(),
+      enabled: isConnected || isSearching
+    },
     { type: 'separator' },
     { label: 'Выход', click: () => { app.isQuitting = true; stopProxy(); app.quit(); }}
   ]);
@@ -1378,7 +1399,7 @@ async function downloadAndExtractBinaries() {
     // macOS continues to use the latest upstream zapret release for tpws.
     const downloadUrl = process.platform === 'win32'
       ? FLOWSEAL_BUNDLE_URL
-      : await getLatestZapretUrl();
+      : ZAPRET_MACOS_ARCHIVE_URL;
     
     const zipPath = path.join(tempDir, 'zapret.zip');
     
@@ -1502,18 +1523,26 @@ async function downloadAndExtractBinaries() {
     } else if (process.platform === 'darwin') {
       execSync(`unzip -o "${zipPath}" -d "${tempDir}"`, { stdio: 'pipe' });
       
-      // Find the zapret-* directory dynamically (version-independent)
-      const zapretDirs = fs.readdirSync(tempDir).filter(f => 
+      // The pinned archive expands to zapret-<commit>/. Requiring the commit in
+      // the name is the integrity check: it fails loudly if the download was not
+      // the source we intend to compile.
+      const zapretDirs = fs.readdirSync(tempDir).filter(f =>
         f.startsWith('zapret-') && fs.statSync(path.join(tempDir, f)).isDirectory()
       );
-      const zapretDir = zapretDirs.length > 0 
-        ? path.join(tempDir, zapretDirs[0]) 
-        : tempDir;
-      
+      const pinnedDir = zapretDirs.find(f => f.includes(ZAPRET_MACOS_COMMIT));
+      if (!pinnedDir) {
+        throw new Error(
+          `Скачанный архив не соответствует закреплённому коммиту ${ZAPRET_MACOS_COMMIT.slice(0, 12)} ` +
+          `(получено: ${zapretDirs.join(', ') || 'ничего'})`
+        );
+      }
+      const zapretDir = path.join(tempDir, pinnedDir);
+
       // Upstream prebuilt aarch64/x86_64 files are Linux ELF binaries. Always
       // compile the dedicated universal macOS target instead of copying them.
       const tpwsSrcDir = path.join(zapretDir, 'tpws');
       const compiledPath = path.join(tpwsSrcDir, 'tpws');
+      sendLog({ type: 'info', message: `Собираю tpws из zapret ${ZAPRET_MACOS_COMMIT.slice(0, 12)}...` });
       try {
         execSync('make mac', {
           cwd: tpwsSrcDir,
@@ -1522,10 +1551,21 @@ async function downloadAndExtractBinaries() {
           env: { ...process.env, OPTIMIZE: '-O2' }
         });
       } catch (e) {
-        throw new Error('tpws macOS compilation failed. Install Xcode Command Line Tools.');
+        // Do not flatten every cause into "install Xcode". A missing toolchain, a
+        // real compile error and a timeout need different actions from the user,
+        // and the previous message hid all three.
+        const stderr = (e.stderr ? e.stderr.toString() : '').trim();
+        const lastLine = stderr.split('\n').filter(Boolean).pop() || '';
+        const looksLikeMissingToolchain =
+          /make: (command )?not found|xcode-select|no developer tools|clang: (command )?not found/i.test(stderr);
+        throw new Error(
+          looksLikeMissingToolchain
+            ? 'Не найдены инструменты сборки. Установите их командой: xcode-select --install'
+            : `Сборка tpws не удалась: ${lastLine || e.message}`
+        );
       }
 
-      if (!isMachOBinary(compiledPath)) {
+      if (!isMachOBinaryRunnable(compiledPath)) {
         throw new Error('tpws binary not found and compilation failed. Please install Xcode Command Line Tools.');
       }
       const destination = path.join(platformDir, 'tpws');
@@ -1578,6 +1618,10 @@ async function downloadAndExtractBinaries() {
 //    TCP WebSocket for voice, which goes through tpws and gets DPI-bypassed
 
 let quicBlockEnabled = false;
+// `pfctl -E` hands out a reference token and refuses to disable pf until every
+// token is released with `pfctl -X`. Without releasing ours, pf stayed enabled
+// after disconnect and kept interfering with other networking tools.
+let pfEnableToken = null;
 
 async function enableQuicBlock() {
   if (process.platform !== 'darwin') return true;
@@ -1604,18 +1648,20 @@ async function enableQuicBlock() {
   }
 
   return new Promise((resolve) => {
+    // `-E` writes its token to stderr, so keep both streams.
     sudo.exec(
-      `/sbin/pfctl -f "${pfConfPath}" 2>/dev/null; /sbin/pfctl -E 2>/dev/null; exit 0`,
+      `/sbin/pfctl -f "${pfConfPath}" 2>/dev/null; /sbin/pfctl -E 2>&1; exit 0`,
       { name: 'UnblockPro' },
-      (error) => {
+      (error, stdout, stderr) => {
         if (error) {
           sendLog({ type: 'warning', message: 'UDP блокировка не установлена — Discord голос и YouTube могут не работать' });
           resolve(false);
-        } else {
-          quicBlockEnabled = true;
-          sendLog({ type: 'info', message: 'UDP заблокирован (QUIC + Discord Voice) — трафик идёт через TCP' });
-          resolve(true);
+          return;
         }
+        pfEnableToken = parsePfEnableToken(`${stdout || ''}\n${stderr || ''}`);
+        quicBlockEnabled = true;
+        sendLog({ type: 'info', message: 'UDP заблокирован (QUIC + Discord Voice) — трафик идёт через TCP' });
+        resolve(true);
       }
     );
   });
@@ -1625,12 +1671,19 @@ function disableQuicBlock() {
   if (!quicBlockEnabled || process.platform !== 'darwin') return;
   quicBlockEnabled = false;
 
+  const token = pfEnableToken;
+  pfEnableToken = null;
+  // Reload the untouched system ruleset, then hand back our enable reference so
+  // pf can return to whatever state it was in before we started.
+  const release = token ? `/sbin/pfctl -X ${token} 2>/dev/null; ` : '';
+  const command = `/sbin/pfctl -f /etc/pf.conf 2>/dev/null; ${release}exit 0`;
+
   try {
-    execSync('/sbin/pfctl -f /etc/pf.conf 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' });
+    execSync(command, { stdio: 'pipe', shell: '/bin/sh' });
   } catch (e) {
     // Fallback: try via sudo-prompt (credentials may still be cached)
     try {
-      sudo.exec('/sbin/pfctl -f /etc/pf.conf 2>/dev/null; exit 0', { name: 'UnblockPro' }, () => {});
+      sudo.exec(command, { name: 'UnblockPro' }, () => {});
     } catch (e2) {}
   }
 }
@@ -1725,36 +1778,81 @@ function flushDnsCache() {
   try { execSync('killall -HUP mDNSResponder 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' }); } catch (e) {}
 }
 
+// Reads at most `limit` bytes so a multi-megabyte page cannot blow up memory.
+function readBodySample(filePath, limit = BODY_SAMPLE_BYTES) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(limit);
+      const read = fs.readSync(fd, buf, 0, limit, 0);
+      return buf.subarray(0, read);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (e) {
+    return Buffer.alloc(0);
+  }
+}
+
+// The body goes to a temp file rather than stdout: it keeps memory bounded and
+// leaves the status code as the only thing on stdout, so there is nothing to
+// mis-parse.
 function testSingleConnection(port, timeoutSec, url) {
   return new Promise((resolve) => {
-    exec(
-      `curl --socks5-hostname 127.0.0.1:${port} --connect-timeout ${timeoutSec} -s -o /dev/null -w "%{http_code}" ${url}`,
-      { timeout: (timeoutSec + 5) * 1000 },
+    const bodyFile = path.join(
+      app.getPath('temp'),
+      `unblock-probe-${process.pid}-${probeCounter++}.bin`
+    );
+    const cleanup = () => { try { fs.unlinkSync(bodyFile); } catch (e) {} };
+
+    execFile(
+      'curl',
+      [
+        '--socks5-hostname', `127.0.0.1:${port}`,
+        '--connect-timeout', String(timeoutSec),
+        '--max-time', String(timeoutSec + 5),
+        '-s', '-o', bodyFile,
+        '-w', '%{http_code}',
+        url
+      ],
+      { timeout: (timeoutSec + 8) * 1000 },
       (error, stdout) => {
-        if (error) { resolve(false); return; }
-        const code = parseInt(stdout.trim(), 10);
-        resolve(code > 0 && code < 500);
+        if (error) { cleanup(); resolve(false); return; }
+        const status = parseInt(String(stdout).trim(), 10);
+        const body = readBodySample(bodyFile);
+        cleanup();
+        if (!Number.isFinite(status)) { resolve(false); return; }
+        resolve(validateProbe(url, status, body.toString('utf8'), body.subarray(0, 16).toString('hex')));
       }
     );
   });
 }
 
-async function testProxyConnection(port = 1080, timeoutSec = 8) {
-  const youtubeResults = await Promise.all(
-    REQUIRED_YOUTUBE_ENDPOINTS.map((url) => testSingleConnection(port, timeoutSec, url))
-  );
-  if (!youtubeResults.every(Boolean)) {
-    sendLog({ type: 'warning', message: 'YouTube Web/video не прошли через прокси — стратегия не подходит' });
+async function runProbeGroup(urls, groupLabel, runProbe) {
+  const results = await Promise.all(urls.map((url) => runProbe(url)));
+  const failed = urls.filter((_, i) => !results[i]).map(probeLabel);
+  if (failed.length > 0) {
+    sendLog({
+      type: 'warning',
+      message: `${groupLabel}: не прошли проверку — ${failed.join(', ')}`
+    });
     return false;
   }
+  return true;
+}
 
-  const discordResults = await Promise.all(
-    REQUIRED_DISCORD_ENDPOINTS.map((url) => testSingleConnection(port, timeoutSec, url))
-  );
-  if (!discordResults.every(Boolean)) {
-    sendLog({ type: 'warning', message: 'Discord API/CDN не прошли через прокси — стратегия не подходит' });
-    return false;
-  }
+async function testProxyConnection(port = TPWS_PORT, timeouts = PROBE_TIMEOUTS) {
+  const { screenTimeoutSec, fullTimeoutSec } = timeouts;
+
+  // Cheapest probes first, on a short budget. Acceptance still requires every
+  // probe to pass, so this changes nothing about which strategy wins — it only
+  // stops a doomed strategy from costing a full YouTube page download and a
+  // 15-second hang before it is rejected.
+  const screen = (url) => testSingleConnection(port, screenTimeoutSec, url);
+  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
+
+  const full = (url) => testSingleConnection(port, fullTimeoutSec, url);
+  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', full)) return false;
 
   return true;
 }
@@ -1763,6 +1861,9 @@ async function testProxyConnection(port = 1080, timeoutSec = 8) {
 
 function testSingleDirectConnection(url, timeoutSec = 10) {
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+
     try {
       const urlObj = new URL(url);
       const req = https.get({
@@ -1772,13 +1873,35 @@ function testSingleDirectConnection(url, timeoutSec = 10) {
         timeout: timeoutSec * 1000,
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
       }, (res) => {
-        res.resume();
-        resolve(res.statusCode > 0 && res.statusCode < 500);
+        // Read a bounded sample so the body can be validated, then stop early —
+        // a status code alone does not prove the real service answered.
+        const chunks = [];
+        let size = 0;
+        res.on('data', (chunk) => {
+          if (size >= BODY_SAMPLE_BYTES) return;
+          chunks.push(chunk);
+          size += chunk.length;
+          if (size >= BODY_SAMPLE_BYTES) {
+            res.destroy();
+          }
+        });
+        const done = () => {
+          const body = Buffer.concat(chunks);
+          finish(validateProbe(
+            url,
+            res.statusCode,
+            body.toString('utf8'),
+            body.subarray(0, 16).toString('hex')
+          ));
+        };
+        res.on('end', done);
+        res.on('close', done);
+        res.on('error', () => finish(false));
       });
-      req.on('error', () => resolve(false));
-      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.on('error', () => finish(false));
+      req.on('timeout', () => { req.destroy(); finish(false); });
     } catch (e) {
-      resolve(false);
+      finish(false);
     }
   });
 }
@@ -1829,45 +1952,31 @@ function testDiscordWebSocketGateway(timeoutSec = 12) {
   });
 }
 
-async function testDirectConnection(timeoutSec = 10) {
+async function testDirectConnection(timeouts = PROBE_TIMEOUTS) {
+  const { screenTimeoutSec, fullTimeoutSec } = timeouts;
   // winws works at driver level — test with direct HTTPS requests (no SOCKS proxy)
   // IMPORTANT: Must verify BOTH YouTube AND Discord work, including Discord media
   // ports (2053,8443 etc.) which are needed for voice/video calls.
-  
-  const youtubeEndpoints = REQUIRED_YOUTUBE_ENDPOINTS;
-  const discordEndpoints = REQUIRED_DISCORD_ENDPOINTS;
   
   // Discord media — test TLS on the voice/media ports that DPI often blocks
   const discordMediaEndpoints = [
     'https://discord.media:443/',
     'https://discord.gg/'
   ];
-  
-  // Require both the site and the video delivery path. A reachable thumbnail
-  // alone is a common false positive while actual playback remains blocked.
-  const youtubeResults = await Promise.all(
-    youtubeEndpoints.map((url) => testSingleDirectConnection(url, timeoutSec))
-  );
-  const youtubeOk = youtubeResults.every(Boolean);
-  
-  if (!youtubeOk) {
-    sendLog({ type: 'warning', message: 'YouTube TLS не прошёл — стратегия не подходит' });
-    return false;
-  }
-  
-  // Require API and CDN so a partially working Discord route is not accepted.
-  const requiredDiscordResults = await Promise.all(
-    discordEndpoints.slice(0, 2).map((url) => testSingleDirectConnection(url, timeoutSec))
-  );
-  const discordOk = requiredDiscordResults.every(Boolean);
-  
-  if (!discordOk) {
-    sendLog({ type: 'warning', message: 'Discord API не прошёл — стратегия не подходит' });
-    return false;
-  }
-  
+
+  // Cheapest probes first on a short budget — a doomed strategy is rejected on a
+  // few bytes instead of a full YouTube page plus a long hang. Acceptance still
+  // requires all of them, so the verdict is unchanged; only the order and the
+  // budget are. Covers YouTube web + video delivery and Discord API + CDN, so a
+  // partially working route is still not accepted.
+  const screen = (url) => testSingleDirectConnection(url, screenTimeoutSec);
+  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
+
+  const probe = (url) => testSingleDirectConnection(url, fullTimeoutSec);
+  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', probe)) return false;
+
   // CRITICAL: Test WebSocket to gateway — Discord app uses this to load. If broken, app stays on "Проблемы с подключением".
-  const gatewayWsOk = await testDiscordWebSocketGateway(timeoutSec);
+  const gatewayWsOk = await testDiscordWebSocketGateway(fullTimeoutSec);
   if (!gatewayWsOk) {
     sendLog({ type: 'warning', message: 'Discord gateway (WebSocket) не прошёл — приложение не загрузится' });
     return false;
@@ -1876,7 +1985,7 @@ async function testDirectConnection(timeoutSec = 10) {
   // Test Discord media (voice/video)
   let discordMediaOk = false;
   for (const url of discordMediaEndpoints) {
-    if (await testSingleDirectConnection(url, timeoutSec)) {
+    if (await testSingleDirectConnection(url, fullTimeoutSec)) {
       discordMediaOk = true;
       break;
     }
@@ -1958,19 +2067,23 @@ const PS_TEST_GATEWAY_WS = [
   'exit 1'
 ].join('\r\n');
 
-async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies) {
+async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies, firstIsPreferred = false) {
   const binDirectory = path.dirname(finalBinaryPath);
   const tempDir = app.getPath('temp');
   const resultFile = path.join(tempDir, 'unblock-result.txt');
   const progressFile = path.join(tempDir, 'unblock-progress.txt');
   const batchFile = path.join(tempDir, 'unblock-test.bat');
   const wsTestScript = path.join(tempDir, 'unblock-test-ws.ps1');
+  const probeScript = path.join(tempDir, 'unblock-test-probe.ps1');
 
   // Clean old temp files
   try { fs.unlinkSync(resultFile); } catch(e) {}
   try { fs.unlinkSync(progressFile); } catch(e) {}
   try { fs.unlinkSync(wsTestScript); } catch(e) {}
+  try { fs.unlinkSync(probeScript); } catch(e) {}
   fs.writeFileSync(wsTestScript, PS_TEST_GATEWAY_WS, 'utf8');
+  // ASCII-only by construction, so no BOM is needed for PowerShell 5.1 to parse it.
+  fs.writeFileSync(probeScript, buildPowerShellProbeScript(), 'ascii');
 
   const hostsUpdateScript = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
 
@@ -2008,39 +2121,28 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
     bat += `cd /d "${binDirectory}"\r\n`;
     bat += `start "" /b "${finalBinaryPath}" ${quotedArgs}\r\n`;
     bat += 'timeout /t 4 /nobreak >nul\r\n';
-    // Require YouTube web and video delivery. Testing only a thumbnail produces
-    // false positives when the interface loads but playback is still blocked.
-    bat += 'set "YT_OK=0"\r\n';
-    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_YOUTUBE_ENDPOINTS[0]}' -TimeoutSec 12 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
-    bat += 'if !errorlevel! equ 0 set "YT_OK=1"\r\n';
-    bat += 'if "!YT_OK!"=="0" (\r\n';
-    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += '  timeout /t 1 /nobreak >nul\r\n';
-    bat += '  goto :strat_next_' + i + '\r\n';
-    bat += ')\r\n';
-    bat += 'set "YT_VIDEO_OK=0"\r\n';
-    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_YOUTUBE_ENDPOINTS[1]}' -TimeoutSec 12 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -lt 500) { exit 0 }; exit 1 }"\r\n`;
-    bat += 'if !errorlevel! equ 0 set "YT_VIDEO_OK=1"\r\n';
-    bat += 'if "!YT_VIDEO_OK!"=="0" (\r\n';
-    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += '  timeout /t 1 /nobreak >nul\r\n';
-    bat += '  goto :strat_next_' + i + '\r\n';
-    bat += ')\r\n';
-    // Require Discord API and a real CDN asset.
-    bat += 'set "DC_OK=0"\r\n';
-    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_DISCORD_ENDPOINTS[0]}' -TimeoutSec 10 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
-    bat += 'if !errorlevel! equ 0 set "DC_OK=1"\r\n';
-    bat += 'if "!DC_OK!"=="0" (\r\n';
-    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += '  goto :strat_next_' + i + '\r\n';
-    bat += ')\r\n';
-    bat += 'set "DC_CDN_OK=0"\r\n';
-    bat += `powershell -command "try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $r = Invoke-WebRequest -Uri '${REQUIRED_DISCORD_ENDPOINTS[1]}' -TimeoutSec 10 -UseBasicParsing; if ($r.StatusCode -lt 500) { exit 0 } else { exit 1 } } catch { exit 1 }"\r\n`;
-    bat += 'if !errorlevel! equ 0 set "DC_CDN_OK=1"\r\n';
-    bat += 'if "!DC_CDN_OK!"=="0" (\r\n';
-    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += '  goto :strat_next_' + i + '\r\n';
-    bat += ')\r\n';
+    // Every probe validates the response body, not just the status code: an ISP
+    // notice page answering 200 used to be accepted and the strategy enabled
+    // while nothing actually worked. Rules come from connectivity-probes.js so
+    // this path and the Node path cannot diverge.
+    for (const url of ORDERED_ENDPOINTS) {
+      bat += `:: probe ${probeLabel(url)}\r\n`;
+      // Same tiering as the Node path: the cheap screening probes get the short
+      // budget, so a strategy DPI will break is rejected in seconds. And, as in
+      // the Node path, a deliberately-preferred first strategy (the user's pick,
+      // or the one that worked last time) gets the generous budget so a slow
+      // network cannot cost it its place.
+      const strategyTimeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
+      const probeTimeout = SCREENING_ENDPOINTS.includes(url)
+        ? strategyTimeouts.screenTimeoutSec
+        : strategyTimeouts.fullTimeoutSec;
+      bat += `powershell -ExecutionPolicy Bypass -NoProfile -File "${probeScript}" -Url "${url}" -Kind "${probeKind(url)}" -TimeoutSec ${probeTimeout}\r\n`;
+      bat += 'if !errorlevel! neq 0 (\r\n';
+      bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
+      bat += '  timeout /t 1 /nobreak >nul\r\n';
+      bat += '  goto :strat_next_' + i + '\r\n';
+      bat += ')\r\n';
+    }
     // Require Discord gateway WebSocket (app won\'t load without it)
     bat += `powershell -ExecutionPolicy Bypass -File "${wsTestScript.replace(/\\/g, '\\\\')}"\r\n`;
     bat += 'if !errorlevel! neq 0 (\r\n';
@@ -2121,6 +2223,8 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
   try { fs.unlinkSync(batchFile); } catch(e) {}
   try { fs.unlinkSync(progressFile); } catch(e) {}
   try { fs.unlinkSync(resultFile); } catch(e) {}
+  try { fs.unlinkSync(probeScript); } catch(e) {}
+  try { fs.unlinkSync(wsTestScript); } catch(e) {}
 
   if (result.success) {
     isConnected = true;
@@ -2148,7 +2252,81 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
 
 // ============= PROXY CONTROL =============
 
+// Ad-hoc signing is the standard remedy when Apple Silicon refuses to run a
+// binary the app compiled or downloaded itself. Only attempted after an actual
+// SIGKILL, never pre-emptively.
+async function adHocSignBinary(binaryPath) {
+  if (process.platform !== 'darwin') return false;
+  try {
+    execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', binaryPath], {
+      stdio: 'pipe',
+      timeout: 20000
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Kill tpws instances this app left behind (previous crash, or a strategy that
+// ignored SIGTERM). `pkill -x` matches the executable name exactly, so it can
+// never hit an unrelated process that merely has "tpws" somewhere in its
+// command line.
+async function killStrayTpws() {
+  if (process.platform !== 'darwin') return;
+  try { execSync('pkill -x tpws 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' }); } catch (e) {}
+  await new Promise(resolve => setTimeout(resolve, 300));
+  try { execSync('pkill -9 -x tpws 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' }); } catch (e) {}
+}
+
+// Windows counterpart. `taskkill` returns before the image is actually gone, and
+// WinDivert filters belonging to a not-yet-dead winws make the next strategy look
+// broken — the same false "не запустился" the macOS side had, from a different
+// cause. Wait for the process list to confirm it left.
+async function killStrayWinws(timeoutMs = 5000) {
+  if (process.platform !== 'win32') return;
+  try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe', timeout: 5000 }); } catch (e) {}
+
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let stillRunning = false;
+    try {
+      const listed = execSync('tasklist /FI "IMAGENAME eq winws.exe" /NH', {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 5000
+      }).toString();
+      stillRunning = /winws\.exe/i.test(listed);
+    } catch (e) {
+      // Cannot tell — do not spin on an unavailable tasklist.
+      return;
+    }
+    if (!stillRunning || Date.now() >= deadline) return;
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+// Public entry point: holds the "one search at a time" lock and always releases
+// it. The search itself lives in runProxyStartAttempt().
 async function startProxy() {
+  if (isSearching) {
+    lastError = 'Подбор стратегии уже идёт';
+    lastErrorCode = 'SEARCH_IN_PROGRESS';
+    sendStatus();
+    return { success: false, error: lastError };
+  }
+
+  isSearching = true;
+  cancelRequested = false;
+  updateTrayMenu();
+  try {
+    return await runProxyStartAttempt();
+  } finally {
+    isSearching = false;
+    updateTrayMenu();
+  }
+}
+
+async function runProxyStartAttempt() {
   if (isConnected || proxyProcess) {
     lastError = 'Подключение уже активно';
     lastErrorCode = 'ALREADY_RUNNING';
@@ -2176,7 +2354,7 @@ async function startProxy() {
 
   const binaryMissing = !binaryPath || !fs.existsSync(binaryPath);
   const windowsBundleStale = process.platform === 'win32' && !isWindowsBundleCurrent();
-  const macBinaryInvalid = process.platform === 'darwin' && !isMachOBinary(binaryPath);
+  const macBinaryInvalid = process.platform === 'darwin' && !isMachOBinaryRunnable(binaryPath);
 
   // Refresh existing Windows installs too: older runtimes do not include the
   // Discord/STUN payload used by the current Flowseal strategies.
@@ -2216,6 +2394,30 @@ async function startProxy() {
       sendStatus();
       return { success: false, error: lastError };
     }
+    // A crash or forced quit can leave tpws holding port 1080, which would make
+    // every strategy in this run fail to bind.
+    await killStrayTpws();
+
+    // Verify tpws can execute at all before blaming the strategies for failing.
+    let runCheck = await probeBinaryRuns(finalBinaryPath);
+    if (!runCheck.ok && runCheck.signal === 'SIGKILL') {
+      sendLog({ type: 'warning', message: 'tpws убит системой — подписываю бинарник ad-hoc и пробую снова' });
+      if (await adHocSignBinary(finalBinaryPath)) {
+        runCheck = await probeBinaryRuns(finalBinaryPath);
+        if (runCheck.ok) {
+          sendLog({ type: 'success', message: 'Подпись исправлена, tpws запускается' });
+        }
+      }
+    }
+    if (!runCheck.ok) {
+      lastError = `tpws не запускается: ${runCheck.reason}. Перебор стратегий не поможет — проблема в самом бинарнике.`;
+      lastErrorCode = 'BINARY_NOT_EXECUTABLE';
+      sendLog({ type: 'error', message: lastError });
+      strategyProgress = null;
+      sendStatus({ searching: false });
+      return { success: false, error: lastError };
+    }
+
     // Set clean DNS (1.1.1.1, 8.8.8.8) to avoid ISP DNS poisoning for Discord
     setCleanDns(services);
     sendLog({ type: 'info', message: 'DNS установлен на 1.1.1.1 / 8.8.8.8 (защита от подмены)' });
@@ -2231,12 +2433,17 @@ async function startProxy() {
   const settings = loadSettings();
   let strategies = allStrategies;
   let singleStrategy = false;
-  
+  // True when strategies[0] is a deliberate choice — the user's pick, or the one
+  // that worked last time — rather than just the head of the default list. Those
+  // get the generous probe budget; the rest get the impatient one.
+  let firstIsPreferred = false;
+
   if (settings.selectedStrategy && settings.selectedStrategy !== 'auto') {
     const selected = allStrategies.find(s => s.name === settings.selectedStrategy);
     if (selected) {
       strategies = [selected];
       singleStrategy = true;
+      firstIsPreferred = true;
       sendLog({ type: 'info', message: `Выбрана стратегия: ${selected.name}` });
     }
   } else if (settings.lastWorkingStrategy) {
@@ -2245,6 +2452,7 @@ async function startProxy() {
     if (lastWorking) {
       const rest = allStrategies.filter(s => s.name !== settings.lastWorkingStrategy);
       strategies = [lastWorking, ...rest];
+      firstIsPreferred = true;
       sendLog({ type: 'info', message: `Сначала пробуем последнюю рабочую: ${lastWorking.name}` });
     }
   }
@@ -2299,7 +2507,7 @@ async function startProxy() {
     // If not running as admin, use elevated batch approach (single UAC prompt)
     if (!isRunningAsAdmin()) {
       sendLog({ type: 'info', message: 'Нет прав администратора — запуск через UAC...' });
-      return await startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies);
+      return await startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies, firstIsPreferred);
     }
 
     try {
@@ -2339,31 +2547,66 @@ async function startProxy() {
 
   for (let i = 0; i < strategies.length; i++) {
     const strategy = strategies[i];
-    
+    // Only the deliberately-preferred first strategy waits the long budget. For
+    // the rest, a hung probe used to cost 15s each — over ~50 strategies that was
+    // most of a quarter-hour spent waiting on answers that never come.
+    const timeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
+
+    if (cancelRequested) break;
+
     // Update strategy progress
     strategyProgress = { current: i + 1, total: totalStrategies, name: strategy.name };
     sendStatus({ searching: true });
     sendLog({ type: 'info', message: `[${i + 1}/${totalStrategies}] Тестирование: ${strategy.name}` });
     
-    // Stop any previous test process
+    // Stop any previous test process and wait for it to be reaped. Returning
+    // early here used to leave an orphan holding the port, which made every
+    // later strategy look like it "failed to start".
     if (proxyProcess) {
-      try { proxyProcess.kill(); } catch (e) {}
+      const previous = proxyProcess;
       proxyProcess = null;
+      await terminateChild(previous);
     }
-    
+
     try {
       if (process.platform === 'darwin') {
+        // The port must be free before spawning, otherwise tpws cannot bind and
+        // the probe below would succeed against a leftover listener instead.
+        if (!(await waitForPortState(TPWS_PORT, false, 5000))) {
+          await killStrayTpws();
+          if (!(await waitForPortState(TPWS_PORT, false, 3000))) {
+            // A foreign listener on 1080 will not free itself, so trying the
+            // remaining strategies would spend ~8s each to arrive at the same
+            // wall and then report the misleading "ни одна стратегия не
+            // сработала". Name the real obstacle instead.
+            lastError = `Порт ${TPWS_PORT} занят другим процессом (возможно, другой VPN или прокси) — закройте его и попробуйте снова`;
+            lastErrorCode = 'PORT_IN_USE';
+            sendLog({ type: 'error', message: lastError });
+            strategyProgress = null;
+            sendStatus({ searching: false });
+            return { success: false, error: lastError };
+          }
+        }
+
         // macOS - run tpws as SOCKS proxy
-        proxyProcess = spawn(finalBinaryPath, strategy.args, {
+        const generation = ++proxyGeneration;
+        const child = spawn(finalBinaryPath, strategy.args, {
           detached: false,
           stdio: ['ignore', 'pipe', 'pipe']
         });
-        
-        proxyProcess.stdout.on('data', () => {});
-        proxyProcess.stderr.on('data', () => {});
-        proxyProcess.on('error', () => {});
-        
-        proxyProcess.on('close', (code, signal) => {
+        proxyProcess = child;
+
+        let stderrTail = '';
+        child.stdout.on('data', () => {});
+        child.stderr.on('data', (data) => {
+          stderrTail = (stderrTail + data.toString()).slice(-500);
+        });
+        child.on('error', () => {});
+
+        child.on('close', (code, signal) => {
+          // A process from an earlier attempt must not clear the handle that now
+          // belongs to a newer one.
+          if (generation !== proxyGeneration) return;
           proxyProcess = null;
           if (isConnected) {
             isConnected = false;
@@ -2372,8 +2615,8 @@ async function startProxy() {
             connectedSince = null;
             disconnectReason = code === 0 ? 'PROCESS_EXITED' : 'PROCESS_CRASHED';
             const exitDetail = code === null ? `сигнал: ${signal || 'неизвестен'}` : `код: ${code}`;
-            lastError = code === 0 
-              ? 'Процесс обхода завершился' 
+            lastError = code === 0
+              ? 'Процесс обхода завершился'
               : `Процесс обхода завершился с ошибкой (${exitDetail})`;
             lastErrorCode = 'PROCESS_CRASHED';
             disableSystemProxy();
@@ -2383,39 +2626,46 @@ async function startProxy() {
             sendStatus();
           }
         });
-        
-        // Wait for tpws to start listening
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        if (!proxyProcess || proxyProcess.killed || proxyProcess.exitCode !== null) {
-          sendLog({ type: 'warning', message: `${strategy.name}: процесс не запустился` });
+
+        // Wait for tpws to bind, instead of hoping 2s was enough. Aborts the
+        // moment the process dies, so an instantly-failing binary costs
+        // milliseconds per strategy rather than the full timeout.
+        const listening = await waitForPortState(TPWS_PORT, true, 8000, {
+          shouldAbort: () => hasExited(child)
+        });
+
+        if (hasExited(child)) {
+          sendLog({
+            type: 'warning',
+            message: `${strategy.name}: процесс не запустился — ${describeChildExit(child, stderrTail)}`
+          });
+          if (generation === proxyGeneration) proxyProcess = null;
           continue; // Process died, try next strategy
         }
-        
-        // Quick check: verify tpws is actually listening on the port
-        const portOpen = await new Promise((resolve) => {
-          const net = require('net');
-          const socket = new net.Socket();
-          socket.setTimeout(2000);
-          socket.on('connect', () => { socket.destroy(); resolve(true); });
-          socket.on('error', () => resolve(false));
-          socket.on('timeout', () => { socket.destroy(); resolve(false); });
-          socket.connect(1080, '127.0.0.1');
-        });
-        
-        if (!portOpen) {
-          sendLog({ type: 'warning', message: `${strategy.name}: порт 1080 не доступен` });
-          try { proxyProcess.kill(); } catch (e) {}
+
+        if (!listening) {
+          sendLog({ type: 'warning', message: `${strategy.name}: порт ${TPWS_PORT} не доступен` });
           proxyProcess = null;
+          await terminateChild(child);
           continue; // tpws not listening, skip this strategy
         }
-        
+
         // Enable system SOCKS proxy so all traffic goes through tpws
-        enableSystemProxy(1080);
-        
+        enableSystemProxy(TPWS_PORT);
+
         // Actually test if connection works through the proxy
-        const works = await testProxyConnection(1080, 10);
-        
+        const works = await testProxyConnection(TPWS_PORT, timeouts);
+
+        // The probes above take seconds; the user may have disconnected or quit
+        // in the meantime. Committing now would switch the system proxy back on
+        // behind their back.
+        if (cancelRequested) {
+          disableSystemProxy();
+          proxyProcess = null;
+          await terminateChild(child);
+          break;
+        }
+
         if (works) {
           // Strategy verified working
           isConnected = true;
@@ -2430,29 +2680,32 @@ async function startProxy() {
           sendStatus({ searching: false });
           return { success: true, strategy: strategy.name };
         } else {
-          // Strategy didn't work — clean up and try next
+          // Strategy didn't work — clean up and try next. Wait for the exit so
+          // the next iteration starts with a free port.
           sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
           disableSystemProxy();
-          try { proxyProcess.kill(); } catch (e) {}
           proxyProcess = null;
+          await terminateChild(child);
           continue;
         }
-        
+
       } else if (process.platform === 'win32') {
         // Windows - winws.exe intercepts traffic at driver level via WinDivert
         // No proxy configuration needed — it modifies packets in-flight
         const binDirectory = path.dirname(finalBinaryPath);
 
-        // Kill any leftover winws from previous strategy iteration
-        try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe' }); } catch(e) {}
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Wait for any leftover winws to really be gone. Blindly firing taskkill
+        // and pausing 500ms was the Windows twin of the macOS orphan bug.
+        await killStrayWinws();
 
         // Start winws.exe directly (app runs as admin via manifest)
+        const generation = ++proxyGeneration;
         let spawnError = null;
         let winwsStderr = '';
-        
+        let child;
+
         try {
-          proxyProcess = spawn(finalBinaryPath, strategy.args, {
+          child = spawn(finalBinaryPath, strategy.args, {
             cwd: binDirectory,
             detached: false,
             stdio: ['ignore', 'pipe', 'pipe'],
@@ -2460,30 +2713,38 @@ async function startProxy() {
           });
         } catch (e) {
           sendLog({ type: 'warning', message: `${strategy.name}: не удалось запустить — ${e.message}` });
-          proxyProcess = null;
           continue;
         }
+        proxyProcess = child;
 
-        proxyProcess.stderr.on('data', (data) => { winwsStderr += data.toString(); });
-        proxyProcess.stdout.on('data', () => {});
-        
-        let earlyExitCode = null;
-        proxyProcess.on('error', (err) => { spawnError = err; });
-        proxyProcess.on('close', (code) => { earlyExitCode = code; });
+        child.stderr.on('data', (data) => { winwsStderr = (winwsStderr + data.toString()).slice(-500); });
+        child.stdout.on('data', () => {});
+        child.on('error', (err) => { spawnError = err; });
 
-        // Wait for winws to start up and set up WinDivert filters
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Let winws install its WinDivert filters, but stop waiting the moment it
+        // dies: a strategy the driver rejects instantly used to cost the full 3s,
+        // on every one of ~50 attempts.
+        await waitForStartupWindow(child, WINWS_STARTUP_MS);
 
-        if (spawnError || earlyExitCode !== null || !proxyProcess || proxyProcess.killed) {
-          const errMsg = spawnError ? spawnError.message : winwsStderr.trim() || `код выхода: ${earlyExitCode}`;
+        if (spawnError || hasExited(child)) {
+          const errMsg = spawnError
+            ? spawnError.message
+            : describeChildExit(child, winwsStderr);
           sendLog({ type: 'warning', message: `${strategy.name}: процесс не запустился — ${errMsg}` });
-          proxyProcess = null;
+          if (generation === proxyGeneration) proxyProcess = null;
           continue;
         }
 
         // winws is running — test if DPI bypass actually works
-        const works = await testDirectConnection(10);
-        
+        const works = await testDirectConnection(timeouts);
+
+        if (cancelRequested) {
+          proxyProcess = null;
+          await terminateChild(child);
+          await killStrayWinws();
+          break;
+        }
+
         if (works) {
           // Strategy verified working!
           isConnected = true;
@@ -2494,9 +2755,13 @@ async function startProxy() {
           // Save as last working strategy
           const s = loadSettings(); s.lastWorkingStrategy = strategy.name; saveSettings(s);
           
-          // Set up close handler for the connected process
-          proxyProcess.removeAllListeners('close');
-          proxyProcess.on('close', (code) => {
+          // Set up close handler for the connected process. Generation-gated for
+          // the same reason as the macOS handler: on a quick reconnect the old
+          // process's close event would otherwise clear the handle that now
+          // belongs to the new connection and report the live one as crashed.
+          child.removeAllListeners('close');
+          child.on('close', () => {
+            if (generation !== proxyGeneration) return;
             proxyProcess = null;
             if (isConnected) {
               isConnected = false;
@@ -2504,7 +2769,9 @@ async function startProxy() {
               currentStrategy = null;
               connectedSince = null;
               disconnectReason = 'PROCESS_CRASHED';
-              lastError = `Процесс обхода завершился неожиданно (код: ${code})`;
+              // Not `код: ${code}`: a process killed by a signal has no exit code,
+              // and printing the raw null is what made these reports unusable.
+              lastError = `Процесс обхода завершился неожиданно (${describeChildExit(child, winwsStderr)})`;
               lastErrorCode = 'PROCESS_CRASHED';
               updateTrayMenu();
               sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу` });
@@ -2517,20 +2784,28 @@ async function startProxy() {
           sendStatus({ searching: false });
           return { success: true, strategy: strategy.name };
         } else {
-          // Strategy didn't work — kill it and try next
+          // Strategy didn't work — wait for it to actually exit before the next
+          // one starts, so its WinDivert filters cannot blame the successor.
           sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
-          try { proxyProcess.kill(); } catch(e) {}
           proxyProcess = null;
+          await terminateChild(child);
           continue;
         }
       }
-      
+
     } catch (error) {
       sendLog({ type: 'warning', message: `${strategy.name}: ошибка — ${error.message}` });
       // Strategy failed, try next
     }
   }
-  
+
+  if (cancelRequested) {
+    strategyProgress = null;
+    sendLog({ type: 'info', message: 'Подбор стратегии отменён' });
+    sendStatus({ searching: false });
+    return { success: false, error: 'Отменено' };
+  }
+
   // All strategies failed
   lastError = 'Ни одна стратегия не сработала. Попробуйте позже или обратитесь в поддержку';
   lastErrorCode = 'ALL_STRATEGIES_FAILED';
@@ -2541,6 +2816,10 @@ async function startProxy() {
 }
 
 function stopProxy() {
+  // Tell a running search to stand down. It yields on every probe, so without
+  // this it would carry on spawning processes after the user disconnected or quit.
+  cancelRequested = true;
+
   // Disable system proxy FIRST (before killing tpws)
   disableSystemProxy();
   
@@ -2553,6 +2832,9 @@ function stopProxy() {
   // Stop winws monitor if running
   stopWinwsMonitor();
   
+  // Invalidate pending close handlers so a shutting-down process cannot report
+  // itself as an unexpected crash.
+  proxyGeneration++;
   if (proxyProcess) {
     try { proxyProcess.kill('SIGTERM'); } catch (e) {}
     proxyProcess = null;
@@ -2560,7 +2842,7 @@ function stopProxy() {
 
   // Kill all related processes synchronously for reliable cleanup
   if (process.platform === 'darwin') {
-    try { execSync('pkill -f tpws 2>/dev/null', { stdio: 'pipe' }); } catch (e) {}
+    try { execSync('pkill -x tpws 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' }); } catch (e) {}
   } else if (process.platform === 'win32') {
     try {
       execSync('taskkill /F /IM winws.exe', { stdio: 'pipe', timeout: 3000 });
@@ -2592,9 +2874,14 @@ function createWindow() {
 
   mainWindow = new BrowserWindow({
     width: 420,
-    height: 560,
+    // The promo card lives outside .main-content, so it permanently consumes
+    // ~145px that never scrolls away. Measured in the real renderer: at 560px
+    // the connect button itself ended up 8px below the fold, and "Свои домены"
+    // 216px below it. 680/600 keeps the connect button and the domains header
+    // visible at every allowed size.
+    height: 680,
     minWidth: 380,
-    minHeight: 480,
+    minHeight: 600,
     frame: false,
     transparent: true,
     resizable: true,
@@ -2636,9 +2923,15 @@ function createTray() {
   let trayIcon;
 
   if (process.platform === 'darwin') {
-    // macOS: 16x16 colored icon — Electron handles retina via @2x automatically
+    // macOS: a monochrome template image, which the system recolours for a light
+    // or dark menu bar. A coloured icon looks foreign there, and one that ignores
+    // the theme becomes invisible on one of the two.
+    //
+    // No resize(): createFromPath already picked up tray-16@2x.png for retina,
+    // and resizing collapses the image to the single 1x representation, which is
+    // what made the icon look soft on retina Macs.
     trayIcon = nativeImage.createFromPath(path.join(iconDir, 'tray-16.png'));
-    trayIcon = trayIcon.resize({ width: 16, height: 16 });
+    trayIcon.setTemplateImage(true);
   } else {
     // Windows: 32x32 colored icon for system tray
     trayIcon = nativeImage.createFromPath(path.join(iconDir, 'tray-32.png'));
@@ -2815,18 +3108,17 @@ function getHostsPath() {
   if (process.platform === 'darwin') return '/etc/hosts';
   return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts');
 }
+// The elevated script only needs to move an already-validated file into place.
+// Block detection, removal and the integrity check all happen in Node, where
+// they are unit-tested, instead of as PowerShell string surgery.
 function buildHostsUpdateScript(hostsPath, tempFile) {
   return [
     '$hostsPath = "' + hostsPath.replace(/"/g, '""') + '"',
-    '$addPath = "' + tempFile.replace(/\\/g, '\\\\').replace(/"/g, '""') + '"',
-    'if (-not (Test-Path $addPath)) { exit 1 }',
-    'if (-not (Test-Path $hostsPath)) { exit 2 }',
-    '$toAdd = (Get-Content $addPath -Raw).TrimEnd()',
-    '$current = Get-Content $hostsPath -Raw -ErrorAction SilentlyContinue',
-    'if (-not $current) { $current = "" }',
-    'if ($current.IndexOf("' + HOSTS_MARKER.replace(/'/g, "''") + '") -ge 0) { exit 0 }',
-    '$block = "`r`n`r`n" + "' + HOSTS_MARKER.replace(/'/g, "''") + '" + "`r`n" + $toAdd',
-    'try { [System.IO.File]::AppendAllText($hostsPath, $block, [System.Text.Encoding]::ASCII) } catch { exit 3 }',
+    '$newPath = "' + tempFile.replace(/"/g, '""') + '"',
+    'if (-not (Test-Path -LiteralPath $newPath)) { exit 1 }',
+    'if (-not (Test-Path -LiteralPath $hostsPath)) { exit 2 }',
+    'try { Copy-Item -LiteralPath $hostsPath -Destination ($hostsPath + ".unblockpro.bak") -Force } catch {}',
+    'try { [System.IO.File]::Copy($newPath, $hostsPath, $true) } catch { exit 3 }',
     'exit 0'
   ].join('; ');
 }
@@ -2834,10 +3126,12 @@ async function prepareHostsUpdateForBatch(tempDir) {
   const tempFile = path.join(tempDir, 'unblock-pro-hosts-discord.txt');
   const psScriptPath = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
 
-  // First check if hosts already has our marker — skip entirely
+  // latin1 round-trips arbitrary single-byte content unchanged, so a user's
+  // existing hosts entries survive byte-for-byte. Everything we add is ASCII.
+  let currentHosts = '';
   try {
-    const currentHosts = fs.readFileSync(getHostsPath(), 'utf8');
-    if (currentHosts.includes(HOSTS_MARKER)) {
+    currentHosts = fs.readFileSync(getHostsPath(), 'latin1');
+    if (hasCurrentBlock(currentHosts, HOSTS_MARKER, app.getVersion())) {
       return { success: true, psScriptPath: null };
     }
   } catch (e) {}
@@ -2856,20 +3150,32 @@ async function prepareHostsUpdateForBatch(tempDir) {
 
   // Use downloaded data or fall back to embedded data
   const hostsData = downloaded || generateFallbackHostsData();
+  const nextHosts = replaceMarkedBlock(currentHosts, HOSTS_MARKER, app.getVersion(), hostsData);
+  const ownHostnames = collectBlockHostnames(hostsData);
+
+  if (!isSafeHostsRewrite(currentHosts, nextHosts, HOSTS_MARKER, { ownHostnames })) {
+    sendLog({ type: 'warning', message: 'Пропускаю обновление hosts — проверка целостности не пройдена' });
+    return { success: false, psScriptPath: null };
+  }
+
   try {
-    fs.writeFileSync(tempFile, hostsData, 'utf8');
+    fs.writeFileSync(tempFile, nextHosts, 'latin1');
     const script = buildHostsUpdateScript(getHostsPath(), tempFile);
     fs.writeFileSync(psScriptPath, script, 'utf8');
     return { success: true, psScriptPath };
   } catch (e) {
-    return { success: false };
+    return { success: false, psScriptPath: null };
   }
 }
 async function updateHostsMacOS() {
   const hostsPath = '/etc/hosts';
+  let current = '';
   try {
-    const current = fs.readFileSync(hostsPath, 'utf8');
-    if (current.includes(HOSTS_MARKER)) {
+    current = fs.readFileSync(hostsPath, 'latin1');
+    // Version-aware: a block written by an older release is refreshed instead of
+    // trusted forever. Discord voice IPs rotate, and a stale pinned address is
+    // exactly what leaves voice stuck on "connecting".
+    if (hasCurrentBlock(current, HOSTS_MARKER, app.getVersion())) {
       return { success: true, alreadyExists: true };
     }
   } catch (e) {}
@@ -2890,12 +3196,22 @@ async function updateHostsMacOS() {
   hostsData = hostsData || generateFallbackHostsData();
 
   const tempFile = path.join(app.getPath('temp'), 'unblock-pro-hosts-add.txt');
-  const block = '\n\n' + HOSTS_MARKER + '\n' + hostsData;
-  fs.writeFileSync(tempFile, block, 'utf8');
+  const nextHosts = replaceMarkedBlock(current, HOSTS_MARKER, app.getVersion(), hostsData);
+  const ownHostnames = collectBlockHostnames(hostsData);
+
+  // Replacing the whole file is the only way to drop a stale block, so refuse
+  // unless every system and user line provably survives.
+  if (!isSafeHostsRewrite(current, nextHosts, HOSTS_MARKER, { ownHostnames })) {
+    sendLog({ type: 'warning', message: 'Пропускаю обновление hosts — проверка целостности не пройдена' });
+    return { success: false, error: 'unsafe hosts rewrite' };
+  }
+
+  fs.writeFileSync(tempFile, nextHosts, 'latin1');
 
   return new Promise((resolve) => {
+    // Back up first: if anything goes wrong the user has /etc/hosts.unblockpro.bak.
     sudo.exec(
-      `/bin/cat "${tempFile}" >> "${hostsPath}" && rm -f "${tempFile}"`,
+      `/bin/cp "${hostsPath}" "${hostsPath}.unblockpro.bak" 2>/dev/null; /bin/cat "${tempFile}" > "${hostsPath}" && rm -f "${tempFile}"`,
       { name: 'UnblockPro' },
       (error) => {
         try { fs.unlinkSync(tempFile); } catch (e) {}
@@ -3135,7 +3451,11 @@ if (!gotTheLock) {
     // Auto-connect if enabled
     if (settings.autoConnect) {
       setTimeout(() => {
-        startProxy();
+        // Nothing awaits this one, so it must not be able to become an
+        // unhandled rejection in the main process.
+        startProxy().catch((e) => {
+          sendLog({ type: 'error', message: `Автоподключение не удалось: ${e.message}` });
+        });
       }, 1500);
     }
     
@@ -3177,7 +3497,7 @@ if (!gotTheLock) {
     try { stopWinwsMonitor(); } catch (e) {}
     try { if (proxyProcess) proxyProcess.kill(); } catch (e) {}
     if (process.platform === 'darwin') {
-      try { execSync('pkill -f tpws 2>/dev/null', { stdio: 'pipe' }); } catch (e) {}
+      try { execSync('pkill -x tpws 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' }); } catch (e) {}
     } else if (process.platform === 'win32') {
       // Try normal taskkill first, then elevated if it fails (winws may be running as admin)
       try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe', timeout: 3000 }); } catch (e) {
