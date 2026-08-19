@@ -3,7 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';">
+  <!-- img-src allows data: because the strategy dropdown draws its arrow from an
+       inline SVG. Without it the policy blocked the image and the select rendered
+       with no arrow at all. Kept narrow: only images, and no remote origin. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
   <title>UnblockPro</title>
   <link rel="stylesheet" href="styles.css">
 </head>
