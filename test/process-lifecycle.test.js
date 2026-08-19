@@ -12,7 +12,8 @@ const {
   probeBinaryRuns,
   probePort,
   terminateChild,
-  waitForPortState
+  waitForPortState,
+  waitForStartupWindow
 } = require('../src/main/process-lifecycle');
 
 const spawned = [];
@@ -198,4 +199,85 @@ test('probeBinaryRuns treats a hang as runnable rather than broken', async () =>
   });
 
   assert.deepEqual(result, { ok: true });
+});
+
+test('waitForStartupWindow returns early when the child dies', async () => {
+  const child = spawnIdleChild();
+  const started = Date.now();
+  setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 100);
+
+  const alive = await waitForStartupWindow(child, 5000, { intervalMs: 20 });
+
+  assert.equal(alive, false, 'a dead child must not be reported as started');
+  assert.ok(
+    Date.now() - started < 2000,
+    'must not sit out the whole window — that cost every rejected strategy the full pause'
+  );
+});
+
+test('waitForStartupWindow reports a surviving child once the window closes', async () => {
+  const child = spawnIdleChild();
+
+  const alive = await waitForStartupWindow(child, 200, { intervalMs: 20 });
+
+  assert.equal(alive, true);
+  assert.equal(hasExited(child), false);
+  await terminateChild(child);
+});
+
+test('terminateChild resolves instead of throwing when the signal cannot be delivered', async () => {
+  // An 'error' event with no listener is rethrown by EventEmitter and would take
+  // down the main process. The primitive must not rely on the caller having
+  // attached one, so this child deliberately has none.
+  const child = spawnIdleChild();
+  child.kill = () => {
+    const err = new Error('EPERM');
+    process.nextTick(() => child.emit('error', err));
+    return false;
+  };
+
+  const confirmed = await terminateChild(child, { graceMs: 50, timeoutMs: 500 });
+
+  assert.equal(typeof confirmed, 'boolean', 'must settle rather than throw');
+  child.kill = require('node:child_process').ChildProcess.prototype.kill;
+  try { child.kill('SIGKILL'); } catch (e) {}
+});
+
+// The bug this whole change exists for: an event from a killed attempt must not
+// be able to clear state that now belongs to a newer attempt. This models the
+// handler contract used in main.js for both platforms.
+test('a generation-gated close handler ignores events from a superseded attempt', async () => {
+  let generation = 0;
+  let currentHandle = null;
+  const falseCrashes = [];
+
+  const attach = (child, ownGeneration, name) => {
+    child.on('close', () => {
+      if (ownGeneration !== generation) return;
+      currentHandle = null;
+      falseCrashes.push(name);
+    });
+  };
+
+  const first = spawnIdleChild();
+  const firstGeneration = ++generation;
+  currentHandle = first;
+  attach(first, firstGeneration, 'first');
+
+  // The loop gives up on the first strategy and starts the next one.
+  currentHandle = null;
+  const killed = terminateChild(first);
+  const second = spawnIdleChild();
+  const secondGeneration = ++generation;
+  currentHandle = second;
+  attach(second, secondGeneration, 'second');
+  await killed;
+  // Let any pending close event from the first child be delivered.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  assert.equal(currentHandle, second, "the first child's exit must not clear the second handle");
+  assert.equal(hasExited(second), false, 'the second child must still be running');
+  assert.deepEqual(falseCrashes, [], 'no attempt may be reported as crashed');
+
+  await terminateChild(second);
 });

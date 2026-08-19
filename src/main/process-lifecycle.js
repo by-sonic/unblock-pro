@@ -73,6 +73,28 @@ function hasExited(child) {
   return !child || child.exitCode !== null || child.signalCode !== null;
 }
 
+// Sit out a startup grace period, returning early the moment the child dies.
+// Resolves true if it is still alive when the window closes, false if it died.
+//
+// Needed where there is no port to poll (Windows `winws` works at driver level):
+// a blind fixed pause charged every rejected strategy the full wait, which over
+// ~50 strategies is most of the time the run takes.
+async function waitForStartupWindow(child, timeoutMs, options = {}) {
+  const {
+    intervalMs = DEFAULT_POLL_INTERVAL_MS,
+    sleep = delay,
+    now = Date.now
+  } = options;
+
+  const deadline = now() + timeoutMs;
+  for (;;) {
+    if (hasExited(child)) return false;
+    const remaining = deadline - now();
+    if (remaining <= 0) return true;
+    await sleep(Math.min(intervalMs, remaining));
+  }
+}
+
 // Terminate a child and wait for the OS to reap it. SIGTERM first so the
 // process can unbind its socket cleanly, SIGKILL if it ignores that.
 // Resolves true when the child is confirmed gone.
@@ -98,6 +120,12 @@ function terminateChild(child, options = {}) {
     };
 
     child.once('exit', () => finish(true));
+    // `child.kill()` reports a failed signal delivery (EPERM, and other
+    // platform-specific cases) asynchronously as an 'error' event, not as a
+    // throw. An 'error' event with no listener is rethrown by EventEmitter and
+    // would take down the main process, so this primitive must not depend on the
+    // caller having attached one.
+    child.once('error', () => finish(hasExited(child)));
 
     graceTimer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch (e) {}
@@ -183,5 +211,6 @@ module.exports = {
   probeBinaryRuns,
   probePort,
   terminateChild,
-  waitForPortState
+  waitForPortState,
+  waitForStartupWindow
 };

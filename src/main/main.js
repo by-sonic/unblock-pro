@@ -9,6 +9,7 @@ const tls = require('tls');
 const sudo = require('sudo-prompt');
 const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
 const {
+  collectBlockHostnames,
   hasCurrentBlock,
   isSafeHostsRewrite,
   parsePfEnableToken,
@@ -20,7 +21,8 @@ const {
   hasExited,
   probeBinaryRuns,
   terminateChild,
-  waitForPortState
+  waitForPortState,
+  waitForStartupWindow
 } = require('./process-lifecycle');
 const { buildMirrorUrls } = require('./mirror-urls');
 const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
@@ -63,6 +65,18 @@ let proxyProcess = null;
 let proxyGeneration = 0;
 // Makes probe temp-file names unique across concurrent probes.
 let probeCounter = 0;
+// A strategy search owns the bypass process, the SOCKS port and the system proxy
+// for minutes at a time. Two searches running at once fight over all three: each
+// kills the other's process and can credit a strategy for traffic the other one
+// carried. The generation token cannot help there — both loops share it.
+let isSearching = false;
+// Set when the user asks to disconnect or quit while a search is running. The
+// loop yields on every probe, so without this it would keep spawning processes
+// (or commit a "working" strategy, re-enabling the system proxy) after the user
+// has already left.
+let cancelRequested = false;
+// How long winws gets to install its WinDivert filters before it counts as up.
+const WINWS_STARTUP_MS = 3000;
 let warnedAboutBundledArch = false;
 const TPWS_PORT = 1080;
 let isConnected = false;
@@ -1220,9 +1234,23 @@ function updateTrayMenu() {
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Открыть', click: () => mainWindow.show() },
     { type: 'separator' },
-    { label: isConnected ? '● Подключено' : '○ Отключено', enabled: false },
-    { label: 'Подключить', click: () => startProxy(), enabled: !isConnected && !isDownloading },
-    { label: 'Отключить', click: () => stopProxy(), enabled: isConnected },
+    {
+      label: isConnected ? '● Подключено' : (isSearching ? '◌ Подбор стратегии…' : '○ Отключено'),
+      enabled: false
+    },
+    // Disabled while a search runs: the search owns the bypass process, the port
+    // and the system proxy for minutes, and a second one would fight it for all
+    // three. The renderer guards its own button, but the tray is a separate path.
+    {
+      label: 'Подключить',
+      click: () => { startProxy().catch((e) => sendLog({ type: 'error', message: `Ошибка подключения: ${e.message}` })); },
+      enabled: !isConnected && !isDownloading && !isSearching
+    },
+    {
+      label: isSearching && !isConnected ? 'Отменить подбор' : 'Отключить',
+      click: () => stopProxy(),
+      enabled: isConnected || isSearching
+    },
     { type: 'separator' },
     { label: 'Выход', click: () => { app.isQuitting = true; stopProxy(); app.quit(); }}
   ]);
@@ -2039,7 +2067,7 @@ const PS_TEST_GATEWAY_WS = [
   'exit 1'
 ].join('\r\n');
 
-async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies) {
+async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies, firstIsPreferred = false) {
   const binDirectory = path.dirname(finalBinaryPath);
   const tempDir = app.getPath('temp');
   const resultFile = path.join(tempDir, 'unblock-result.txt');
@@ -2100,10 +2128,14 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
     for (const url of ORDERED_ENDPOINTS) {
       bat += `:: probe ${probeLabel(url)}\r\n`;
       // Same tiering as the Node path: the cheap screening probes get the short
-      // budget, so a strategy DPI will break is rejected in seconds.
+      // budget, so a strategy DPI will break is rejected in seconds. And, as in
+      // the Node path, a deliberately-preferred first strategy (the user's pick,
+      // or the one that worked last time) gets the generous budget so a slow
+      // network cannot cost it its place.
+      const strategyTimeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
       const probeTimeout = SCREENING_ENDPOINTS.includes(url)
-        ? PROBE_TIMEOUTS.screenTimeoutSec
-        : PROBE_TIMEOUTS.fullTimeoutSec;
+        ? strategyTimeouts.screenTimeoutSec
+        : strategyTimeouts.fullTimeoutSec;
       bat += `powershell -ExecutionPolicy Bypass -NoProfile -File "${probeScript}" -Url "${url}" -Kind "${probeKind(url)}" -TimeoutSec ${probeTimeout}\r\n`;
       bat += 'if !errorlevel! neq 0 (\r\n';
       bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
@@ -2247,7 +2279,54 @@ async function killStrayTpws() {
   try { execSync('pkill -9 -x tpws 2>/dev/null; exit 0', { stdio: 'pipe', shell: '/bin/sh' }); } catch (e) {}
 }
 
+// Windows counterpart. `taskkill` returns before the image is actually gone, and
+// WinDivert filters belonging to a not-yet-dead winws make the next strategy look
+// broken — the same false "не запустился" the macOS side had, from a different
+// cause. Wait for the process list to confirm it left.
+async function killStrayWinws(timeoutMs = 5000) {
+  if (process.platform !== 'win32') return;
+  try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe', timeout: 5000 }); } catch (e) {}
+
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let stillRunning = false;
+    try {
+      const listed = execSync('tasklist /FI "IMAGENAME eq winws.exe" /NH', {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 5000
+      }).toString();
+      stillRunning = /winws\.exe/i.test(listed);
+    } catch (e) {
+      // Cannot tell — do not spin on an unavailable tasklist.
+      return;
+    }
+    if (!stillRunning || Date.now() >= deadline) return;
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+// Public entry point: holds the "one search at a time" lock and always releases
+// it. The search itself lives in runProxyStartAttempt().
 async function startProxy() {
+  if (isSearching) {
+    lastError = 'Подбор стратегии уже идёт';
+    lastErrorCode = 'SEARCH_IN_PROGRESS';
+    sendStatus();
+    return { success: false, error: lastError };
+  }
+
+  isSearching = true;
+  cancelRequested = false;
+  updateTrayMenu();
+  try {
+    return await runProxyStartAttempt();
+  } finally {
+    isSearching = false;
+    updateTrayMenu();
+  }
+}
+
+async function runProxyStartAttempt() {
   if (isConnected || proxyProcess) {
     lastError = 'Подключение уже активно';
     lastErrorCode = 'ALREADY_RUNNING';
@@ -2428,7 +2507,7 @@ async function startProxy() {
     // If not running as admin, use elevated batch approach (single UAC prompt)
     if (!isRunningAsAdmin()) {
       sendLog({ type: 'info', message: 'Нет прав администратора — запуск через UAC...' });
-      return await startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies);
+      return await startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies, firstIsPreferred);
     }
 
     try {
@@ -2473,6 +2552,8 @@ async function startProxy() {
     // most of a quarter-hour spent waiting on answers that never come.
     const timeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
 
+    if (cancelRequested) break;
+
     // Update strategy progress
     strategyProgress = { current: i + 1, total: totalStrategies, name: strategy.name };
     sendStatus({ searching: true });
@@ -2494,8 +2575,16 @@ async function startProxy() {
         if (!(await waitForPortState(TPWS_PORT, false, 5000))) {
           await killStrayTpws();
           if (!(await waitForPortState(TPWS_PORT, false, 3000))) {
-            sendLog({ type: 'warning', message: `${strategy.name}: порт ${TPWS_PORT} занят другим процессом — пропускаю` });
-            continue;
+            // A foreign listener on 1080 will not free itself, so trying the
+            // remaining strategies would spend ~8s each to arrive at the same
+            // wall and then report the misleading "ни одна стратегия не
+            // сработала". Name the real obstacle instead.
+            lastError = `Порт ${TPWS_PORT} занят другим процессом (возможно, другой VPN или прокси) — закройте его и попробуйте снова`;
+            lastErrorCode = 'PORT_IN_USE';
+            sendLog({ type: 'error', message: lastError });
+            strategyProgress = null;
+            sendStatus({ searching: false });
+            return { success: false, error: lastError };
           }
         }
 
@@ -2567,6 +2656,16 @@ async function startProxy() {
         // Actually test if connection works through the proxy
         const works = await testProxyConnection(TPWS_PORT, timeouts);
 
+        // The probes above take seconds; the user may have disconnected or quit
+        // in the meantime. Committing now would switch the system proxy back on
+        // behind their back.
+        if (cancelRequested) {
+          disableSystemProxy();
+          proxyProcess = null;
+          await terminateChild(child);
+          break;
+        }
+
         if (works) {
           // Strategy verified working
           isConnected = true;
@@ -2595,16 +2694,18 @@ async function startProxy() {
         // No proxy configuration needed — it modifies packets in-flight
         const binDirectory = path.dirname(finalBinaryPath);
 
-        // Kill any leftover winws from previous strategy iteration
-        try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe' }); } catch(e) {}
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Wait for any leftover winws to really be gone. Blindly firing taskkill
+        // and pausing 500ms was the Windows twin of the macOS orphan bug.
+        await killStrayWinws();
 
         // Start winws.exe directly (app runs as admin via manifest)
+        const generation = ++proxyGeneration;
         let spawnError = null;
         let winwsStderr = '';
-        
+        let child;
+
         try {
-          proxyProcess = spawn(finalBinaryPath, strategy.args, {
+          child = spawn(finalBinaryPath, strategy.args, {
             cwd: binDirectory,
             detached: false,
             stdio: ['ignore', 'pipe', 'pipe'],
@@ -2612,30 +2713,38 @@ async function startProxy() {
           });
         } catch (e) {
           sendLog({ type: 'warning', message: `${strategy.name}: не удалось запустить — ${e.message}` });
-          proxyProcess = null;
           continue;
         }
+        proxyProcess = child;
 
-        proxyProcess.stderr.on('data', (data) => { winwsStderr += data.toString(); });
-        proxyProcess.stdout.on('data', () => {});
-        
-        let earlyExitCode = null;
-        proxyProcess.on('error', (err) => { spawnError = err; });
-        proxyProcess.on('close', (code) => { earlyExitCode = code; });
+        child.stderr.on('data', (data) => { winwsStderr = (winwsStderr + data.toString()).slice(-500); });
+        child.stdout.on('data', () => {});
+        child.on('error', (err) => { spawnError = err; });
 
-        // Wait for winws to start up and set up WinDivert filters
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Let winws install its WinDivert filters, but stop waiting the moment it
+        // dies: a strategy the driver rejects instantly used to cost the full 3s,
+        // on every one of ~50 attempts.
+        await waitForStartupWindow(child, WINWS_STARTUP_MS);
 
-        if (spawnError || earlyExitCode !== null || !proxyProcess || proxyProcess.killed) {
-          const errMsg = spawnError ? spawnError.message : winwsStderr.trim() || `код выхода: ${earlyExitCode}`;
+        if (spawnError || hasExited(child)) {
+          const errMsg = spawnError
+            ? spawnError.message
+            : describeChildExit(child, winwsStderr);
           sendLog({ type: 'warning', message: `${strategy.name}: процесс не запустился — ${errMsg}` });
-          proxyProcess = null;
+          if (generation === proxyGeneration) proxyProcess = null;
           continue;
         }
 
         // winws is running — test if DPI bypass actually works
         const works = await testDirectConnection(timeouts);
-        
+
+        if (cancelRequested) {
+          proxyProcess = null;
+          await terminateChild(child);
+          await killStrayWinws();
+          break;
+        }
+
         if (works) {
           // Strategy verified working!
           isConnected = true;
@@ -2646,9 +2755,13 @@ async function startProxy() {
           // Save as last working strategy
           const s = loadSettings(); s.lastWorkingStrategy = strategy.name; saveSettings(s);
           
-          // Set up close handler for the connected process
-          proxyProcess.removeAllListeners('close');
-          proxyProcess.on('close', (code) => {
+          // Set up close handler for the connected process. Generation-gated for
+          // the same reason as the macOS handler: on a quick reconnect the old
+          // process's close event would otherwise clear the handle that now
+          // belongs to the new connection and report the live one as crashed.
+          child.removeAllListeners('close');
+          child.on('close', () => {
+            if (generation !== proxyGeneration) return;
             proxyProcess = null;
             if (isConnected) {
               isConnected = false;
@@ -2656,7 +2769,9 @@ async function startProxy() {
               currentStrategy = null;
               connectedSince = null;
               disconnectReason = 'PROCESS_CRASHED';
-              lastError = `Процесс обхода завершился неожиданно (код: ${code})`;
+              // Not `код: ${code}`: a process killed by a signal has no exit code,
+              // and printing the raw null is what made these reports unusable.
+              lastError = `Процесс обхода завершился неожиданно (${describeChildExit(child, winwsStderr)})`;
               lastErrorCode = 'PROCESS_CRASHED';
               updateTrayMenu();
               sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу` });
@@ -2669,20 +2784,28 @@ async function startProxy() {
           sendStatus({ searching: false });
           return { success: true, strategy: strategy.name };
         } else {
-          // Strategy didn't work — kill it and try next
+          // Strategy didn't work — wait for it to actually exit before the next
+          // one starts, so its WinDivert filters cannot blame the successor.
           sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
-          try { proxyProcess.kill(); } catch(e) {}
           proxyProcess = null;
+          await terminateChild(child);
           continue;
         }
       }
-      
+
     } catch (error) {
       sendLog({ type: 'warning', message: `${strategy.name}: ошибка — ${error.message}` });
       // Strategy failed, try next
     }
   }
-  
+
+  if (cancelRequested) {
+    strategyProgress = null;
+    sendLog({ type: 'info', message: 'Подбор стратегии отменён' });
+    sendStatus({ searching: false });
+    return { success: false, error: 'Отменено' };
+  }
+
   // All strategies failed
   lastError = 'Ни одна стратегия не сработала. Попробуйте позже или обратитесь в поддержку';
   lastErrorCode = 'ALL_STRATEGIES_FAILED';
@@ -2693,6 +2816,10 @@ async function startProxy() {
 }
 
 function stopProxy() {
+  // Tell a running search to stand down. It yields on every probe, so without
+  // this it would carry on spawning processes after the user disconnected or quit.
+  cancelRequested = true;
+
   // Disable system proxy FIRST (before killing tpws)
   disableSystemProxy();
   
@@ -3018,8 +3145,9 @@ async function prepareHostsUpdateForBatch(tempDir) {
   // Use downloaded data or fall back to embedded data
   const hostsData = downloaded || generateFallbackHostsData();
   const nextHosts = replaceMarkedBlock(currentHosts, HOSTS_MARKER, app.getVersion(), hostsData);
+  const ownHostnames = collectBlockHostnames(hostsData);
 
-  if (!isSafeHostsRewrite(currentHosts, nextHosts, HOSTS_MARKER)) {
+  if (!isSafeHostsRewrite(currentHosts, nextHosts, HOSTS_MARKER, { ownHostnames })) {
     sendLog({ type: 'warning', message: 'Пропускаю обновление hosts — проверка целостности не пройдена' });
     return { success: false, psScriptPath: null };
   }
@@ -3063,10 +3191,11 @@ async function updateHostsMacOS() {
 
   const tempFile = path.join(app.getPath('temp'), 'unblock-pro-hosts-add.txt');
   const nextHosts = replaceMarkedBlock(current, HOSTS_MARKER, app.getVersion(), hostsData);
+  const ownHostnames = collectBlockHostnames(hostsData);
 
   // Replacing the whole file is the only way to drop a stale block, so refuse
   // unless every system and user line provably survives.
-  if (!isSafeHostsRewrite(current, nextHosts, HOSTS_MARKER)) {
+  if (!isSafeHostsRewrite(current, nextHosts, HOSTS_MARKER, { ownHostnames })) {
     sendLog({ type: 'warning', message: 'Пропускаю обновление hosts — проверка целостности не пройдена' });
     return { success: false, error: 'unsafe hosts rewrite' };
   }
@@ -3316,7 +3445,11 @@ if (!gotTheLock) {
     // Auto-connect if enabled
     if (settings.autoConnect) {
       setTimeout(() => {
-        startProxy();
+        // Nothing awaits this one, so it must not be able to become an
+        // unhandled rejection in the main process.
+        startProxy().catch((e) => {
+          sendLog({ type: 'error', message: `Автоподключение не удалось: ${e.message}` });
+        });
       }, 1500);
     }
     
