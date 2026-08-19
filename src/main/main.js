@@ -2923,9 +2923,15 @@ function createTray() {
   let trayIcon;
 
   if (process.platform === 'darwin') {
-    // macOS: 16x16 colored icon — Electron handles retina via @2x automatically
+    // macOS: a monochrome template image, which the system recolours for a light
+    // or dark menu bar. A coloured icon looks foreign there, and one that ignores
+    // the theme becomes invisible on one of the two.
+    //
+    // No resize(): createFromPath already picked up tray-16@2x.png for retina,
+    // and resizing collapses the image to the single 1x representation, which is
+    // what made the icon look soft on retina Macs.
     trayIcon = nativeImage.createFromPath(path.join(iconDir, 'tray-16.png'));
-    trayIcon = trayIcon.resize({ width: 16, height: 16 });
+    trayIcon.setTemplateImage(true);
   } else {
     // Windows: 32x32 colored icon for system tray
     trayIcon = nativeImage.createFromPath(path.join(iconDir, 'tray-32.png'));

@@ -1,0 +1,92 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>UnblockPro icons</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 32px 28px 48px;
+    font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: #f6f7fb; color: #14141c;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  p.sub { margin: 0 0 28px; color: #5c5c6e; }
+  section { margin-bottom: 34px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+       color: #6b6b80; margin: 0 0 12px; font-weight: 600; }
+  .row { display: flex; align-items: flex-end; gap: 22px; flex-wrap: wrap; }
+  figure { margin: 0; text-align: center; }
+  figcaption { margin-top: 8px; font-size: 11px; color: #7a7a90; }
+  img { display: block; image-rendering: auto; }
+  .zoom img { image-rendering: pixelated; }
+  .bar { display: flex; align-items: center; gap: 10px;
+         padding: 7px 14px; border-radius: 8px; font-size: 12px; }
+  .bar.light { background: #e8e8ee; color: #33333f; }
+  .bar.dark  { background: #26262e; color: #e6e6ee; }
+  /* A template image is recoloured by the system; these filters stand in for
+     that so the glyph can be judged on both menu-bar backgrounds. */
+  .bar.light img { filter: none; }
+  .bar.dark  img { filter: invert(1); }
+  .note { max-width: 62ch; color: #5c5c6e; font-size: 13px; }
+  code { background: #e9e9f0; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+
+<h1>UnblockPro — иконки</h1>
+<p class="sub">Метафора: трафик проходит через брешь в барьере. Один знак для приложения и для трея.</p>
+
+<section>
+  <h2>Иконка приложения</h2>
+  <div class="row">
+    <figure><img src="icon.png" width="256" height="256"><figcaption>256</figcaption></figure>
+    <figure><img src="icon.png" width="128" height="128"><figcaption>128</figcaption></figure>
+    <figure><img src="icon.png" width="64" height="64"><figcaption>64</figcaption></figure>
+    <figure><img src="icon.png" width="32" height="32"><figcaption>32</figcaption></figure>
+    <figure><img src="icon.png" width="16" height="16"><figcaption>16</figcaption></figure>
+  </div>
+</section>
+
+<section>
+  <h2>Трей macOS — template image, реальный размер</h2>
+  <div class="row">
+    <div class="bar light">
+      <img src="../src/main/icons/tray-16.png" width="16" height="16">
+      <span>светлая строка меню</span>
+    </div>
+    <div class="bar dark">
+      <img src="../src/main/icons/tray-16.png" width="16" height="16">
+      <span>тёмная строка меню</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Трей macOS — увеличено ×10, видно попадание в пиксельную сетку</h2>
+  <div class="row zoom">
+    <figure><img src="../src/main/icons/tray-16.png" width="160" height="160"><figcaption>16 px → ×10</figcaption></figure>
+    <figure><img src="../src/main/icons/tray-16@2x.png" width="160" height="160"><figcaption>32 px (@2x) → ×5</figcaption></figure>
+  </div>
+</section>
+
+<section>
+  <h2>Трей Windows — цветная плашка</h2>
+  <div class="row">
+    <div class="bar dark"><img src="../src/main/icons/tray-32.png" width="16" height="16"><span>тёмная панель, 16</span></div>
+    <div class="bar light"><img src="../src/main/icons/tray-32.png" width="16" height="16"><span>светлая панель, 16</span></div>
+    <figure><img src="../src/main/icons/tray-32.png" width="32" height="32"><figcaption>32</figcaption></figure>
+    <figure class="zoom"><img src="../src/main/icons/tray-32.png" width="128" height="128"><figcaption>32 → ×4</figcaption></figure>
+  </div>
+</section>
+
+<section>
+  <h2>Почему так</h2>
+  <p class="note">
+    Не замок и не щит: приложение не шифрует трафик и не является VPN, поэтому
+    «охранная» метафора врала бы о том, что оно делает. Барьер сплошной во всю
+    высоту, а брешь <em>вырезана</em> из него маской — именно вырез создаёт
+    впечатление, что стрелка прошла насквозь. Знак нарисован на сетке 16 единиц:
+    все края попадают на целый пиксель в 16, 32, 64, 128, 256, 512 и 1024.
+    На macOS файл <code>tray-16.png</code> — чёрный по прозрачному и помечен как
+    template, поэтому система сама перекрашивает его под светлую и тёмную строку
+    меню. На Windows такого механизма нет, и панель бывает любой, поэтому там
+    цветная плашка.
+  </p>
+</section>

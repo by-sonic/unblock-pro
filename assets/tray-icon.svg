@@ -1,10 +1,31 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- macOS menu-bar glyph, and the authoring grid for the whole mark.
+       Black on transparent: it is loaded as a template image, so the system
+       recolours it for a light or dark menu bar. Colour here would be discarded,
+       and a coloured menu-bar icon looks foreign on macOS.
+
+       Every edge sits on a whole unit, so the shape stays crisp at 16px and
+       doubles exactly for @2x. Nothing is thinner than 2 units — a 1px feature
+       disappears on a non-retina screen.
+
+       Two earlier drafts failed here and are worth recording. Short barrier
+       segments read as two stray tick marks, not a wall; making them
+       semi-transparent only turned them into ghosts. What works is a solid
+       full-height wall with the breach *cut out* of it: the notch is what makes
+       the arrow look like it went through something, and the silhouette stays
+       readable when it is 16 pixels tall in a menu bar. -->
   <defs>
-    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#3b82f6"/>
-      <stop offset="100%" style="stop-color:#8b5cf6"/>
-    </linearGradient>
+    <mask id="breach">
+      <rect x="0" y="0" width="16" height="16" fill="#ffffff"/>
+      <!-- The hole the traffic goes through. Wider than the arrow shaft so a
+           sliver of background separates the two shapes. -->
+      <rect x="3" y="6" width="8" height="4" rx="1" fill="#000000"/>
+    </mask>
   </defs>
-  <rect width="32" height="32" rx="6" fill="url(#grad)"/>
-  <text x="16" y="22" font-family="Arial Black, sans-serif" font-size="18" font-weight="900" fill="white" text-anchor="middle">U</text>
+
+  <g fill="#000000">
+    <rect x="5" y="0" width="3" height="16" rx="0.6" mask="url(#breach)"/>
+    <rect x="0" y="7" width="11" height="2" rx="1"/>
+    <path d="M9.5 4 L16 8 L9.5 12 Z"/>
+  </g>
 </svg>
