@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('api', {
   
   // Logs & errors
   getLogs: () => ipcRenderer.invoke('get-logs'),
+  copyLogs: () => ipcRenderer.invoke('copy-logs'),
+  showLogFile: () => ipcRenderer.invoke('show-log-file'),
   clearError: () => ipcRenderer.invoke('clear-error'),
   
   // Custom domains

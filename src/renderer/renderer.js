@@ -39,6 +39,9 @@ const logsChevron = document.getElementById('logsChevron');
 const logsBody = document.getElementById('logsBody');
 const logsList = document.getElementById('logsList');
 const logsCount = document.getElementById('logsCount');
+const logsCopy = document.getElementById('logsCopy');
+const logsCopyLabel = document.getElementById('logsCopyLabel');
+const logsReveal = document.getElementById('logsReveal');
 
 // Custom domains elements
 const domainsToggle = document.getElementById('domainsToggle');
@@ -175,6 +178,38 @@ function setupEventListeners() {
       logsList.scrollTop = logsList.scrollHeight;
     }
   });
+
+  logsCopy.addEventListener('click', copyLogs);
+  logsReveal.addEventListener('click', () => window.api.showLogFile());
+}
+
+// Restores the button label after the confirmation flash, so a second copy
+// still reads as a fresh action.
+let copyResetTimer = null;
+
+function flashCopyResult(label, stateClass) {
+  logsCopyLabel.textContent = label;
+  logsCopy.classList.remove('is-done', 'is-failed');
+  if (stateClass) logsCopy.classList.add(stateClass);
+
+  clearTimeout(copyResetTimer);
+  copyResetTimer = setTimeout(() => {
+    logsCopyLabel.textContent = 'Скопировать журнал';
+    logsCopy.classList.remove('is-done', 'is-failed');
+  }, 2000);
+}
+
+async function copyLogs() {
+  try {
+    const result = await window.api.copyLogs();
+    if (result && result.success) {
+      flashCopyResult('Скопировано', 'is-done');
+    } else {
+      flashCopyResult('Не удалось скопировать', 'is-failed');
+    }
+  } catch (e) {
+    flashCopyResult('Не удалось скопировать', 'is-failed');
+  }
 }
 
 async function loadSystemInfo() {

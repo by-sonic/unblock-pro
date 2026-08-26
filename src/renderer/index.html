@@ -293,6 +293,21 @@
         </button>
         <div class="logs-body" id="logsBody" style="display: none;">
           <div class="logs-list" id="logsList"></div>
+          <div class="logs-actions">
+            <button class="logs-action" id="logsCopy" title="Скопировать журнал вместе с версией приложения и системы">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <rect x="9" y="9" width="13" height="13" rx="2" stroke="currentColor" stroke-width="2"/>
+                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              <span id="logsCopyLabel">Скопировать журнал</span>
+            </button>
+            <button class="logs-action logs-action-ghost" id="logsReveal" title="Открыть папку с файлом журнала">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+              </svg>
+              <span>Файл</span>
+            </button>
+          </div>
         </div>
       </div>
 
