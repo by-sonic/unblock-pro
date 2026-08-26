@@ -21,6 +21,11 @@ const {
 const { copyFileResilient } = require('./safe-copy');
 const { appendLogLine, buildLogReport, readLogTail } = require('./log-report');
 const {
+  describeIntegrityFailure,
+  repairRuntimeFromReference,
+  verifyRuntimeAgainstReference
+} = require('./runtime-integrity');
+const {
   describeChildExit,
   hasExited,
   probeBinaryRuns,
@@ -193,6 +198,67 @@ function getBinaryPath() {
 function isWindowsBundleCurrent(platformDir = getResourcePath()) {
   if (process.platform !== 'win32') return true;
   return isFlowsealBundleCurrent(platformDir);
+}
+
+// The trusted copy of the Windows runtime: the one inside the installed
+// application. The installer is perMachine, so it sits under Program Files where
+// an unprivileged process cannot write — unlike the runtime directory in
+// %APPDATA% that the engine is actually launched from.
+function getRuntimeReferenceDir() {
+  if (process.platform !== 'win32' || !app.isPackaged) return null;
+
+  // The portable build unpacks its resources into a temp directory the user can
+  // write to, so the "reference" there is exactly as forgeable as the runtime it
+  // would be vouching for. Better to report that no check is possible than to
+  // compare a copy against itself and call it verified.
+  if (process.env.PORTABLE_EXECUTABLE_DIR) return null;
+
+  return path.join(process.resourcesPath, 'bin');
+}
+
+// Runs before every elevated launch. Returns { ok } or { ok: false, error }.
+async function ensureWindowsRuntimeIntegrity() {
+  const runtimeDir = getResourcePath();
+  const referenceDir = getRuntimeReferenceDir();
+
+  const result = verifyRuntimeAgainstReference(runtimeDir, referenceDir, FLOWSEAL_REQUIRED_WINDOWS_FILES);
+
+  if (!result.hasReference) {
+    // Portable build or a dev checkout: there is no admin-only copy to compare
+    // against. Say that plainly instead of implying the check passed.
+    sendLog({
+      type: 'warning',
+      message: 'Проверка целостности движка недоступна в этой сборке — эталонной копии нет'
+    });
+    return { ok: true };
+  }
+
+  if (result.ok) return { ok: true };
+
+  sendLog({
+    type: 'warning',
+    message: `Файлы движка не совпадают с эталоном (${describeIntegrityFailure(result)}) — восстанавливаю из приложения`
+  });
+
+  const { failed } = await repairRuntimeFromReference(
+    runtimeDir,
+    referenceDir,
+    FLOWSEAL_REQUIRED_WINDOWS_FILES,
+    { copyFile: (src, dest) => copyFileResilient(src, dest) }
+  );
+
+  const after = verifyRuntimeAgainstReference(runtimeDir, referenceDir, FLOWSEAL_REQUIRED_WINDOWS_FILES);
+  if (after.ok) {
+    sendLog({ type: 'success', message: 'Движок восстановлен из встроенной копии' });
+    return { ok: true };
+  }
+
+  // Refuse rather than run an unverified binary as administrator.
+  const detail = describeIntegrityFailure(after) || (failed[0] && failed[0].error) || 'причина неизвестна';
+  return {
+    ok: false,
+    error: `Файлы движка не совпадают с эталоном и восстановить их не удалось (${detail}). Подключение отменено — переустановите приложение.`
+  };
 }
 
 // ============= HOST LISTS & PATTERN FILES =============
@@ -2467,7 +2533,21 @@ async function runProxyStartAttempt() {
   }
   
   const totalStrategies = strategies.length;
-  
+
+  // Windows: the engine is about to be run with administrator rights out of a
+  // directory the user can write to. Check it against the copy shipped inside
+  // the installation before that happens, not only once at download time.
+  if (process.platform === 'win32') {
+    const integrity = await ensureWindowsRuntimeIntegrity();
+    if (!integrity.ok) {
+      lastError = integrity.error;
+      lastErrorCode = 'RUNTIME_INTEGRITY';
+      sendLog({ type: 'error', message: integrity.error });
+      sendStatus({ searching: false });
+      return { success: false, error: integrity.error };
+    }
+  }
+
   sendLog({ type: 'info', message: `Начинаю перебор ${totalStrategies} стратегий...` });
 
   // macOS: update hosts for Discord voice servers (all regions)

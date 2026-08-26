@@ -80,7 +80,8 @@ const ERROR_TITLES = {
   'PERMISSION_DENIED': 'Нет прав доступа',
   'PORT_IN_USE': 'Порт занят',
   'NETWORK_UNAVAILABLE': 'Нет сети',
-  'ALREADY_RUNNING': 'Уже подключено'
+  'ALREADY_RUNNING': 'Уже подключено',
+  'RUNTIME_INTEGRITY': 'Файлы движка изменены'
 };
 
 // Initialize
