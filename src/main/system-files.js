@@ -183,8 +183,24 @@ function isSafeHostsRewrite(original, next, baseMarker, options = {}) {
   return true;
 }
 
+// The elevated script only needs to move an already-validated file into place.
+// Block detection, removal and the integrity check all happen in Node, where
+// they are unit-tested, instead of as PowerShell string surgery.
+function buildHostsUpdateScript(hostsPath, tempFile) {
+  return [
+    '$hostsPath = "' + hostsPath.replace(/"/g, '""') + '"',
+    '$newPath = "' + tempFile.replace(/"/g, '""') + '"',
+    'if (-not (Test-Path -LiteralPath $newPath)) { exit 1 }',
+    'if (-not (Test-Path -LiteralPath $hostsPath)) { exit 2 }',
+    'try { Copy-Item -LiteralPath $hostsPath -Destination ($hostsPath + ".unblockpro.bak") -Force } catch {}',
+    'try { [System.IO.File]::Copy($newPath, $hostsPath, $true) } catch { exit 3 }',
+    'exit 0'
+  ].join('; ');
+}
+
 module.exports = {
   buildBlockEndMarker,
+  buildHostsUpdateScript,
   buildBlockMarker,
   collectBlockHostnames,
   hasCurrentBlock,

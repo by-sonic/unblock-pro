@@ -278,3 +278,32 @@ test('the hosts rewrite guard requires a loopback mapping to survive', () => {
   const original = '127.0.0.1 localhost\n';
   assert.equal(isSafeHostsRewrite(original, 'somehost 1.2.3.4\n', MARKER), false);
 });
+
+// --- The elevated hosts write ---
+
+const WIN_HOSTS = 'C:\\Windows\\System32\\drivers\\etc\\hosts';
+const WIN_TEMP = 'C:\\Temp\\new.txt';
+
+test('the elevated script refuses to run unless both files exist', () => {
+  const { buildHostsUpdateScript } = require('../src/main/system-files');
+  const script = buildHostsUpdateScript(WIN_HOSTS, WIN_TEMP);
+
+  assert.match(script, /Test-Path -LiteralPath \$newPath.*exit 1/);
+  assert.match(script, /Test-Path -LiteralPath \$hostsPath.*exit 2/);
+});
+
+test('the elevated script backs up before it overwrites', () => {
+  const { buildHostsUpdateScript } = require('../src/main/system-files');
+  const script = buildHostsUpdateScript(WIN_HOSTS, WIN_TEMP);
+
+  assert.ok(script.indexOf('.unblockpro.bak') < script.indexOf('[System.IO.File]::Copy'));
+});
+
+test('a quote in a path stays data instead of ending the string', () => {
+  const { buildHostsUpdateScript } = require('../src/main/system-files');
+  const script = buildHostsUpdateScript('C:\\a"; rm -rf x', WIN_TEMP);
+
+  // PowerShell escapes a double quote inside a double-quoted string by doubling
+  // it, so injected text cannot start a statement of its own.
+  assert.ok(script.includes('$hostsPath = "C:\\a""; rm -rf x"'), script.split('; ')[0]);
+});
