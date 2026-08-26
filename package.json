@@ -37,7 +37,7 @@
     "url": "https://github.com/by-sonic/unblock-pro"
   },
   "devDependencies": {
-    "electron": "^28.1.0",
+    "electron": "^43.4.1",
     "electron-builder": "^26.7.0"
   },
   "dependencies": {
