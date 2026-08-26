@@ -1,10 +1,11 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, clipboard, shell } = require('electron');
 const path = require('path');
 const { spawn, exec, execFile, execFileSync, execSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
+const os = require('os');
 const tls = require('tls');
 const sudo = require('sudo-prompt');
 const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
@@ -16,6 +17,7 @@ const {
   replaceMarkedBlock
 } = require('./system-files');
 const { copyFileResilient } = require('./safe-copy');
+const { appendLogLine, buildLogReport, readLogTail } = require('./log-report');
 const {
   describeChildExit,
   hasExited,
@@ -1210,11 +1212,48 @@ function sendStatus(extra = {}) {
   }
 }
 
+// Where the log lives on disk. userData is writable without elevation on both
+// platforms and survives an app update.
+function getLogFilePath() {
+  return path.join(app.getPath('userData'), 'unblockpro.log');
+}
+
+// os.release() reports the Darwin kernel version on macOS ("24.6.0"), which is
+// not what a user or a bug report means by "версия macOS".
+function describeOsVersion() {
+  if (process.platform === 'darwin') {
+    try {
+      return execSync('sw_vers -productVersion', { encoding: 'utf8', stdio: 'pipe', timeout: 2000 }).trim();
+    } catch (e) {
+      return os.release();
+    }
+  }
+  return os.release();
+}
+
+function buildCurrentLogReport() {
+  const platformNames = { darwin: 'macOS', win32: 'Windows' };
+  return buildLogReport({
+    fileText: readLogTail(getLogFilePath()),
+    entries: logEntries,
+    systemInfo: {
+      appVersion: app.getVersion(),
+      osName: platformNames[process.platform] || process.platform,
+      osVersion: describeOsVersion(),
+      arch: process.arch,
+      strategy: currentStrategy
+    }
+  });
+}
+
 function sendLog(entry) {
   // entry: { type: 'info'|'success'|'error'|'warning', message: string, timestamp: number }
   console.log(`[${entry.type}] ${entry.message}`);
   const logEntry = { ...entry, timestamp: Date.now() };
   logEntries.push(logEntry);
+  // The window keeps a short tail; the file keeps the whole sweep, which is the
+  // only copy that outlives a restart and can be attached to an issue.
+  appendLogLine(getLogFilePath(), logEntry);
   // Keep only last 100 entries
   if (logEntries.length > 100) logEntries.shift();
   if (mainWindow && mainWindow.webContents) {
@@ -3043,6 +3082,34 @@ ipcMain.handle('get-status', () => {
 
 ipcMain.handle('get-logs', () => {
   return logEntries;
+});
+
+// Copying goes through the main process on purpose: the renderer would need a
+// secure-context clipboard permission, and the report has to be assembled from
+// the log file plus app/OS facts that only the main process holds.
+ipcMain.handle('copy-logs', () => {
+  try {
+    const report = buildCurrentLogReport();
+    clipboard.writeText(report);
+    return { success: true, length: report.length };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('show-log-file', () => {
+  try {
+    const logFile = getLogFilePath();
+    if (!fs.existsSync(logFile)) {
+      // Nothing has been logged yet: reveal the folder rather than a dead path.
+      shell.openPath(app.getPath('userData'));
+      return { success: true, revealed: 'folder' };
+    }
+    shell.showItemInFolder(logFile);
+    return { success: true, revealed: 'file' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 });
 
 ipcMain.handle('clear-error', () => {
