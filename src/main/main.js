@@ -13,6 +13,7 @@ const {
   hasCurrentBlock,
   isSafeHostsRewrite,
   parsePfEnableToken,
+  planHostsRemoval,
   replaceMarkedBlock
 } = require('./system-files');
 const { copyFileResilient } = require('./safe-copy');
@@ -1667,23 +1668,50 @@ async function enableQuicBlock() {
   });
 }
 
-function disableQuicBlock() {
-  if (!quicBlockEnabled || process.platform !== 'darwin') return;
-  quicBlockEnabled = false;
+// Undoes the macOS system changes that need root: the pf ruleset and the hosts
+// block. Both go into one command on purpose — each elevated call is a password
+// dialog, and disconnecting should cost at most one.
+//
+// When there is nothing to undo, no command runs at all, so a disconnect that
+// changed nothing never prompts.
+function disableQuicBlock(hostsCleanup = null) {
+  if (process.platform !== 'darwin') return;
 
-  const token = pfEnableToken;
-  pfEnableToken = null;
-  // Reload the untouched system ruleset, then hand back our enable reference so
-  // pf can return to whatever state it was in before we started.
-  const release = token ? `/sbin/pfctl -X ${token} 2>/dev/null; ` : '';
-  const command = `/sbin/pfctl -f /etc/pf.conf 2>/dev/null; ${release}exit 0`;
+  const parts = [];
+
+  if (quicBlockEnabled) {
+    quicBlockEnabled = false;
+    const token = pfEnableToken;
+    pfEnableToken = null;
+    // Reload the untouched system ruleset, then hand back our enable reference so
+    // pf can return to whatever state it was in before we started.
+    parts.push('/sbin/pfctl -f /etc/pf.conf 2>/dev/null');
+    if (token) parts.push(`/sbin/pfctl -X ${token} 2>/dev/null`);
+  }
+
+  if (hostsCleanup) {
+    parts.push(`/bin/cp "${hostsCleanup.hostsPath}" "${hostsCleanup.hostsPath}.unblockpro.bak" 2>/dev/null`);
+    parts.push(`/bin/cat "${hostsCleanup.tempFile}" > "${hostsCleanup.hostsPath}"`);
+    parts.push(`rm -f "${hostsCleanup.tempFile}"`);
+  }
+
+  if (parts.length === 0) return;
+
+  const command = parts.join('; ') + '; exit 0';
 
   try {
     execSync(command, { stdio: 'pipe', shell: '/bin/sh' });
+    if (hostsCleanup) sendLog({ type: 'info', message: 'Записи Discord убраны из hosts' });
   } catch (e) {
     // Fallback: try via sudo-prompt (credentials may still be cached)
     try {
-      sudo.exec(command, { name: 'UnblockPro' }, () => {});
+      sudo.exec(command, { name: 'UnblockPro' }, (error) => {
+        if (hostsCleanup) {
+          sendLog(error
+            ? { type: 'warning', message: 'Не удалось убрать записи Discord из hosts — уберите вручную через «Убрать записи из hosts»' }
+            : { type: 'info', message: 'Записи Discord убраны из hosts' });
+        }
+      });
     } catch (e2) {}
   }
 }
@@ -2825,10 +2853,16 @@ function stopProxy() {
   
   // Restore original DNS settings
   restoreDns();
-  
-  // Restore QUIC (remove pf block)
-  disableQuicBlock();
-  
+
+  // Take our Discord block back out of hosts. Prepared unelevated so that when
+  // there is no block the elevated step below is skipped entirely.
+  const hostsCleanup = prepareHostsRemoval();
+
+  // Restore QUIC (remove pf block) — on macOS this also applies the hosts
+  // cleanup, in the same elevated call, so a disconnect costs one prompt at most.
+  disableQuicBlock(hostsCleanup);
+  applyHostsRemovalWindows(hostsCleanup);
+
   // Stop winws monitor if running
   stopWinwsMonitor();
   
@@ -3108,6 +3142,75 @@ function getHostsPath() {
   if (process.platform === 'darwin') return '/etc/hosts';
   return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts');
 }
+
+// Prepares the removal of our hosts block, without touching the real file.
+//
+// The block pins Discord voice addresses, which is what the bypass needs while
+// it runs — and exactly what breaks Discord once it stops: hosts wins over DNS,
+// so a pinned address keeps being used with the bypass off, and even under a
+// VPN (#60). The block therefore must not outlive the session.
+//
+// Returns a descriptor for the elevated step to consume, or null when there is
+// nothing to do — that null is what keeps a plain disconnect prompt-free.
+function prepareHostsRemoval() {
+  const hostsPath = getHostsPath();
+
+  let current = '';
+  try {
+    current = fs.readFileSync(hostsPath, 'latin1');
+  } catch (e) {
+    return null;
+  }
+
+  const plan = planHostsRemoval(current, HOSTS_MARKER, generateFallbackHostsData());
+  if (!plan.changed) {
+    if (plan.reason === 'unsafe') {
+      sendLog({ type: 'warning', message: 'Пропускаю очистку hosts — проверка целостности не пройдена' });
+    }
+    return null;
+  }
+
+  const tempFile = path.join(app.getPath('temp'), 'unblock-pro-hosts-clean.txt');
+  try {
+    fs.writeFileSync(tempFile, plan.next, 'latin1');
+  } catch (e) {
+    return null;
+  }
+
+  return { hostsPath, tempFile };
+}
+
+// Windows counterpart of the macOS branch in disableQuicBlock(): the packaged app
+// runs elevated by manifest, so the common case writes the file directly and
+// nobody sees a prompt.
+function applyHostsRemovalWindows(cleanup) {
+  if (!cleanup || process.platform !== 'win32') return;
+
+  if (isRunningAsAdmin()) {
+    try {
+      fs.copyFileSync(cleanup.hostsPath, cleanup.hostsPath + '.unblockpro.bak');
+    } catch (e) {}
+    try {
+      fs.copyFileSync(cleanup.tempFile, cleanup.hostsPath);
+      fs.unlinkSync(cleanup.tempFile);
+      sendLog({ type: 'info', message: 'Записи Discord убраны из hosts' });
+      return;
+    } catch (e) {
+      // Fall through to the elevated path below.
+    }
+  }
+
+  try {
+    const psScriptPath = path.join(app.getPath('temp'), 'unblock-pro-clean-hosts.ps1');
+    fs.writeFileSync(psScriptPath, buildHostsUpdateScript(cleanup.hostsPath, cleanup.tempFile), 'utf8');
+    sudo.exec(`powershell -ExecutionPolicy Bypass -NoProfile -File "${psScriptPath.replace(/\\/g, '\\\\')}"`, { name: 'UnblockPro clean hosts' }, (error) => {
+      try { fs.unlinkSync(psScriptPath); } catch (e) {}
+      sendLog(error
+        ? { type: 'warning', message: 'Не удалось убрать записи Discord из hosts — уберите вручную через «Убрать записи из hosts»' }
+        : { type: 'info', message: 'Записи Discord убраны из hosts' });
+    });
+  } catch (e) {}
+}
 // The elevated script only needs to move an already-validated file into place.
 // Block detection, removal and the integrity check all happen in Node, where
 // they are unit-tested, instead of as PowerShell string surgery.
@@ -3225,6 +3328,32 @@ async function updateHostsMacOS() {
     );
   });
 }
+
+ipcMain.handle('clean-hosts', async () => {
+  const cleanup = prepareHostsRemoval();
+  if (!cleanup) return { success: true, removed: false };
+
+  if (process.platform === 'win32') {
+    applyHostsRemovalWindows(cleanup);
+    return { success: true, removed: true };
+  }
+
+  return new Promise((resolve) => {
+    sudo.exec(
+      `/bin/cp "${cleanup.hostsPath}" "${cleanup.hostsPath}.unblockpro.bak" 2>/dev/null; /bin/cat "${cleanup.tempFile}" > "${cleanup.hostsPath}" && rm -f "${cleanup.tempFile}"`,
+      { name: 'UnblockPro' },
+      (error) => {
+        try { fs.unlinkSync(cleanup.tempFile); } catch (e) {}
+        if (error) {
+          resolve({ success: false, error: error.message || 'Permission denied' });
+        } else {
+          sendLog({ type: 'success', message: 'Записи Discord убраны из hosts' });
+          resolve({ success: true, removed: true });
+        }
+      }
+    );
+  });
+});
 
 ipcMain.handle('update-hosts-for-discord', async () => {
   if (process.platform === 'darwin') {

@@ -648,6 +648,19 @@ document.getElementById('clearDiscordCacheBtn')?.addEventListener('click', async
   alert('Готово. Закройте Discord и запустите снова.');
 });
 
+// For anyone left with a block from an older version: the app now removes it on
+// disconnect, but an existing one has to be cleared once.
+document.getElementById('cleanHostsBtn')?.addEventListener('click', async () => {
+  const result = await window.api.cleanHosts();
+  if (result?.removed) {
+    alert('Записи Discord убраны из hosts. Перезапустите Discord.');
+  } else if (result?.success) {
+    alert('Записей приложения в hosts нет — убирать нечего.');
+  } else {
+    alert('Не удалось убрать записи: ' + (result?.error || 'неизвестная ошибка'));
+  }
+});
+
 document.getElementById('tgLink')?.addEventListener('click', (e) => {
   e.preventDefault();
   window.api.openExternal('https://t.me/bysonicx');

@@ -59,6 +59,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "scripts/uninstall-clean-hosts.ps1",
+        "to": "uninstall-clean-hosts.ps1"
       }
     ],
     "mac": {
@@ -120,6 +124,7 @@
     "nsis": {
       "oneClick": true,
       "perMachine": true,
+      "include": "build/installer.nsh",
       "artifactName": "UnblockPro-${version}-win-setup.${ext}"
     },
     "portable": {

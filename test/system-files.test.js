@@ -278,3 +278,64 @@ test('the hosts rewrite guard requires a loopback mapping to survive', () => {
   const original = '127.0.0.1 localhost\n';
   assert.equal(isSafeHostsRewrite(original, 'somehost 1.2.3.4\n', MARKER), false);
 });
+
+// --- planHostsRemoval: the decision that runs on every disconnect ---
+
+const FALLBACK = '1.2.3.4 discord.media\n1.2.3.4 finland10000.discord.media\n';
+
+test('no block means nothing to do, so a disconnect never asks for a password', () => {
+  const { planHostsRemoval } = require('../src/main/system-files');
+  const plan = planHostsRemoval('127.0.0.1 localhost\n', MARKER, FALLBACK);
+
+  assert.equal(plan.changed, false);
+  assert.equal(plan.reason, 'absent');
+});
+
+test('a current block is planned away, user lines survive', () => {
+  const { planHostsRemoval, replaceMarkedBlock } = require('../src/main/system-files');
+  const original = '127.0.0.1 localhost\n10.0.0.5 my-nas\n';
+  const withBlock = replaceMarkedBlock(original, MARKER, '2.0.21', FALLBACK);
+
+  const plan = planHostsRemoval(withBlock, MARKER, FALLBACK);
+
+  assert.equal(plan.changed, true);
+  assert.match(plan.next, /10\.0\.0\.5 my-nas/);
+  assert.match(plan.next, /127\.0\.0\.1 localhost/);
+  assert.doesNotMatch(plan.next, /discord\.media/);
+});
+
+test('a legacy block without a sentinel is still removed, using the embedded list', () => {
+  const { planHostsRemoval } = require('../src/main/system-files');
+  const legacy = `127.0.0.1 localhost\n\n${MARKER}\n1.2.3.4 discord.media\n1.2.3.4 finland10000.discord.media\n`;
+
+  const plan = planHostsRemoval(legacy, MARKER, FALLBACK);
+
+  assert.equal(plan.changed, true);
+  assert.doesNotMatch(plan.next, /discord\.media/);
+  assert.match(plan.next, /127\.0\.0\.1 localhost/);
+});
+
+test('a user line appended below a legacy block is not swallowed', () => {
+  const { planHostsRemoval } = require('../src/main/system-files');
+  const legacy = `127.0.0.1 localhost\n\n${MARKER}\n1.2.3.4 discord.media\n9.9.9.9 my-own-host\n`;
+
+  const plan = planHostsRemoval(legacy, MARKER, FALLBACK);
+
+  assert.equal(plan.changed, true);
+  assert.match(plan.next, /9\.9\.9\.9 my-own-host/);
+  assert.doesNotMatch(plan.next, /discord\.media/);
+});
+
+test('removal is planned once — the cleaned file needs no second pass', () => {
+  const { planHostsRemoval, replaceMarkedBlock } = require('../src/main/system-files');
+  const withBlock = replaceMarkedBlock('127.0.0.1 localhost\n', MARKER, '2.0.21', FALLBACK);
+  const first = planHostsRemoval(withBlock, MARKER, FALLBACK);
+
+  assert.equal(planHostsRemoval(first.next, MARKER, FALLBACK).changed, false);
+});
+
+test('planning never throws on junk input', () => {
+  const { planHostsRemoval } = require('../src/main/system-files');
+  assert.doesNotThrow(() => planHostsRemoval(null, MARKER, FALLBACK));
+  assert.doesNotThrow(() => planHostsRemoval('', MARKER, ''));
+});
