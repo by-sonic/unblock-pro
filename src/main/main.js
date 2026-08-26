@@ -12,6 +12,7 @@ const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
 const {
   collectBlockHostnames,
   hasCurrentBlock,
+  buildHostsUpdateScript,
   isSafeHostsRewrite,
   parsePfEnableToken,
   replaceMarkedBlock
@@ -29,6 +30,7 @@ const {
 const { buildMirrorUrls } = require('./mirror-urls');
 const { buildStrategySweepBatch, parseSweepResult } = require('./windows-batch');
 const { runServiceProbes } = require('./service-probe-run');
+const { HOSTS_DATA } = require('./hosts-data');
 const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
 const {
   BODY_SAMPLE_BYTES,
@@ -2444,7 +2446,7 @@ async function runProxyStartAttempt() {
     try {
       const hostsResult = await updateHostsMacOS();
       if (hostsResult.success && !hostsResult.alreadyExists) {
-        sendLog({ type: 'info', message: 'Hosts обновлён для Discord голоса (все регионы)' });
+        sendLog({ type: 'info', message: 'Hosts обновлён (Discord, Telegram, GitHub)' });
       }
     } catch (e) {
       sendLog({ type: 'warning', message: 'Не удалось обновить hosts — голос Discord может не работать' });
@@ -3104,66 +3106,14 @@ ipcMain.handle('open-external', (event, url) => {
   }
 });
 
-// Update hosts file for Discord voice — Flowseal: "для подключения к голосовому чату Discord"
-const HOSTS_URL = 'https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/hosts';
+// The hosts block the app writes with elevated rights. The content is pinned and
+// shipped (see hosts-data.js): it used to be fetched from a moving upstream
+// branch at connect time, with no commit and no checksum, and written as root.
 const HOSTS_MARKER = '# UnblockPro Discord/Telegram hosts';
-
-// Embedded fallback hosts data — used when GitHub download fails.
-// Includes Telegram web hosts and Discord voice servers (finland10000-10199.discord.media).
-function generateFallbackHostsData() {
-  const lines = [];
-  // Telegram web
-  const tgDomains = [
-    'telegram.me', 'telegram.dog', 'telegram.space', 'telesco.pe', 'tg.dev',
-    'kws2.web.telegram.org', 'kws2-1.web.telegram.org', 'kws1-1.web.telegram.org',
-    'kws1.web.telegram.org', 'telegram.org', 't.me', 'api.telegram.org',
-    'pluto.web.telegram.org', 'pluto-1.web.telegram.org', 'flora.web.telegram.org',
-    'td.telegram.org', 'venus.web.telegram.org', 'web.telegram.org',
-    'kws4-1.web.telegram.org', 'kws4.web.telegram.org', 'kws5-1.web.telegram.org',
-    'kws5.web.telegram.org', 'zws1-1.web.telegram.org', 'zws1.web.telegram.org',
-    'zws2-1.web.telegram.org', 'zws2.web.telegram.org', 'zws4-1.web.telegram.org',
-    'zws5-1.web.telegram.org', 'zws5.web.telegram.org'
-  ];
-  for (const d of tgDomains) lines.push(`149.154.167.220 ${d}`);
-  lines.push('');
-
-  // Discord voice servers — ALL regions, ports 10000-10099
-  const voiceIp = '104.25.158.178';
-  const regions = [
-    'finland', 'russia',
-    'us-east', 'us-west', 'us-south', 'us-central',
-    'eu-central', 'eu-west',
-    'brazil', 'hongkong', 'india', 'japan', 'singapore',
-    'southafrica', 'south-korea', 'sydney',
-    'bucharest', 'tel-aviv', 'newark', 'milan',
-    'rotterdam', 'madrid', 'stockholm', 'buenos-aires',
-    'atlanta', 'seattle', 'santa-clara', 'oregon'
-  ];
-  for (const region of regions) {
-    for (let i = 10000; i <= 10099; i++) {
-      lines.push(`${voiceIp} ${region}${i}.discord.media`);
-    }
-  }
-  return lines.join('\n');
-}
 
 function getHostsPath() {
   if (process.platform === 'darwin') return '/etc/hosts';
   return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts');
-}
-// The elevated script only needs to move an already-validated file into place.
-// Block detection, removal and the integrity check all happen in Node, where
-// they are unit-tested, instead of as PowerShell string surgery.
-function buildHostsUpdateScript(hostsPath, tempFile) {
-  return [
-    '$hostsPath = "' + hostsPath.replace(/"/g, '""') + '"',
-    '$newPath = "' + tempFile.replace(/"/g, '""') + '"',
-    'if (-not (Test-Path -LiteralPath $newPath)) { exit 1 }',
-    'if (-not (Test-Path -LiteralPath $hostsPath)) { exit 2 }',
-    'try { Copy-Item -LiteralPath $hostsPath -Destination ($hostsPath + ".unblockpro.bak") -Force } catch {}',
-    'try { [System.IO.File]::Copy($newPath, $hostsPath, $true) } catch { exit 3 }',
-    'exit 0'
-  ].join('; ');
 }
 async function prepareHostsUpdateForBatch(tempDir) {
   const tempFile = path.join(tempDir, 'unblock-pro-hosts-discord.txt');
@@ -3179,20 +3129,7 @@ async function prepareHostsUpdateForBatch(tempDir) {
     }
   } catch (e) {}
 
-  // Try downloading latest from GitHub
-  const downloaded = await new Promise((resolve) => {
-    const req = https.get(HOSTS_URL, { family: 4, lookup: ipv4Lookup, timeout: 10000 }, (res) => {
-      if (res.statusCode !== 200) { resolve(null); return; }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-  });
-
-  // Use downloaded data or fall back to embedded data
-  const hostsData = downloaded || generateFallbackHostsData();
+  const hostsData = HOSTS_DATA;
   const nextHosts = replaceMarkedBlock(currentHosts, HOSTS_MARKER, app.getVersion(), hostsData);
   const ownHostnames = collectBlockHostnames(hostsData);
 
@@ -3223,20 +3160,7 @@ async function updateHostsMacOS() {
     }
   } catch (e) {}
 
-  let hostsData;
-  try {
-    hostsData = await new Promise((resolve) => {
-      const req = https.get(HOSTS_URL, { family: 4, lookup: ipv4Lookup, timeout: 10000 }, (res) => {
-        if (res.statusCode !== 200) { resolve(null); return; }
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => { req.destroy(); resolve(null); });
-    });
-  } catch (e) {}
-  hostsData = hostsData || generateFallbackHostsData();
+  const hostsData = HOSTS_DATA;
 
   const tempFile = path.join(app.getPath('temp'), 'unblock-pro-hosts-add.txt');
   const nextHosts = replaceMarkedBlock(current, HOSTS_MARKER, app.getVersion(), hostsData);
@@ -3273,45 +3197,50 @@ ipcMain.handle('update-hosts-for-discord', async () => {
   if (process.platform === 'darwin') {
     return await updateHostsMacOS();
   }
-  const tempDir = app.getPath('temp');
-  const tempFile = path.join(tempDir, 'unblock-pro-hosts-discord.txt');
   const hostsPath = getHostsPath();
-  const psScriptPath = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
+
+  // Goes through the same merge and the same integrity guard as the connect
+  // path. It used to write the *downloaded body* over the hosts file wholesale:
+  // the temp file handed to the elevated copy was the raw response, not the
+  // merged result, so pressing this button replaced the user's entire hosts file
+  // — localhost and all — with the upstream list.
+  const prepared = await prepareHostsUpdateForBatch(app.getPath('temp'));
+  if (!prepared.success) {
+    return { success: false, error: 'Проверка целостности hosts не пройдена — файл не тронут' };
+  }
+  if (!prepared.psScriptPath) {
+    return { success: true, hostsPath, alreadyExists: true };
+  }
+
+  const command = `powershell -ExecutionPolicy Bypass -NoProfile -File "${prepared.psScriptPath.replace(/\\/g, '\\\\')}"`;
+
+  if (isRunningAsAdmin()) {
+    try {
+      execSync(command, { stdio: 'pipe' });
+      sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
+      return { success: true, hostsPath };
+    } catch (e) {
+      return { success: false, error: e.message || 'Ошибка' };
+    } finally {
+      try { fs.unlinkSync(prepared.psScriptPath); } catch (e) {}
+    }
+  }
+
+  sendLog({ type: 'info', message: 'Запрос прав для записи в hosts...' });
   return new Promise((resolve) => {
-    const req = https.get(HOSTS_URL, { family: 4, lookup: ipv4Lookup, timeout: 15000 }, (res) => {
-      if (res.statusCode !== 200) {
-        resolve({ success: false, error: `HTTP ${res.statusCode}` });
+    sudo.exec(command, { name: 'UnblockPro update hosts' }, (err) => {
+      try { fs.unlinkSync(prepared.psScriptPath); } catch (e) {}
+      if (err && (err.message || '').toLowerCase().includes('cancel')) {
+        resolve({ success: false, error: 'Отклонено' });
         return;
       }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        try {
-          const body = Buffer.concat(chunks).toString('utf8');
-          fs.writeFileSync(tempFile, body, 'utf8');
-          const psScript = buildHostsUpdateScript(hostsPath, tempFile);
-          fs.writeFileSync(psScriptPath, psScript, 'utf8');
-          sendLog({ type: 'info', message: 'Запрос прав для записи в hosts...' });
-          sudo.exec(`powershell -ExecutionPolicy Bypass -NoProfile -File "${psScriptPath.replace(/\\/g, '\\\\')}"`, { name: 'UnblockPro update hosts' }, (err) => {
-            try { fs.unlinkSync(psScriptPath); } catch (e) {}
-            if (err && (err.message || '').toLowerCase().includes('cancel')) {
-              resolve({ success: false, error: 'Отклонено' });
-              return;
-            }
-            if (err) {
-              resolve({ success: false, error: err.message || 'Ошибка' });
-              return;
-            }
-            sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
-            resolve({ success: true, hostsPath });
-          });
-        } catch (e) {
-          resolve({ success: false, error: e.message });
-        }
-      });
+      if (err) {
+        resolve({ success: false, error: err.message || 'Ошибка' });
+        return;
+      }
+      sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
+      resolve({ success: true, hostsPath });
     });
-    req.on('error', (e) => resolve({ success: false, error: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ success: false, error: 'Timeout' }); });
   });
 });
 
