@@ -964,6 +964,12 @@ body {
   border-radius: var(--border-radius);
   border: 1px solid var(--border-color);
   overflow: hidden;
+  /* .main-content is a column flex container, so its children may shrink. Every
+     other card is limited by its content, but `overflow: hidden` sets this one's
+     automatic minimum size to zero — measured at the default 420x680 window the
+     card collapsed to 2px, which is why "разверните журнал" read as a card that
+     is not there. */
+  flex-shrink: 0;
 }
 
 .logs-header {
