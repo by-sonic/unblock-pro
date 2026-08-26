@@ -1405,6 +1405,7 @@ body {
 .logs-action-ghost {
   flex: 0 0 auto;
   background: none;
+}
 
 /* Partial protection: one service could not be unblocked on this ISP. The badge
    stays visible but reads as struck out, so "подключено" never implies more than
