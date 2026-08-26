@@ -1,10 +1,11 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, clipboard, shell } = require('electron');
 const path = require('path');
 const { spawn, exec, execFile, execFileSync, execSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
+const os = require('os');
 const tls = require('tls');
 const sudo = require('sudo-prompt');
 const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
@@ -17,6 +18,7 @@ const {
   replaceMarkedBlock
 } = require('./system-files');
 const { copyFileResilient } = require('./safe-copy');
+const { appendLogLine, buildLogReport, readLogTail } = require('./log-report');
 const {
   describeChildExit,
   hasExited,
@@ -26,20 +28,25 @@ const {
   waitForStartupWindow
 } = require('./process-lifecycle');
 const { buildMirrorUrls } = require('./mirror-urls');
+const { buildStrategySweepBatch, parseSweepResult } = require('./windows-batch');
+const { runServiceProbes } = require('./service-probe-run');
 const { HOSTS_DATA } = require('./hosts-data');
 const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
 const {
   BODY_SAMPLE_BYTES,
-  ORDERED_ENDPOINTS,
   PROBE_TIMEOUTS,
   PATIENT_TIMEOUTS,
-  REMAINING_ENDPOINTS,
-  SCREENING_ENDPOINTS,
   buildPowerShellProbeScript,
-  probeKind,
-  probeLabel,
   validateProbe
 } = require('./connectivity-probes');
+const {
+  buildOutcome,
+  describeOutcome,
+  describeTally,
+  isAcceptable,
+  pickBetterOutcome,
+  tallyFailures
+} = require('./strategy-outcome');
 const {
   FLOWSEAL_BUNDLE_MARKER,
   FLOWSEAL_BUNDLE_SHA256,
@@ -84,6 +91,9 @@ const TPWS_PORT = 1080;
 let isConnected = false;
 let isDownloading = false;
 let currentStrategy = null;
+// What the connected strategy actually unblocks. Non-null and partial means the
+// user is connected but one of the services could not be fixed on this ISP.
+let currentOutcome = null;
 let lastError = null;
 let lastErrorCode = null;
 let disconnectReason = null;
@@ -1199,6 +1209,7 @@ function sendStatus(extra = {}) {
   if (mainWindow && mainWindow.webContents) {
     mainWindow.webContents.send('status', { 
       connected: isConnected,
+      outcome: currentOutcome,
       downloading: isDownloading,
       strategy: currentStrategy,
       binaryExists: fs.existsSync(getBinaryPath() || ''),
@@ -1212,11 +1223,48 @@ function sendStatus(extra = {}) {
   }
 }
 
+// Where the log lives on disk. userData is writable without elevation on both
+// platforms and survives an app update.
+function getLogFilePath() {
+  return path.join(app.getPath('userData'), 'unblockpro.log');
+}
+
+// os.release() reports the Darwin kernel version on macOS ("24.6.0"), which is
+// not what a user or a bug report means by "версия macOS".
+function describeOsVersion() {
+  if (process.platform === 'darwin') {
+    try {
+      return execSync('sw_vers -productVersion', { encoding: 'utf8', stdio: 'pipe', timeout: 2000 }).trim();
+    } catch (e) {
+      return os.release();
+    }
+  }
+  return os.release();
+}
+
+function buildCurrentLogReport() {
+  const platformNames = { darwin: 'macOS', win32: 'Windows' };
+  return buildLogReport({
+    fileText: readLogTail(getLogFilePath()),
+    entries: logEntries,
+    systemInfo: {
+      appVersion: app.getVersion(),
+      osName: platformNames[process.platform] || process.platform,
+      osVersion: describeOsVersion(),
+      arch: process.arch,
+      strategy: currentStrategy
+    }
+  });
+}
+
 function sendLog(entry) {
   // entry: { type: 'info'|'success'|'error'|'warning', message: string, timestamp: number }
   console.log(`[${entry.type}] ${entry.message}`);
   const logEntry = { ...entry, timestamp: Date.now() };
   logEntries.push(logEntry);
+  // The window keeps a short tail; the file keeps the whole sweep, which is the
+  // only copy that outlives a restart and can be attached to an issue.
+  appendLogLine(getLogFilePath(), logEntry);
   // Keep only last 100 entries
   if (logEntries.length > 100) logEntries.shift();
   if (mainWindow && mainWindow.webContents) {
@@ -1237,7 +1285,13 @@ function updateTrayMenu() {
     { label: 'Открыть', click: () => mainWindow.show() },
     { type: 'separator' },
     {
-      label: isConnected ? '● Подключено' : (isSearching ? '◌ Подбор стратегии…' : '○ Отключено'),
+      // A partial connection says so here too — the tray is the only status many
+      // users ever look at.
+      label: isConnected
+        ? (currentOutcome && currentOutcome.level === 'partial'
+          ? `● Подключено частично (${describeOutcome(currentOutcome)})`
+          : '● Подключено')
+        : (isSearching ? '◌ Подбор стратегии…' : '○ Отключено'),
       enabled: false
     },
     // Disabled while a search runs: the search owns the bypass process, the port
@@ -1830,33 +1884,13 @@ function testSingleConnection(port, timeoutSec, url) {
   });
 }
 
-async function runProbeGroup(urls, groupLabel, runProbe) {
-  const results = await Promise.all(urls.map((url) => runProbe(url)));
-  const failed = urls.filter((_, i) => !results[i]).map(probeLabel);
-  if (failed.length > 0) {
-    sendLog({
-      type: 'warning',
-      message: `${groupLabel}: не прошли проверку — ${failed.join(', ')}`
-    });
-    return false;
-  }
-  return true;
-}
-
 async function testProxyConnection(port = TPWS_PORT, timeouts = PROBE_TIMEOUTS) {
   const { screenTimeoutSec, fullTimeoutSec } = timeouts;
-
-  // Cheapest probes first, on a short budget. Acceptance still requires every
-  // probe to pass, so this changes nothing about which strategy wins — it only
-  // stops a doomed strategy from costing a full YouTube page download and a
-  // 15-second hang before it is rejected.
-  const screen = (url) => testSingleConnection(port, screenTimeoutSec, url);
-  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
-
-  const full = (url) => testSingleConnection(port, fullTimeoutSec, url);
-  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', full)) return false;
-
-  return true;
+  return runServiceProbes({
+    screen: (url) => testSingleConnection(port, screenTimeoutSec, url),
+    full: (url) => testSingleConnection(port, fullTimeoutSec, url),
+    log: sendLog
+  });
 }
 
 // ============= DIRECT CONNECTION TEST (Windows) =============
@@ -1956,9 +1990,7 @@ function testDiscordWebSocketGateway(timeoutSec = 12) {
 
 async function testDirectConnection(timeouts = PROBE_TIMEOUTS) {
   const { screenTimeoutSec, fullTimeoutSec } = timeouts;
-  // winws works at driver level — test with direct HTTPS requests (no SOCKS proxy)
-  // IMPORTANT: Must verify BOTH YouTube AND Discord work, including Discord media
-  // ports (2053,8443 etc.) which are needed for voice/video calls.
+  // winws works at driver level — test with direct HTTPS requests (no SOCKS proxy).
   
   // Discord media — test TLS on the voice/media ports that DPI often blocks
   const discordMediaEndpoints = [
@@ -1966,37 +1998,27 @@ async function testDirectConnection(timeouts = PROBE_TIMEOUTS) {
     'https://discord.gg/'
   ];
 
-  // Cheapest probes first on a short budget — a doomed strategy is rejected on a
-  // few bytes instead of a full YouTube page plus a long hang. Acceptance still
-  // requires all of them, so the verdict is unchanged; only the order and the
-  // budget are. Covers YouTube web + video delivery and Discord API + CDN, so a
-  // partially working route is still not accepted.
-  const screen = (url) => testSingleDirectConnection(url, screenTimeoutSec);
-  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
+  // Same per-service evaluation as the macOS path: screen both services cheaply,
+  // then spend the expensive probes only on the ones still alive, and report
+  // what each service ended up with instead of one all-or-nothing boolean.
+  const result = await runServiceProbes({
+    screen: (url) => testSingleDirectConnection(url, screenTimeoutSec),
+    full: (url) => testSingleDirectConnection(url, fullTimeoutSec),
+    discordExtra: () => testDiscordWebSocketGateway(fullTimeoutSec),
+    log: sendLog
+  });
 
-  const probe = (url) => testSingleDirectConnection(url, fullTimeoutSec);
-  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', probe)) return false;
-
-  // CRITICAL: Test WebSocket to gateway — Discord app uses this to load. If broken, app stays on "Проблемы с подключением".
-  const gatewayWsOk = await testDiscordWebSocketGateway(fullTimeoutSec);
-  if (!gatewayWsOk) {
-    sendLog({ type: 'warning', message: 'Discord gateway (WebSocket) не прошёл — приложение не загрузится' });
-    return false;
-  }
-  
-  // Test Discord media (voice/video)
-  let discordMediaOk = false;
-  for (const url of discordMediaEndpoints) {
-    if (await testSingleDirectConnection(url, fullTimeoutSec)) {
-      discordMediaOk = true;
-      break;
+  // Informational only — voice/media never decided acceptance and still does not.
+  if (result.outcome.services.discord) {
+    for (const url of discordMediaEndpoints) {
+      if (await testSingleDirectConnection(url, fullTimeoutSec)) {
+        sendLog({ type: 'info', message: 'Discord media: доступен' });
+        break;
+      }
     }
   }
-  if (discordMediaOk) {
-    sendLog({ type: 'info', message: 'Discord media: доступен' });
-  }
-  
-  return true; // YouTube + Discord API + Discord WebSocket all passed
+
+  return result;
 }
 
 // ============= WINDOWS ELEVATION & MONITORING =============
@@ -2024,6 +2046,7 @@ function startWinwsMonitor() {
           isConnected = false;
           const prevStrategy = currentStrategy;
           currentStrategy = null;
+          currentOutcome = null;
           connectedSince = null;
           disconnectReason = 'PROCESS_CRASHED';
           lastError = 'Процесс обхода завершился неожиданно';
@@ -2089,83 +2112,20 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
 
   const hostsUpdateScript = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
 
-  // Generate batch script that tests all strategies with one UAC prompt
-  let bat = '@echo off\r\n';
-  bat += 'setlocal EnableDelayedExpansion\r\n';
-  bat += `set "RESULT=${resultFile}"\r\n`;
-  bat += `set "PROGRESS=${progressFile}"\r\n`;
-  bat += 'taskkill /F /IM winws.exe >nul 2>&1\r\n';
-  bat += 'timeout /t 1 /nobreak >nul\r\n';
-  bat += ':: Update hosts and clear Discord cache at each connection start\r\n';
-  bat += `if exist "${hostsUpdateScript}" powershell -ExecutionPolicy Bypass -NoProfile -File "${hostsUpdateScript}"\r\n`;
-  bat += 'rd /s /q "%APPDATA%\\discord\\Cache" 2>nul\r\n';
-  bat += 'rd /s /q "%APPDATA%\\discord\\Code Cache" 2>nul\r\n';
-  bat += 'rd /s /q "%APPDATA%\\discord\\GPUCache" 2>nul\r\n';
-  bat += '\r\n';
-
-  for (let i = 0; i < strategies.length; i++) {
-    const s = strategies[i];
-    // Quote args that contain spaces or path separators with spaces
-    const quotedArgs = s.args.map(a => {
-      // If arg contains = with a path value, quote the path part
-      const eqIdx = a.indexOf('=');
-      if (eqIdx !== -1) {
-        const key = a.substring(0, eqIdx + 1);
-        const val = a.substring(eqIdx + 1);
-        if (val.includes(' ') || val.includes('\\')) {
-          return `${key}"${val}"`;
-        }
-      }
-      return a;
-    }).join(' ');
-    bat += `:: Strategy ${i + 1}: ${s.name}\r\n`;
-    bat += `echo ${i + 1}/${totalStrategies}:${s.name}> "%PROGRESS%"\r\n`;
-    bat += `cd /d "${binDirectory}"\r\n`;
-    bat += `start "" /b "${finalBinaryPath}" ${quotedArgs}\r\n`;
-    bat += 'timeout /t 4 /nobreak >nul\r\n';
-    // Every probe validates the response body, not just the status code: an ISP
-    // notice page answering 200 used to be accepted and the strategy enabled
-    // while nothing actually worked. Rules come from connectivity-probes.js so
-    // this path and the Node path cannot diverge.
-    for (const url of ORDERED_ENDPOINTS) {
-      bat += `:: probe ${probeLabel(url)}\r\n`;
-      // Same tiering as the Node path: the cheap screening probes get the short
-      // budget, so a strategy DPI will break is rejected in seconds. And, as in
-      // the Node path, a deliberately-preferred first strategy (the user's pick,
-      // or the one that worked last time) gets the generous budget so a slow
-      // network cannot cost it its place.
-      const strategyTimeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
-      const probeTimeout = SCREENING_ENDPOINTS.includes(url)
-        ? strategyTimeouts.screenTimeoutSec
-        : strategyTimeouts.fullTimeoutSec;
-      bat += `powershell -ExecutionPolicy Bypass -NoProfile -File "${probeScript}" -Url "${url}" -Kind "${probeKind(url)}" -TimeoutSec ${probeTimeout}\r\n`;
-      bat += 'if !errorlevel! neq 0 (\r\n';
-      bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-      bat += '  timeout /t 1 /nobreak >nul\r\n';
-      bat += '  goto :strat_next_' + i + '\r\n';
-      bat += ')\r\n';
-    }
-    // Require Discord gateway WebSocket (app won\'t load without it)
-    bat += `powershell -ExecutionPolicy Bypass -File "${wsTestScript.replace(/\\/g, '\\\\')}"\r\n`;
-    bat += 'if !errorlevel! neq 0 (\r\n';
-    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += '  goto :strat_next_' + i + '\r\n';
-    bat += ')\r\n';
-    bat += `echo WORKS:${s.name}> "%RESULT%"\r\n`;
-    bat += 'goto :end\r\n';
-    bat += ':strat_next_' + i + '\r\n';
-    bat += 'taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += 'timeout /t 1 /nobreak >nul\r\n';
-    bat += '\r\n';
-  }
-
-  bat += 'echo NONE> "%RESULT%"\r\n';
-  bat += 'taskkill /F /IM winws.exe >nul 2>&1\r\n';
-  bat += 'goto :realend\r\n';
-  bat += ':end\r\n';
-  bat += ':: Strategy found — winws stays running\r\n';
-  bat += ':realend\r\n';
-  bat += 'endlocal\r\n';
+  // Generated in windows-batch.js so the control flow is testable without a UAC
+  // prompt — it now has to decide per service and retry a partial candidate.
+  const bat = buildStrategySweepBatch({
+    strategies,
+    binaryPath: finalBinaryPath,
+    binDirectory,
+    resultFile,
+    progressFile,
+    hostsUpdateScript,
+    probeScript,
+    wsTestScript,
+    totalStrategies,
+    firstIsPreferred
+  });
 
   fs.writeFileSync(batchFile, bat, { encoding: 'utf8' });
 
@@ -2208,10 +2168,9 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
 
       // Read result file
       try {
-        const resultContent = fs.readFileSync(resultFile, 'utf8').trim();
-        if (resultContent.startsWith('WORKS:')) {
-          const strategyName = resultContent.substring(6).trim();
-          resolve({ success: true, strategy: strategyName });
+        const parsed = parseSweepResult(fs.readFileSync(resultFile, 'utf8'));
+        if (parsed.found) {
+          resolve({ success: true, strategy: parsed.strategy, outcome: buildOutcome(parsed.services) });
         } else {
           resolve({ success: false, error: 'Ни одна стратегия не сработала', errorCode: 'ALL_STRATEGIES_FAILED' });
         }
@@ -2229,19 +2188,11 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
   try { fs.unlinkSync(wsTestScript); } catch(e) {}
 
   if (result.success) {
-    isConnected = true;
-    currentStrategy = result.strategy;
-    connectedSince = Date.now();
-    strategyProgress = null;
-    clearError();
-    // Save as last working strategy
-    const s = loadSettings(); s.lastWorkingStrategy = result.strategy; saveSettings(s);
-    updateTrayMenu();
-    sendLog({ type: 'success', message: `Стратегия ${result.strategy} работает!` });
+    commitConnectedStrategy(result.strategy, result.outcome);
     sendStatus({ searching: false });
     // Monitor winws.exe since we can't track the elevated process directly
     startWinwsMonitor();
-    return { success: true, strategy: result.strategy };
+    return { success: true, strategy: result.strategy, outcome: result.outcome };
   } else {
     lastError = result.error;
     lastErrorCode = result.errorCode || 'ALL_STRATEGIES_FAILED';
@@ -2309,6 +2260,33 @@ async function killStrayWinws(timeoutMs = 5000) {
 
 // Public entry point: holds the "one search at a time" lock and always releases
 // it. The search itself lives in runProxyStartAttempt().
+// Commits a strategy the sweep accepted. Partial results are committed too, but
+// only on the retry pass and never silently: the user is told which service is
+// still blocked, and a partial is not remembered as `lastWorkingStrategy` — the
+// next connect should look for something better rather than pin the half-fix.
+function commitConnectedStrategy(strategyName, outcome) {
+  isConnected = true;
+  currentStrategy = strategyName;
+  currentOutcome = outcome;
+  connectedSince = Date.now();
+  strategyProgress = null;
+  clearError();
+
+  if (outcome.level === 'full') {
+    const s = loadSettings();
+    s.lastWorkingStrategy = strategyName;
+    saveSettings(s);
+    sendLog({ type: 'success', message: `Стратегия ${strategyName} работает!` });
+  } else {
+    sendLog({
+      type: 'warning',
+      message: `Стратегия ${strategyName}: ${describeOutcome(outcome)}. Подключаю частично — это лучшее, что нашлось у вашего провайдера.`
+    });
+  }
+
+  updateTrayMenu();
+}
+
 async function startProxy() {
   if (isSearching) {
     lastError = 'Подбор стратегии уже идёт';
@@ -2547,19 +2525,47 @@ async function runProxyStartAttempt() {
     }
   }
 
-  for (let i = 0; i < strategies.length; i++) {
-    const strategy = strategies[i];
+  // A strategy that fixes only one of the two services is remembered instead of
+  // discarded. If the whole list runs out without a full match, the best partial
+  // is queued once more and accepted — otherwise an ISP that simply cannot be
+  // beaten on Discord leaves the user with nothing, YouTube included (#59).
+  const queue = [...strategies];
+  const probeFailures = {};
+  let bestPartial = null;
+  let acceptPartial = false;
+
+  const queueRetry = () => {
+    if (acceptPartial || !bestPartial || cancelRequested) return false;
+    acceptPartial = true;
+    queue.push(bestPartial.strategy);
+    sendLog({
+      type: 'info',
+      message: `Полностью рабочей стратегии нет. Возвращаюсь к ${bestPartial.strategy.name} — ${describeOutcome(bestPartial.outcome)}`
+    });
+    return true;
+  };
+
+  for (let i = 0; i < queue.length || queueRetry(); i++) {
+    const strategy = queue[i];
     // Only the deliberately-preferred first strategy waits the long budget. For
     // the rest, a hung probe used to cost 15s each — over ~50 strategies that was
-    // most of a quarter-hour spent waiting on answers that never come.
-    const timeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
+    // most of a quarter-hour spent waiting on answers that never come. The retry
+    // pass gets it too: it is a deliberate pick, and losing it to one impatient
+    // probe would drop the user back to nothing.
+    const timeouts = ((i === 0 && firstIsPreferred) || acceptPartial) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
 
     if (cancelRequested) break;
 
-    // Update strategy progress
-    strategyProgress = { current: i + 1, total: totalStrategies, name: strategy.name };
+    // Update strategy progress. On the retry pass the index runs past the list,
+    // so clamp it rather than showing "53/52".
+    strategyProgress = { current: Math.min(i + 1, totalStrategies), total: totalStrategies, name: strategy.name };
     sendStatus({ searching: true });
-    sendLog({ type: 'info', message: `[${i + 1}/${totalStrategies}] Тестирование: ${strategy.name}` });
+    sendLog({
+      type: 'info',
+      message: acceptPartial
+        ? `Повторный запуск запасной стратегии: ${strategy.name}`
+        : `[${i + 1}/${totalStrategies}] Тестирование: ${strategy.name}`
+    });
     
     // Stop any previous test process and wait for it to be reaped. Returning
     // early here used to leave an orphan holding the port, which made every
@@ -2614,6 +2620,7 @@ async function runProxyStartAttempt() {
             isConnected = false;
             const prevStrategy = currentStrategy;
             currentStrategy = null;
+            currentOutcome = null;
             connectedSince = null;
             disconnectReason = code === 0 ? 'PROCESS_EXITED' : 'PROCESS_CRASHED';
             const exitDetail = code === null ? `сигнал: ${signal || 'неизвестен'}` : `код: ${code}`;
@@ -2655,8 +2662,9 @@ async function runProxyStartAttempt() {
         // Enable system SOCKS proxy so all traffic goes through tpws
         enableSystemProxy(TPWS_PORT);
 
-        // Actually test if connection works through the proxy
-        const works = await testProxyConnection(TPWS_PORT, timeouts);
+        // Actually test what works through the proxy, service by service.
+        const { outcome, failed } = await testProxyConnection(TPWS_PORT, timeouts);
+        tallyFailures(probeFailures, failed);
 
         // The probes above take seconds; the user may have disconnected or quit
         // in the meantime. Committing now would switch the system proxy back on
@@ -2668,23 +2676,21 @@ async function runProxyStartAttempt() {
           break;
         }
 
-        if (works) {
-          // Strategy verified working
-          isConnected = true;
-          currentStrategy = strategy.name;
-          connectedSince = Date.now();
-          strategyProgress = null;
-          clearError();
-          // Save as last working strategy
-          const s = loadSettings(); s.lastWorkingStrategy = strategy.name; saveSettings(s);
-          updateTrayMenu();
-          sendLog({ type: 'success', message: `Стратегия ${strategy.name} работает!` });
+        if (isAcceptable(outcome, acceptPartial)) {
+          commitConnectedStrategy(strategy.name, outcome);
           sendStatus({ searching: false });
-          return { success: true, strategy: strategy.name };
+          return { success: true, strategy: strategy.name, outcome };
         } else {
-          // Strategy didn't work — clean up and try next. Wait for the exit so
-          // the next iteration starts with a free port.
-          sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          // Not (yet) good enough — clean up and try the next one. Wait for the
+          // exit so the next iteration starts with a free port.
+          if (outcome.level === 'partial') {
+            sendLog({ type: 'info', message: `${strategy.name}: ${describeOutcome(outcome)} — запоминаю как запасной вариант` });
+            if (pickBetterOutcome(bestPartial && bestPartial.outcome, outcome) === outcome) {
+              bestPartial = { strategy, outcome };
+            }
+          } else {
+            sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          }
           disableSystemProxy();
           proxyProcess = null;
           await terminateChild(child);
@@ -2737,8 +2743,9 @@ async function runProxyStartAttempt() {
           continue;
         }
 
-        // winws is running — test if DPI bypass actually works
-        const works = await testDirectConnection(timeouts);
+        // winws is running — test what the DPI bypass actually achieves.
+        const { outcome, failed } = await testDirectConnection(timeouts);
+        tallyFailures(probeFailures, failed);
 
         if (cancelRequested) {
           proxyProcess = null;
@@ -2747,16 +2754,9 @@ async function runProxyStartAttempt() {
           break;
         }
 
-        if (works) {
-          // Strategy verified working!
-          isConnected = true;
-          currentStrategy = strategy.name;
-          connectedSince = Date.now();
-          strategyProgress = null;
-          clearError();
-          // Save as last working strategy
-          const s = loadSettings(); s.lastWorkingStrategy = strategy.name; saveSettings(s);
-          
+        if (isAcceptable(outcome, acceptPartial)) {
+          commitConnectedStrategy(strategy.name, outcome);
+
           // Set up close handler for the connected process. Generation-gated for
           // the same reason as the macOS handler: on a quick reconnect the old
           // process's close event would otherwise clear the handle that now
@@ -2769,6 +2769,7 @@ async function runProxyStartAttempt() {
               isConnected = false;
               const prevStrategy = currentStrategy;
               currentStrategy = null;
+              currentOutcome = null;
               connectedSince = null;
               disconnectReason = 'PROCESS_CRASHED';
               // Not `код: ${code}`: a process killed by a signal has no exit code,
@@ -2781,14 +2782,19 @@ async function runProxyStartAttempt() {
             }
           });
 
-          updateTrayMenu();
-          sendLog({ type: 'success', message: `Стратегия ${strategy.name} работает!` });
           sendStatus({ searching: false });
-          return { success: true, strategy: strategy.name };
+          return { success: true, strategy: strategy.name, outcome };
         } else {
-          // Strategy didn't work — wait for it to actually exit before the next
-          // one starts, so its WinDivert filters cannot blame the successor.
-          sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          // Wait for it to actually exit before the next one starts, so its
+          // WinDivert filters cannot blame the successor.
+          if (outcome.level === 'partial') {
+            sendLog({ type: 'info', message: `${strategy.name}: ${describeOutcome(outcome)} — запоминаю как запасной вариант` });
+            if (pickBetterOutcome(bestPartial && bestPartial.outcome, outcome) === outcome) {
+              bestPartial = { strategy, outcome };
+            }
+          } else {
+            sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          }
           proxyProcess = null;
           await terminateChild(child);
           continue;
@@ -2808,11 +2814,18 @@ async function runProxyStartAttempt() {
     return { success: false, error: 'Отменено' };
   }
 
-  // All strategies failed
-  lastError = 'Ни одна стратегия не сработала. Попробуйте позже или обратитесь в поддержку';
+  // All strategies failed. Say what actually failed rather than only that
+  // something did: "Discord API — 52 из 52" means the ISP blocks Discord and no
+  // strategy can help, which is a different problem — and a different answer to
+  // the user — than a couple of scattered failures.
+  const tally = describeTally(probeFailures, totalStrategies);
+  lastError = tally
+    ? `Ни одна стратегия не сработала. Чаще всего не проходило: ${tally}`
+    : 'Ни одна стратегия не сработала. Попробуйте позже или обратитесь в поддержку';
   lastErrorCode = 'ALL_STRATEGIES_FAILED';
   strategyProgress = null;
   sendLog({ type: 'error', message: `Все ${totalStrategies} стратегий не сработали` });
+  if (tally) sendLog({ type: 'error', message: `Не проходили проверки: ${tally}` });
   sendStatus({ searching: false });
   return { success: false, error: lastError };
 }
@@ -2858,6 +2871,7 @@ function stopProxy() {
 
   isConnected = false;
   currentStrategy = null;
+  currentOutcome = null;
   connectedSince = null;
   strategyProgress = null;
   clearError();
@@ -3034,6 +3048,7 @@ ipcMain.handle('get-status', () => {
     connected: isConnected,
     downloading: isDownloading,
     strategy: currentStrategy,
+    outcome: currentOutcome,
     binaryExists: fs.existsSync(getBinaryPath() || ''),
     error: lastError,
     errorCode: lastErrorCode,
@@ -3045,6 +3060,34 @@ ipcMain.handle('get-status', () => {
 
 ipcMain.handle('get-logs', () => {
   return logEntries;
+});
+
+// Copying goes through the main process on purpose: the renderer would need a
+// secure-context clipboard permission, and the report has to be assembled from
+// the log file plus app/OS facts that only the main process holds.
+ipcMain.handle('copy-logs', () => {
+  try {
+    const report = buildCurrentLogReport();
+    clipboard.writeText(report);
+    return { success: true, length: report.length };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('show-log-file', () => {
+  try {
+    const logFile = getLogFilePath();
+    if (!fs.existsSync(logFile)) {
+      // Nothing has been logged yet: reveal the folder rather than a dead path.
+      shell.openPath(app.getPath('userData'));
+      return { success: true, revealed: 'folder' };
+    }
+    shell.showItemInFolder(logFile);
+    return { success: true, revealed: 'file' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 });
 
 ipcMain.handle('clear-error', () => {
