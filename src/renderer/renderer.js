@@ -20,6 +20,9 @@ const strategySelect = document.getElementById('strategySelect');
 const connectionTimer = document.getElementById('connectionTimer');
 const timerText = document.getElementById('timerText');
 const serviceBadges = document.getElementById('serviceBadges');
+const badgeDiscord = document.getElementById('badgeDiscord');
+const badgeYoutube = document.getElementById('badgeYoutube');
+const partialNote = document.getElementById('partialNote');
 const strategyProgress = document.getElementById('strategyProgress');
 const strategyProgressText = document.getElementById('strategyProgressText');
 const strategyProgressCount = document.getElementById('strategyProgressCount');
@@ -36,6 +39,9 @@ const logsChevron = document.getElementById('logsChevron');
 const logsBody = document.getElementById('logsBody');
 const logsList = document.getElementById('logsList');
 const logsCount = document.getElementById('logsCount');
+const logsCopy = document.getElementById('logsCopy');
+const logsCopyLabel = document.getElementById('logsCopyLabel');
+const logsReveal = document.getElementById('logsReveal');
 
 // Custom domains elements
 const domainsToggle = document.getElementById('domainsToggle');
@@ -172,6 +178,38 @@ function setupEventListeners() {
       logsList.scrollTop = logsList.scrollHeight;
     }
   });
+
+  logsCopy.addEventListener('click', copyLogs);
+  logsReveal.addEventListener('click', () => window.api.showLogFile());
+}
+
+// Restores the button label after the confirmation flash, so a second copy
+// still reads as a fresh action.
+let copyResetTimer = null;
+
+function flashCopyResult(label, stateClass) {
+  logsCopyLabel.textContent = label;
+  logsCopy.classList.remove('is-done', 'is-failed');
+  if (stateClass) logsCopy.classList.add(stateClass);
+
+  clearTimeout(copyResetTimer);
+  copyResetTimer = setTimeout(() => {
+    logsCopyLabel.textContent = 'Скопировать журнал';
+    logsCopy.classList.remove('is-done', 'is-failed');
+  }, 2000);
+}
+
+async function copyLogs() {
+  try {
+    const result = await window.api.copyLogs();
+    if (result && result.success) {
+      flashCopyResult('Скопировано', 'is-done');
+    } else {
+      flashCopyResult('Не удалось скопировать', 'is-failed');
+    }
+  } catch (e) {
+    flashCopyResult('Не удалось скопировать', 'is-failed');
+  }
 }
 
 async function loadSystemInfo() {
@@ -276,7 +314,7 @@ function handleStatusUpdate(status) {
   }
   
   // Update status indicator
-  statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error');
+  statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error', 'partial');
   connectBtn.classList.remove('connected', 'connecting', 'downloading');
   statusText.classList.remove('error-text');
   
@@ -311,7 +349,11 @@ function handleStatusUpdate(status) {
     downloadSection.style.display = 'none';
     hideStrategyProgress();
     hideError();
-    showServiceBadges();
+    showServiceBadges(status.outcome);
+    if (status.outcome && status.outcome.level === 'partial') {
+      statusIndicator.classList.add('partial');
+      statusText.textContent = 'Защита частичная';
+    }
     
     // Start connection timer
     if (status.connectedSince) {
@@ -414,12 +456,34 @@ function updateTimerDisplay() {
 
 // ============= Service Badges =============
 
-function showServiceBadges() {
+const SERVICE_HINTS = {
+  discord: 'Discord у вашего провайдера поднять не удалось — ни одна стратегия его не открыла. YouTube при этом работает.',
+  youtube: 'YouTube у вашего провайдера поднять не удалось — ни одна стратегия его не открыла. Discord при этом работает.'
+};
+
+// `outcome` is absent on older states and on a full connection; both mean "всё
+// работает", so the badges stay as they are.
+function showServiceBadges(outcome) {
   serviceBadges.style.display = 'flex';
+
+  const services = (outcome && outcome.services) || { discord: true, youtube: true };
+  badgeDiscord.classList.toggle('is-blocked', services.discord === false);
+  badgeYoutube.classList.toggle('is-blocked', services.youtube === false);
+
+  const blocked = Object.keys(SERVICE_HINTS).filter((name) => services[name] === false);
+  if (blocked.length === 1) {
+    partialNote.textContent = SERVICE_HINTS[blocked[0]];
+    partialNote.style.display = 'block';
+  } else {
+    partialNote.style.display = 'none';
+  }
 }
 
 function hideServiceBadges() {
   serviceBadges.style.display = 'none';
+  partialNote.style.display = 'none';
+  badgeDiscord.classList.remove('is-blocked');
+  badgeYoutube.classList.remove('is-blocked');
 }
 
 // ============= Error Display =============
@@ -646,6 +710,19 @@ document.getElementById('updateHostsBtn')?.addEventListener('click', async () =>
 document.getElementById('clearDiscordCacheBtn')?.addEventListener('click', async () => {
   await window.api.clearDiscordCache();
   alert('Готово. Закройте Discord и запустите снова.');
+});
+
+// For anyone left with a block from an older version: the app now removes it on
+// disconnect, but an existing one has to be cleared once.
+document.getElementById('cleanHostsBtn')?.addEventListener('click', async () => {
+  const result = await window.api.cleanHosts();
+  if (result?.removed) {
+    alert('Записи Discord убраны из hosts. Перезапустите Discord.');
+  } else if (result?.success) {
+    alert('Записей приложения в hosts нет — убирать нечего.');
+  } else {
+    alert('Не удалось убрать записи: ' + (result?.error || 'неизвестная ошибка'));
+  }
 });
 
 document.getElementById('tgLink')?.addEventListener('click', (e) => {

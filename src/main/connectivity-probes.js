@@ -35,6 +35,7 @@ const BLOCK_NOTICE_PATTERN = 'blocked|\\u0437\\u0430\\u0431\\u043b\\u043e\\u043a
 const PROBE_RULES = Object.freeze([
   Object.freeze({
     kind: 'youtube-home',
+    service: 'youtube',
     tier: 'full',  // ~1 MB of HTML — never pay for it on a doomed strategy
     url: 'https://www.youtube.com/',
     label: 'YouTube Web',
@@ -44,6 +45,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'youtube-video',
+    service: 'youtube',
     tier: 'screen',  // 404 + empty body, a few bytes
     url: 'https://redirector.googlevideo.com/',
     label: 'YouTube video (googlevideo)',
@@ -55,6 +57,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'discord-api',
+    service: 'discord',
     tier: 'screen',  // tiny JSON
     url: 'https://discord.com/api/v10/gateway',
     label: 'Discord API',
@@ -65,6 +68,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'discord-cdn',
+    service: 'discord',
     tier: 'full',  // small PNG, but still a real download
     url: 'https://cdn.discordapp.com/embed/avatars/0.png',
     label: 'Discord CDN',
@@ -75,6 +79,28 @@ const PROBE_RULES = Object.freeze([
 ]);
 
 const RULES_BY_URL = new Map(PROBE_RULES.map((rule) => [rule.url, rule]));
+
+// Which service a probe speaks for. Acceptance is per service: a strategy that
+// fixes YouTube but not Discord is a usable result on an ISP where Discord
+// cannot be unblocked at all, and rejecting it outright leaves the user with
+// nothing. See strategy-outcome.js.
+function serviceOfUrl(url) {
+  const rule = RULES_BY_URL.get(url);
+  return rule ? rule.service : null;
+}
+
+// Endpoints of one tier ('screen' | 'full'), grouped by service, so the sweep
+// can screen both services cheaply, drop the ones that are already lost, and
+// spend the expensive probes only on services still in play.
+function endpointsByService(tier) {
+  const grouped = {};
+  for (const rule of PROBE_RULES) {
+    const inTier = tier === 'screen' ? rule.tier === 'screen' : rule.tier !== 'screen';
+    if (!inTier) continue;
+    (grouped[rule.service] = grouped[rule.service] || []).push(rule.url);
+  }
+  return grouped;
+}
 
 // Verification requires every probe to pass, so failing any one is already enough
 // to reject a strategy. That makes the order free to choose — and cheapest-first
@@ -234,7 +260,9 @@ module.exports = {
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS,
   buildPowerShellProbeScript,
+  endpointsByService,
   probeKind,
   probeLabel,
+  serviceOfUrl,
   validateProbe
 };
