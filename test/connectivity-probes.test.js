@@ -179,3 +179,44 @@ test('a full sweep of hung strategies stays in minutes, not a quarter hour', () 
   );
   assert.ok(worstNow < worstBefore / 2, 'must be at least a 2x improvement');
 });
+
+// --- Service grouping: which probes belong to YouTube and which to Discord ---
+
+test('every probe rule declares the service it speaks for', () => {
+  for (const rule of PROBE_RULES) {
+    assert.ok(['youtube', 'discord'].includes(rule.service), `${rule.kind} без сервиса`);
+  }
+});
+
+test('a url maps back to its service', () => {
+  const { serviceOfUrl } = require('../src/main/connectivity-probes');
+  assert.equal(serviceOfUrl(YT_VIDEO), 'youtube');
+  assert.equal(serviceOfUrl(DC_CDN), 'discord');
+  assert.equal(serviceOfUrl('https://example.com/'), null);
+});
+
+test('screening probes are grouped per service, cheapest tier only', () => {
+  const { endpointsByService } = require('../src/main/connectivity-probes');
+  const screen = endpointsByService('screen');
+
+  assert.deepEqual(screen.youtube, [YT_VIDEO]);
+  assert.deepEqual(screen.discord, [DC_API]);
+});
+
+test('the remaining probes are grouped per service too', () => {
+  const { endpointsByService } = require('../src/main/connectivity-probes');
+  const full = endpointsByService('full');
+
+  assert.deepEqual(full.youtube, [YT_HOME]);
+  assert.deepEqual(full.discord, [DC_CDN]);
+});
+
+test('grouping covers every rule, so no probe is silently dropped', () => {
+  const { endpointsByService } = require('../src/main/connectivity-probes');
+  const grouped = [
+    ...Object.values(endpointsByService('screen')).flat(),
+    ...Object.values(endpointsByService('full')).flat()
+  ].sort();
+
+  assert.deepEqual(grouped, PROBE_RULES.map((r) => r.url).sort());
+});
