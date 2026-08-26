@@ -95,19 +95,21 @@
         </div>
         <!-- Service badges -->
         <div class="service-badges" id="serviceBadges" style="display: none;">
-          <span class="service-badge discord">
+          <span class="service-badge discord" id="badgeDiscord">
             <svg width="16" height="12" viewBox="0 0 71 55" fill="currentColor">
               <path d="M60.1 4.9A58.5 58.5 0 0045.4.2a.2.2 0 00-.2.1 40.8 40.8 0 00-1.8 3.7 54 54 0 00-16.2 0A37.4 37.4 0 0025.4.3a.2.2 0 00-.2-.1A58.4 58.4 0 0010.5 5a.2.2 0 00-.1 0C1.5 18.7-.9 32 .3 45.2v.1a58.7 58.7 0 0017.7 9 .2.2 0 00.3-.1 42 42 0 003.6-5.9.2.2 0 00-.1-.3 38.7 38.7 0 01-5.5-2.6.2.2 0 01 0-.4l1.1-.9a.2.2 0 01.2 0 41.9 41.9 0 0035.6 0 .2.2 0 01.2 0l1.1.9a.2.2 0 010 .3 36.3 36.3 0 01-5.5 2.7.2.2 0 00-.1.3 47.2 47.2 0 003.6 5.9.2.2 0 00.3.1A58.5 58.5 0 0070.3 45.3v-.1C71.7 30.1 67.8 17 60.2 5a.2.2 0 000 0zM23.7 37.1c-3.5 0-6.4-3.2-6.4-7.1s2.8-7.1 6.4-7.1 6.5 3.2 6.4 7.1c0 3.9-2.8 7.1-6.4 7.1zm23.6 0c-3.5 0-6.4-3.2-6.4-7.1s2.8-7.1 6.4-7.1 6.5 3.2 6.4 7.1c0 3.9-2.9 7.1-6.4 7.1z"/>
             </svg>
             Discord
           </span>
-          <span class="service-badge youtube">
+          <span class="service-badge youtube" id="badgeYoutube">
             <svg width="16" height="12" viewBox="0 0 24 18" fill="currentColor">
               <path d="M23.5 2.8A3 3 0 0021.4.7C19.5.2 12 .2 12 .2S4.5.2 2.6.7A3 3 0 00.5 2.8 31.4 31.4 0 000 9a31.4 31.4 0 00.5 6.2A3 3 0 002.6 17.3c1.9.5 9.4.5 9.4.5s7.5 0 9.4-.5a3 3 0 002.1-2.1A31.4 31.4 0 0024 9a31.4 31.4 0 00-.5-6.2zM9.6 12.8V5.2L15.8 9l-6.2 3.8z"/>
             </svg>
             YouTube
           </span>
         </div>
+        <!-- Shown when only one of the two services could be unblocked -->
+        <div class="partial-note" id="partialNote" style="display: none;"></div>
       </div>
 
       <!-- Strategy progress -->
@@ -291,6 +293,21 @@
         </button>
         <div class="logs-body" id="logsBody" style="display: none;">
           <div class="logs-list" id="logsList"></div>
+          <div class="logs-actions">
+            <button class="logs-action" id="logsCopy" title="Скопировать журнал вместе с версией приложения и системы">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <rect x="9" y="9" width="13" height="13" rx="2" stroke="currentColor" stroke-width="2"/>
+                <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              <span id="logsCopyLabel">Скопировать журнал</span>
+            </button>
+            <button class="logs-action logs-action-ghost" id="logsReveal" title="Открыть папку с файлом журнала">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+              </svg>
+              <span>Файл</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -307,8 +324,8 @@
           Приложение автоматически находит рабочую стратегию обхода DPI для вашего провайдера и разблокирует Discord, YouTube и другие сервисы. Все работает локально, без VPN-серверов.
         </div>
         <div class="info-actions">
-          <button type="button" class="link-btn" id="updateHostsBtn" title="Обновляет hosts для Discord голоса (нужны права админа)">
-            Обновить hosts (Discord голос)
+          <button type="button" class="link-btn" id="updateHostsBtn" title="Прописывает адреса Discord, Telegram и GitHub в hosts в обход подмены DNS (нужны права админа)">
+            Обновить hosts
           </button>
           <button type="button" class="link-btn" id="clearDiscordCacheBtn" title="Очистить кэш Discord">
             Очистить кэш Discord

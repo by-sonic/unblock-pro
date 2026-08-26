@@ -7,6 +7,7 @@
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
     "sync:flowseal": "node scripts/sync-flowseal-strategies.js",
+    "sync:hosts": "node scripts/sync-hosts-data.js",
     "build:icons": "electron scripts/build-icons.js",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
