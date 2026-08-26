@@ -86,6 +86,32 @@ function collectBlockHostnames(blockBody) {
   return hostnames;
 }
 
+// The lines between our opening marker and the closing sentinel, without the
+// markers themselves. Used to work out which hostnames are ours before removing
+// the block: the removal guard needs to know which lines are allowed to vanish,
+// and asking the file is more honest than assuming the current embedded list.
+//
+// Returns null for a legacy block written before the closing sentinel existed —
+// there is no way to tell where such a block ends without already knowing which
+// hostnames belong to it, and guessing is what deleted user entries before.
+function extractMarkedBlockBody(content, baseMarker) {
+  const lines = String(content || '').split('\n');
+  const pattern = markerPattern(baseMarker);
+
+  const start = lines.findIndex(
+    (line) => pattern.test(line) && !isBlockEndLine(line, baseMarker)
+  );
+  if (start === -1) return null;
+
+  for (let i = start + 1; i < lines.length; i++) {
+    if (isBlockEndLine(lines[i], baseMarker)) {
+      return lines.slice(start + 1, i).join('\n');
+    }
+  }
+
+  return null;
+}
+
 // Drops our block, leaving every other line byte-identical.
 //
 // Blocks written by this version end at the closing sentinel. Blocks written by
@@ -198,17 +224,47 @@ function buildHostsUpdateScript(hostsPath, tempFile) {
   ].join('; ');
 }
 
+// Works out what the hosts file should look like once our block is gone, and
+// refuses rather than guessing when it cannot be sure.
+//
+// `fallbackBlockData` is only consulted for a legacy block — one written before
+// the closing sentinel existed, whose extent cannot be read from the file. Those
+// were generated from the same embedded list, so its hostnames are the best
+// available answer to "which lines are ours".
+//
+// Returns { changed: false, reason: 'absent' | 'unsafe' } or
+// { changed: true, next, ownHostnames }. Never throws and never writes.
+function planHostsRemoval(content, baseMarker, fallbackBlockData = '') {
+  const current = String(content || '');
+
+  if (!hasMarkedBlock(current, baseMarker)) return { changed: false, reason: 'absent' };
+
+  const body = extractMarkedBlockBody(current, baseMarker);
+  const ownHostnames = collectBlockHostnames(body === null ? fallbackBlockData : body);
+
+  const next = removeMarkedBlock(current, baseMarker, { ownHostnames });
+  if (next === current) return { changed: false, reason: 'absent' };
+
+  if (!isSafeHostsRewrite(current, next, baseMarker, { ownHostnames })) {
+    return { changed: false, reason: 'unsafe' };
+  }
+
+  return { changed: true, next, ownHostnames };
+}
+
 module.exports = {
   buildBlockEndMarker,
   buildHostsUpdateScript,
   buildBlockMarker,
   collectBlockHostnames,
+  extractMarkedBlockBody,
   hasCurrentBlock,
   hasMarkedBlock,
   hostnamesOf,
   isOwnedHostsLine,
   isSafeHostsRewrite,
   parsePfEnableToken,
+  planHostsRemoval,
   removeMarkedBlock,
   replaceMarkedBlock
 };
