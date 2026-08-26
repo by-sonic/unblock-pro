@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('api', {
   
   // Logs & errors
   getLogs: () => ipcRenderer.invoke('get-logs'),
+  copyLogs: () => ipcRenderer.invoke('copy-logs'),
+  showLogFile: () => ipcRenderer.invoke('show-log-file'),
   clearError: () => ipcRenderer.invoke('clear-error'),
   
   // Custom domains
@@ -41,6 +43,7 @@ contextBridge.exposeInMainWorld('api', {
   // External links
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   updateHostsForDiscord: () => ipcRenderer.invoke('update-hosts-for-discord'),
+  cleanHosts: () => ipcRenderer.invoke('clean-hosts'),
   clearDiscordCache: () => ipcRenderer.invoke('clear-discord-cache'),
   
   // Event listeners

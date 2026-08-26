@@ -1,0 +1,94 @@
+name: Проблема в работе
+description: Обход не работает, ошибка при подключении, что-то сломалось
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за репорт. Заполните поля ниже — без них проблему почти невозможно
+        воспроизвести: одна и та же ошибка на разных провайдерах имеет разные причины.
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Версия UnblockPro
+      description: Видно в заголовке окна приложения. Проверьте на последней версии перед репортом.
+      placeholder: "2.0.20"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Операционная система
+      options:
+        - macOS (Apple Silicon — M1/M2/M3/M4)
+        - macOS (Intel)
+        - Windows 11
+        - Windows 10
+        - Другое
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: Версия ОС
+      placeholder: "macOS Sequoia 15.7.7 / Windows 11 23H2"
+    validations:
+      required: true
+
+  - type: input
+    id: isp
+    attributes:
+      label: Провайдер и город
+      description: Блокировки различаются по провайдерам — без этого поля репорт почти бесполезен.
+      placeholder: "МГТС, Москва"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: broken
+    attributes:
+      label: Что именно не работает
+      multiple: true
+      options:
+        - YouTube — страница не открывается
+        - YouTube — интерфейс открывается, видео не грузится
+        - Discord — не открывается вообще
+        - Discord — вечное «подключение» к голосовому каналу
+        - Приложение не подключается («ни одна стратегия не сработала»)
+        - Ошибка при скачивании бинарников
+        - Другое
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Что происходит
+      description: Что вы сделали, что ожидали и что получили. Скриншот ошибки приложите сюда же.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Журнал
+      description: |
+        В главном окне разверните карточку «Журнал» и нажмите «Скопировать журнал»,
+        затем вставьте содержимое сюда. Если кнопки нет — у вас версия старше 2.0.21,
+        приложите скриншот развёрнутого журнала.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Проверил на последней версии из Releases
+          required: true
+        - label: Попробовал отключиться и подключиться заново, чтобы перебор стратегий прошёл заново
+          required: true

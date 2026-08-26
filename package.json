@@ -7,6 +7,7 @@
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
     "sync:flowseal": "node scripts/sync-flowseal-strategies.js",
+    "sync:hosts": "node scripts/sync-hosts-data.js",
     "build:icons": "electron scripts/build-icons.js",
     "build": "electron-builder",
     "build:mac": "electron-builder --mac",
@@ -36,7 +37,7 @@
     "url": "https://github.com/by-sonic/unblock-pro"
   },
   "devDependencies": {
-    "electron": "^28.1.0",
+    "electron": "^43.4.1",
     "electron-builder": "^26.7.0"
   },
   "dependencies": {
@@ -59,6 +60,10 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "scripts/uninstall-clean-hosts.ps1",
+        "to": "uninstall-clean-hosts.ps1"
       }
     ],
     "mac": {
@@ -120,6 +125,7 @@
     "nsis": {
       "oneClick": true,
       "perMachine": true,
+      "include": "build/installer.nsh",
       "artifactName": "UnblockPro-${version}-win-setup.${ext}"
     },
     "portable": {

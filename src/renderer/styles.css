@@ -964,6 +964,12 @@ body {
   border-radius: var(--border-radius);
   border: 1px solid var(--border-color);
   overflow: hidden;
+  /* .main-content is a column flex container, so its children may shrink. Every
+     other card is limited by its content, but `overflow: hidden` sets this one's
+     automatic minimum size to zero — measured at the default 420x680 window the
+     card collapsed to 2px, which is why "разверните журнал" read as a card that
+     is not there. */
+  flex-shrink: 0;
 }
 
 .logs-header {
@@ -1344,4 +1350,96 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(255, 255, 255, 0.15);
+}
+
+/* Log export — the only way a user can hand over diagnostics */
+.logs-actions {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--border-color);
+}
+
+.logs-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.logs-action:hover {
+  background: #2a2a3a;
+  color: var(--text-primary);
+}
+
+.logs-action:active {
+  transform: translateY(1px);
+}
+
+.logs-action:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.logs-action.is-done {
+  border-color: var(--accent-green);
+  color: var(--accent-green);
+}
+
+.logs-action.is-failed {
+  border-color: var(--accent-red);
+  color: var(--accent-red);
+}
+
+/* Secondary action: narrower, quieter — copying is the one that matters. */
+.logs-action-ghost {
+  flex: 0 0 auto;
+  background: none;
+}
+
+/* Partial protection: one service could not be unblocked on this ISP. The badge
+   stays visible but reads as struck out, so "подключено" never implies more than
+   the connection actually delivers. */
+.service-badge.is-blocked {
+  opacity: 0.4;
+  text-decoration: line-through;
+  filter: grayscale(1);
+}
+
+.partial-note {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--border-radius-sm);
+  background: var(--accent-yellow-glow);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* Partial protection is not full protection: the ring goes amber so the state
+   is readable at a glance, without pretending to be an error either. */
+.status-indicator.connected.partial .status-ring {
+  border-color: var(--accent-yellow);
+  box-shadow: 0 0 20px var(--accent-yellow-glow);
+}
+
+.status-indicator.connected.partial .status-dot {
+  background: var(--accent-yellow);
+  box-shadow: 0 0 15px var(--accent-yellow-glow);
+}
+
+.status-indicator.connected.partial .status-pulse {
+  background: var(--accent-yellow);
+||||||| 3f2a097
 }
