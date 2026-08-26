@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Последний релиз
+    url: https://github.com/by-sonic/unblock-pro/releases/latest
+    about: Прежде чем сообщать о проблеме, проверьте её на последней версии.
+  - name: FAQ
+    url: https://github.com/by-sonic/unblock-pro#faq
+    about: Частые вопросы — свои домены, установка, требования к системе.
