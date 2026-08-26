@@ -20,6 +20,9 @@ const strategySelect = document.getElementById('strategySelect');
 const connectionTimer = document.getElementById('connectionTimer');
 const timerText = document.getElementById('timerText');
 const serviceBadges = document.getElementById('serviceBadges');
+const badgeDiscord = document.getElementById('badgeDiscord');
+const badgeYoutube = document.getElementById('badgeYoutube');
+const partialNote = document.getElementById('partialNote');
 const strategyProgress = document.getElementById('strategyProgress');
 const strategyProgressText = document.getElementById('strategyProgressText');
 const strategyProgressCount = document.getElementById('strategyProgressCount');
@@ -311,7 +314,7 @@ function handleStatusUpdate(status) {
   }
   
   // Update status indicator
-  statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error');
+  statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error', 'partial');
   connectBtn.classList.remove('connected', 'connecting', 'downloading');
   statusText.classList.remove('error-text');
   
@@ -346,7 +349,11 @@ function handleStatusUpdate(status) {
     downloadSection.style.display = 'none';
     hideStrategyProgress();
     hideError();
-    showServiceBadges();
+    showServiceBadges(status.outcome);
+    if (status.outcome && status.outcome.level === 'partial') {
+      statusIndicator.classList.add('partial');
+      statusText.textContent = 'Защита частичная';
+    }
     
     // Start connection timer
     if (status.connectedSince) {
@@ -449,12 +456,34 @@ function updateTimerDisplay() {
 
 // ============= Service Badges =============
 
-function showServiceBadges() {
+const SERVICE_HINTS = {
+  discord: 'Discord у вашего провайдера поднять не удалось — ни одна стратегия его не открыла. YouTube при этом работает.',
+  youtube: 'YouTube у вашего провайдера поднять не удалось — ни одна стратегия его не открыла. Discord при этом работает.'
+};
+
+// `outcome` is absent on older states and on a full connection; both mean "всё
+// работает", so the badges stay as they are.
+function showServiceBadges(outcome) {
   serviceBadges.style.display = 'flex';
+
+  const services = (outcome && outcome.services) || { discord: true, youtube: true };
+  badgeDiscord.classList.toggle('is-blocked', services.discord === false);
+  badgeYoutube.classList.toggle('is-blocked', services.youtube === false);
+
+  const blocked = Object.keys(SERVICE_HINTS).filter((name) => services[name] === false);
+  if (blocked.length === 1) {
+    partialNote.textContent = SERVICE_HINTS[blocked[0]];
+    partialNote.style.display = 'block';
+  } else {
+    partialNote.style.display = 'none';
+  }
 }
 
 function hideServiceBadges() {
   serviceBadges.style.display = 'none';
+  partialNote.style.display = 'none';
+  badgeDiscord.classList.remove('is-blocked');
+  badgeYoutube.classList.remove('is-blocked');
 }
 
 // ============= Error Display =============

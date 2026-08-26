@@ -1406,3 +1406,40 @@ body {
   flex: 0 0 auto;
   background: none;
 }
+
+/* Partial protection: one service could not be unblocked on this ISP. The badge
+   stays visible but reads as struck out, so "подключено" never implies more than
+   the connection actually delivers. */
+.service-badge.is-blocked {
+  opacity: 0.4;
+  text-decoration: line-through;
+  filter: grayscale(1);
+}
+
+.partial-note {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--border-radius-sm);
+  background: var(--accent-yellow-glow);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* Partial protection is not full protection: the ring goes amber so the state
+   is readable at a glance, without pretending to be an error either. */
+.status-indicator.connected.partial .status-ring {
+  border-color: var(--accent-yellow);
+  box-shadow: 0 0 20px var(--accent-yellow-glow);
+}
+
+.status-indicator.connected.partial .status-dot {
+  background: var(--accent-yellow);
+  box-shadow: 0 0 15px var(--accent-yellow-glow);
+}
+
+.status-indicator.connected.partial .status-pulse {
+  background: var(--accent-yellow);
+||||||| 3f2a097
+}
