@@ -45,6 +45,27 @@ test('delayed expansion is enabled, since every flag depends on it', () => {
   assert.match(build(), /setlocal EnableDelayedExpansion/);
 });
 
+test('native cmd launch preserves Flowseal exclamation reset markers', { skip: process.platform !== 'win32' }, (t) => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { execFileSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'unblock-argv-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'capture.js'), "require('fs').writeFileSync('args.json', JSON.stringify(process.argv.slice(2)))");
+  const args = ['capture.js', '--dpi-desync-fake-tls=!', '--dpi-desync-fake-tls=!+'];
+  const bat = build({ binaryPath: process.execPath, binDirectory: dir, strategies: [{ name: 'reset', args }] });
+  const blocks = [...bat.matchAll(/setlocal DisableDelayedExpansion\r\n[\s\S]*?\r\nendlocal/g)];
+  assert.equal(blocks.length, 2, 'initial and partial restart must both preserve markers');
+  // Execute only the generated launch fragment with a harmless argv recorder.
+  // No winws, taskkill, hosts/DNS changes or elevated shell is involved.
+  for (const [block] of blocks) {
+    fs.writeFileSync(path.join(dir, 'launch.cmd'), '@echo off\r\nsetlocal EnableDelayedExpansion\r\n' + block.replace('start "" /b', 'start "" /b /wait') + '\r\n');
+    execFileSync('cmd.exe', ['/d', '/c', 'launch.cmd'], { cwd: dir, timeout: 10000 });
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'args.json'), 'utf8')), args.slice(1));
+  }
+});
+
 test('each strategy gets its own label set, so gotos cannot collide', () => {
   const bat = build();
   for (let i = 0; i < STRATEGIES.length; i++) {

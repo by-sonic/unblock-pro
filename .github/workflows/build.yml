@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.outputs.outputs.version }}
+      commit_sha: ${{ steps.outputs.outputs.commit_sha }}
       should_build: ${{ steps.outputs.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +51,11 @@ jobs:
               echo "version=$VERSION" >> $GITHUB_OUTPUT
             fi
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            PACKAGE_VERSION=$(node -p "require('./package.json').version")
+            if [ "${GITHUB_REF#refs/tags/v}" != "$PACKAGE_VERSION" ]; then
+              echo "Tag version does not match package.json" >&2
+              exit 1
+            fi
             echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
@@ -57,6 +63,7 @@ jobs:
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
+          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   build-mac:
     runs-on: macos-latest
@@ -65,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -145,7 +152,7 @@ jobs:
           timeout_minutes: 15
           max_attempts: 3
           retry_wait_seconds: 10
-          command: npm run build:mac
+          command: npm run build:mac -- --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -170,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -199,17 +206,20 @@ jobs:
       - name: Bundle audited Flowseal runtime
         shell: pwsh
         run: |
-          $url = 'https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.9.9c/zapret-discord-youtube-1.9.9c.zip'
+          $bundle = node -e "const b=require('./src/main/flowseal-bundle'); console.log(JSON.stringify({version:b.FLOWSEAL_BUNDLE_VERSION,url:b.FLOWSEAL_BUNDLE_URL,sha256:b.FLOWSEAL_BUNDLE_SHA256}))" | ConvertFrom-Json
           $archive = Join-Path $env:RUNNER_TEMP 'flowseal.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'flowseal'
-          Invoke-WebRequest -Uri $url -OutFile $archive
+          Invoke-WebRequest -Uri $bundle.url -OutFile $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($hash -ne '6064e4b26ed7358961a0b978fbb6263b119d8d7a5a06bb4a6454aeb855cf63e9') {
+          if ($hash -ne $bundle.sha256) {
             throw "Flowseal checksum mismatch: $hash"
           }
           Expand-Archive -Path $archive -DestinationPath $extract
-          Copy-Item -Path "$extract\zapret-discord-youtube-1.9.9c\bin\*" -Destination 'bin\win32' -Recurse
-          Set-Content -Path 'bin\win32\flowseal-bundle-version.txt' -Value '1.9.9c' -NoNewline
+          Copy-Item -Path "$extract\zapret-discord-youtube-$($bundle.version)\bin\*" -Destination 'bin\win32' -Recurse
+          Set-Content -Path 'bin\win32\flowseal-bundle-version.txt' -Value $bundle.version -NoNewline
+
+      - name: Validate every bundled Windows strategy without opening WinDivert
+        run: node scripts/check-windows-strategies.js
 
       - name: Build Windows
         uses: nick-fields/retry@v3
@@ -217,7 +227,7 @@ jobs:
           timeout_minutes: 15
           max_attempts: 3
           retry_wait_seconds: 10
-          command: npm run build:win
+          command: npm run build:win -- --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -242,7 +252,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
@@ -260,6 +270,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.commit_sha }}
           name: UnblockPro v${{ needs.prepare.outputs.version }}
           body: |
             ## UnblockPro v${{ needs.prepare.outputs.version }}
@@ -271,7 +282,7 @@ jobs:
             | **macOS** Apple Silicon (M1/M2/M3/M4) | `UnblockPro-*-mac-arm64.dmg` | Для Mac с M-процессором |
             | **macOS** Intel | `UnblockPro-*-mac-x64.dmg` | Для Mac с Intel |
             | **Windows** | `UnblockPro-*-win-setup.exe` | Установщик |
-            | **Windows** | `UnblockPro-*-win-portable.exe` | Портативная версия |
+            Windows: используйте установщик. Portable-запуск отключён, поскольку движок должен находиться в защищённом каталоге Program Files.
             
             ### macOS — первый запуск
             

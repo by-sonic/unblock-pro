@@ -36,7 +36,10 @@
 | **macOS** Apple Silicon (M1/M2/M3/M4) | [UnblockPro-mac-arm64.dmg / .zip](https://github.com/by-sonic/unblock-pro/releases/latest) | Для Mac с M-процессором |
 | **macOS** Intel | [UnblockPro-mac-x64.dmg / .zip](https://github.com/by-sonic/unblock-pro/releases/latest) | Для Mac с Intel |
 | **Windows** | [UnblockPro-win-setup.exe](https://github.com/by-sonic/unblock-pro/releases/latest) | Установщик |
-| **Windows** | [UnblockPro-win-portable.exe](https://github.com/by-sonic/unblock-pro/releases/latest) | Портативная версия (без установки) |
+
+Для Windows используйте установщик: движок запускается из защищённого каталога
+Program Files. Portable-сборка больше не выпускается из-за возможности подмены
+бинарников в доступном пользователю каталоге.
 
 > Перейдите в [Releases](https://github.com/by-sonic/unblock-pro/releases/latest) и скачайте версию для вашей ОС
 
@@ -56,10 +59,10 @@
 
 ## Что нового в Windows
 
-- Все 20 стратегий `general*.bat` синхронизированы с [Flowseal/zapret-discord-youtube 1.9.9c](https://github.com/Flowseal/zapret-discord-youtube/releases/tag/1.9.9c), включая новую `ALT12`; `ALT9` проверяется первой
+- Все 22 стратегии `general*.bat` синхронизированы с [Flowseal/zapret-discord-youtube 1.10.2](https://github.com/Flowseal/zapret-discord-youtube/releases/tag/1.10.2), включая `ALT13` и `EXP`; `ALT13` проверяется первой
 - Добавлены актуальные Discord/STUN payload-файлы, TCP/UDP-профили, игровые правила и порт `8443`
 - Совместимый runtime входит в приложение, а скачанный bundle проверяется по SHA-256
-- Списки доменов и исключений обновлены до версии Flowseal `1.9.9c`
+- Списки доменов и исключений обновлены до версии Flowseal `1.10.2`
 - Автоподбор проверяет не только страницы, но и YouTube video redirect, Discord CDN и WebSocket gateway
 
 ---
@@ -88,7 +91,7 @@ UnblockPro использует технологию [zapret](https://github.com
 | Платформа | Метод |
 |-----------|-------|
 | **macOS** | `tpws` — SOCKS5 прокси с модификацией пакетов. Приложение автоматически настраивает системный прокси |
-| **Windows** | `winws` — перехватывает пакеты на уровне драйвера через WinDivert. Стратегия `ALT9` и runtime синхронизированы с Flowseal `1.9.9c` |
+| **Windows** | `winws` — перехватывает пакеты на уровне драйвера через WinDivert. Стратегия `ALT13` и runtime синхронизированы с Flowseal `1.10.2` |
 
 Приложение последовательно тестирует несколько стратегий (split+disorder, split-tls, methodeol, oob и другие), пока не найдёт работающую для вашего провайдера.
 
@@ -187,19 +190,26 @@ xattr -cr /Applications/UnblockPro.app
 
 ## Разработка
 
-### Изменения, ожидающие релиза
+### Исправления в следующей версии после 2.0.20
 
-Ветка с исправлениями описана в [аудите открытых issues](docs/issue-resolution-2026-09.md).
-Эти изменения ещё не входят в опубликованную 2.0.20:
+Исправления описаны в [аудите открытых issues](docs/issue-resolution-2026-09.md),
+обновление движков — в [отчёте проверки upstream](docs/runtime-update-2026-09.md):
 
 - карточки «Свои домены» и «Журнал» доступны через прокрутку даже в небольшом окне;
 - подбор можно направить на свой HTTPS-ресурс; такой результат подтверждает
   доступность выбранного адреса, а не работу YouTube или Discord;
 - журнал сохраняется на диск и копируется кнопкой в приложении;
 - сбой самого движка macOS диагностируется отдельно от неудачной стратегии;
+- macOS включает upstream-исправление размера стека DNS-потока; проверка запуска
+  проходит через разрешение доменного имени, а не только открытие локального порта;
 - Windows проверяет защищённость каталога установленного движка. Если проверка
   отклоняет portable-каталог, используйте установщик. Проверка хеша в доступном
   пользователю каталоге сама по себе не защищает от подмены перед запуском.
+
+Движок, профили и списки обновляются вместе с UnblockPro после проверки совместимости.
+Программа не загружает произвольный свежий `zapret` при каждом запуске.
+На Windows новая версия устанавливается автообновлением, на macOS — вручную
+со страницы Releases. Работоспособность стратегии зависит от сети провайдера.
 
 При аварии `tpws` на macOS приложите к issue отчёт `tpws*.ips` из
 `~/Library/Logs/DiagnosticReports` (Finder → Переход → Переход к папке).

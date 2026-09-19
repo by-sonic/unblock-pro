@@ -78,7 +78,9 @@ test('the Flowseal checksum is still pinned — the guard above must not remove 
   const workflow = read('.github/workflows/build.yml');
 
   assert.match(bundle, /FLOWSEAL_BUNDLE_SHA256 = '[0-9a-f]{64}'/, 'Windows bundle must keep its SHA256');
-  assert.match(workflow, /[0-9a-f]{64}/, 'the workflow must still verify the Windows archive');
+  assert.ok(workflow.includes("require('./src/main/flowseal-bundle')"));
+  assert.ok(workflow.includes('sha256:b.FLOWSEAL_BUNDLE_SHA256'));
+  assert.ok(workflow.includes('$hash -ne $bundle.sha256'), 'CI must verify the shared archive checksum');
 });
 
 test('the extracted archive directory is verified against the pin', () => {

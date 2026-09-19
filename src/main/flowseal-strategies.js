@@ -4,6 +4,7 @@ const path = require('path');
 const snapshot = require('./flowseal-strategies.snapshot.json');
 
 const FLOWSEAL_AUTO_ORDER = [
+  'ALT13',
   'ALT9',
   'ALT11',
   'ALT3',

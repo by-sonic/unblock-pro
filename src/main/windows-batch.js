@@ -60,6 +60,14 @@ function buildStrategySweepBatch({
   targetUrl = normalizeTargetUrl(targetUrl);
   const lines = [];
   const add = (line) => lines.push(line);
+  const launch = (strategy) => {
+    // Flowseal reset markers contain a literal '!'. Delayed expansion would
+    // discard it (also inside quotes); keep it off while launching the child.
+    add('setlocal DisableDelayedExpansion');
+    add('cd /d "' + binDirectory + '"');
+    add('start "" /b "' + binaryPath + '" ' + strategy.args.map(quoteArg).join(' '));
+    add('endlocal');
+  };
   const checkCancel = () => { if (cancelFile) add('if exist "' + cancelFile + '" goto :cancelled'); };
 
   const screening = endpointsByService('screen');
@@ -95,8 +103,7 @@ function buildStrategySweepBatch({
     checkCancel();
     add(':: Strategy ' + (i + 1) + ': ' + strategy.name);
     add('echo ' + (i + 1) + '/' + totalStrategies + ':' + strategy.name + '> "%PROGRESS%"');
-    add('cd /d "' + binDirectory + '"');
-    add('start "" /b "' + binaryPath + '" ' + strategy.args.map(quoteArg).join(' '));
+    launch(strategy);
     add('timeout /t ' + settleSeconds + ' /nobreak >nul');
     if (targetUrl) {
       checkCancel();
@@ -167,8 +174,7 @@ function buildStrategySweepBatch({
   add('goto :realend');
   strategies.forEach((strategy, i) => {
     add(':run_partial_' + i);
-    add('cd /d "' + binDirectory + '"');
-    add('start "" /b "' + binaryPath + '" ' + strategy.args.map(quoteArg).join(' '));
+    launch(strategy);
     add('timeout /t ' + settleSeconds + ' /nobreak >nul');
     add('goto :end');
   });

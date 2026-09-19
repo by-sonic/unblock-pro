@@ -16,12 +16,14 @@ function close(server) {
   return new Promise((resolve) => server.close(resolve));
 }
 
-// Negotiate SOCKS5 and make a real CONNECT request to loopback. Pinned tpws
+// Negotiate SOCKS5 and make a domain CONNECT request to localhost. Pinned tpws
 // deliberately rejects local destinations with REP=2 (tpws_conn.c,
 // proxy_mode_connect_remote). That complete response proves its event loop and
-// request parser ran; it does not prove external forwarding or DPI bypass.
+// request parser and resolver worker ran; it does not prove external forwarding
+// or DPI bypass. An IPv4 CONNECT would miss macOS resolver-stack crashes.
 // If local forwarding is supported, verify our endpoint's unpredictable body.
-// No DNS, external sites, system proxy, pf or privilege changes are involved.
+// Only the local localhost name is resolved; no external sites, system proxy,
+// pf or privilege changes are involved.
 function requestThroughSocks(proxyPort, targetPort, token, timeoutMs) {
   return new Promise((resolve, reject) => {
     const socket = net.connect(proxyPort, '127.0.0.1');
@@ -47,7 +49,11 @@ function requestThroughSocks(proxyPort, targetPort, token, timeoutMs) {
         if (buffer[0] !== 5 || buffer[1] !== 0) return finish(new Error('SOCKS runtime: неверное приветствие'));
         buffer = buffer.subarray(2);
         stage = 'connect';
-        socket.write(Buffer.from([5, 1, 0, 1, 127, 0, 0, 1, targetPort >> 8, targetPort & 255]));
+        const hostname = Buffer.from('localhost', 'ascii');
+        socket.write(Buffer.concat([
+          Buffer.from([5, 1, 0, 3, hostname.length]), hostname,
+          Buffer.from([targetPort >> 8, targetPort & 255])
+        ]));
       }
       if (stage === 'connect') {
         if (buffer.length < 5) return;

@@ -23,7 +23,22 @@ if (mode === 'never-listens') {
         socket.write(Buffer.from([5]));
         setImmediate(() => socket.write(Buffer.from([0])));
       }
-      if (pending.length < 10) return;
+      if (pending.length < 5) return;
+      // Require a domain CONNECT so the preflight cannot silently stop testing
+      // the resolver path that crashed on macOS. Reject all non-local targets.
+      if (pending[0] !== 5 || pending[1] !== 1 || pending[2] !== 0 || pending[3] !== 3) {
+        socket.end(Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0]));
+        return;
+      }
+      const hostnameLength = pending[4];
+      const requestLength = 7 + hostnameLength;
+      if (pending.length < requestLength) return;
+      if (pending.subarray(5, 5 + hostnameLength).toString('ascii') !== 'localhost') {
+        socket.destroy();
+        return;
+      }
+      if (mode === 'crash-on-domain') return process.kill(process.pid, 'SIGKILL');
+      if (mode === 'hang-on-domain') return;
       const replies = {
         deny: [5, 2, 0, 1, 0, 0, 0, 0, 0, 0],
         'invalid-reply': [5, 1, 0, 1, 0, 0, 0, 0, 0, 0],
@@ -36,7 +51,7 @@ if (mode === 'never-listens') {
         socket.end(Buffer.from(replies[mode]));
         return;
       }
-      const targetPort = pending.readUInt16BE(8);
+      const targetPort = pending.readUInt16BE(5 + hostnameLength);
       socket.removeListener('data', onData);
       const target = net.connect(targetPort, '127.0.0.1', () => {
         socket.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]));

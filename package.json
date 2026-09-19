@@ -112,12 +112,6 @@
           "arch": [
             "x64"
           ]
-        },
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
         }
       ],
       "requestedExecutionLevel": "requireAdministrator"
@@ -127,9 +121,6 @@
       "perMachine": true,
       "include": "build/installer.nsh",
       "artifactName": "UnblockPro-${version}-win-setup.${ext}"
-    },
-    "portable": {
-      "artifactName": "UnblockPro-${version}-win-portable.${ext}"
     },
     "publish": {
       "provider": "github",

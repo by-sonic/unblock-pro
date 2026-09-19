@@ -22,7 +22,7 @@ async function probeFixture(mode, timeoutMs = 1500) {
   return result;
 }
 
-test('SOCKS runtime preflight transfers a local HTTP response and accepts controlled shutdown', async () => {
+test('SOCKS runtime preflight sends localhost through the resolver path and accepts controlled shutdown', async () => {
   assert.deepEqual(await probeFixture('relay'), { ok: true, check: 'loopback-http' });
 });
 
@@ -43,15 +43,17 @@ for (const mode of ['invalid-version', 'invalid-reserved', 'invalid-address', 't
   });
 }
 
-test('SOCKS runtime preflight catches a process that listens then dies', async () => {
-  const result = await probeFixture('crash');
-  assert.equal(result.ok, false);
-  // Windows exposes a process self-kill as exit code 1, POSIX as SIGKILL.
-  assert.match(result.reason, process.platform === 'win32' ? /код выхода: 1/ : /SIGKILL/);
-  assert.doesNotMatch(result.reason, /подпис/);
-});
+for (const mode of ['crash', 'crash-on-domain']) {
+  test(`SOCKS runtime preflight catches ${mode} after the listener starts`, async () => {
+    const result = await probeFixture(mode);
+    assert.equal(result.ok, false);
+    // Windows exposes a process self-kill as exit code 1, POSIX as SIGKILL.
+    assert.match(result.reason, process.platform === 'win32' ? /код выхода: 1/ : /SIGKILL/);
+    assert.doesNotMatch(result.reason, /подпис/);
+  });
+}
 
-for (const mode of ['never-listens', 'hang']) {
+for (const mode of ['never-listens', 'hang', 'hang-on-domain']) {
   test(`SOCKS runtime preflight bounds ${mode} and does not blame its own kill on macOS`, async () => {
     const started = Date.now();
     const result = await probeFixture(mode, 250);

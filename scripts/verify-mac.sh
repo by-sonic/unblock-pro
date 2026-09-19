@@ -25,10 +25,10 @@ codesign --verify --verbose "$BINARY" 2>&1 || true
 echo "--- unit tests ---"
 npm test
 
-echo "--- real SOCKS listener + loopback CONNECT request ---"
+echo "--- real SOCKS listener + localhost domain CONNECT (resolver worker) ---"
 if node scripts/check-mac-runtime.js "$BINARY"; then
   echo "Local runtime smoke passed. Pinned tpws rejects loopback destinations by policy."
-  echo "This checks the event loop and SOCKS request handling, not external forwarding or ISP bypass."
+  echo "This checks the event loop, SOCKS request handling and localhost resolver, not external forwarding or ISP bypass."
 else
   echo "Runtime smoke failed. Save this output and the matching tpws .ips crash report from:"
   echo "  ~/Library/Logs/DiagnosticReports/ or /Library/Logs/DiagnosticReports/"
