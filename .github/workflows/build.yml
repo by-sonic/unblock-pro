@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.outputs.outputs.version }}
+      commit_sha: ${{ steps.outputs.outputs.commit_sha }}
       should_build: ${{ steps.outputs.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +51,11 @@ jobs:
               echo "version=$VERSION" >> $GITHUB_OUTPUT
             fi
           elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            PACKAGE_VERSION=$(node -p "require('./package.json').version")
+            if [ "${GITHUB_REF#refs/tags/v}" != "$PACKAGE_VERSION" ]; then
+              echo "Tag version does not match package.json" >&2
+              exit 1
+            fi
             echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
             echo "should_build=true" >> $GITHUB_OUTPUT
           else
@@ -57,6 +63,7 @@ jobs:
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
+          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
   build-mac:
     runs-on: macos-latest
@@ -65,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -127,40 +134,17 @@ jobs:
           }
           "
 
-      # A binary that passes every static check and still gets SIGKILLed on exec
-      # is exactly what was reported on Apple Silicon (M4, macOS 27): universal,
-      # both slices present, dead the moment it runs. The runner is arm64, so
-      # actually running it here turns that report into a build gate.
-      - name: Verify the bundled tpws can actually execute
+      # --help never enters the event loop; exercise the actual listener and a
+      # local SOCKS5 request without changing any system network settings.
+      # Pinned tpws rejects loopback CONNECT by policy; a valid REP=2 is expected.
+      - name: Smoke test the bundled tpws SOCKS runtime
         shell: bash
         run: |
           echo "runner arch: $(uname -m), macOS $(sw_vers -productVersion)"
-
-          echo "--- signature ---"
-          codesign -dv --verbose=4 bin/darwin/tpws 2>&1 | sed 's/^/  /' || echo "  (codesign reported nothing)"
-
-          echo "--- exec (no GNU timeout on the runner, so watchdog it) ---"
-          bin/darwin/tpws --help >"$RUNNER_TEMP/tpws-help.txt" 2>&1 &
-          pid=$!
-          ( sleep 10; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
-          watchdog=$!
-          # Actions runs bash with -e, and `wait` returns the child's status, so
-          # a non-zero exit would abort the step before the verdict is printed.
-          code=0
-          wait $pid 2>/dev/null || code=$?
-          kill $watchdog 2>/dev/null || true
-
-          echo "  exit status: $code"
-          echo "  output:"
-          head -5 "$RUNNER_TEMP/tpws-help.txt" 2>/dev/null | sed 's/^/    /' || true
-
-          # A non-zero exit is fine — plenty of tools return non-zero for --help.
-          # Only being killed by a signal means the binary cannot run at all.
-          if [ "$code" -ge 128 ]; then
-            echo "FAIL: killed by signal $((code - 128)) on $(uname -m) — the shipped binary cannot run"
-            exit 1
-          fi
-          echo "ok: tpws executes on $(uname -m)"
+          # Sign the artifact we just compiled, including both universal slices.
+          codesign --force --sign - bin/darwin/tpws
+          codesign --verify --verbose bin/darwin/tpws
+          node scripts/check-mac-runtime.js bin/darwin/tpws
 
       - name: Build macOS
         uses: nick-fields/retry@v3
@@ -168,7 +152,7 @@ jobs:
           timeout_minutes: 15
           max_attempts: 3
           retry_wait_seconds: 10
-          command: npm run build:mac
+          command: npm run build:mac -- --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -193,7 +177,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -212,6 +196,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Verify renderer layout and protected-runtime bootstrap
+        run: npx electron scripts/renderer-smoke.js
+
       - name: Create bin directory
         run: mkdir bin\win32
         shell: cmd
@@ -219,17 +206,20 @@ jobs:
       - name: Bundle audited Flowseal runtime
         shell: pwsh
         run: |
-          $url = 'https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.9.9c/zapret-discord-youtube-1.9.9c.zip'
+          $bundle = node -e "const b=require('./src/main/flowseal-bundle'); console.log(JSON.stringify({version:b.FLOWSEAL_BUNDLE_VERSION,url:b.FLOWSEAL_BUNDLE_URL,sha256:b.FLOWSEAL_BUNDLE_SHA256}))" | ConvertFrom-Json
           $archive = Join-Path $env:RUNNER_TEMP 'flowseal.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'flowseal'
-          Invoke-WebRequest -Uri $url -OutFile $archive
+          Invoke-WebRequest -Uri $bundle.url -OutFile $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
-          if ($hash -ne '6064e4b26ed7358961a0b978fbb6263b119d8d7a5a06bb4a6454aeb855cf63e9') {
+          if ($hash -ne $bundle.sha256) {
             throw "Flowseal checksum mismatch: $hash"
           }
           Expand-Archive -Path $archive -DestinationPath $extract
-          Copy-Item -Path "$extract\zapret-discord-youtube-1.9.9c\bin\*" -Destination 'bin\win32' -Recurse
-          Set-Content -Path 'bin\win32\flowseal-bundle-version.txt' -Value '1.9.9c' -NoNewline
+          Copy-Item -Path "$extract\zapret-discord-youtube-$($bundle.version)\bin\*" -Destination 'bin\win32' -Recurse
+          Set-Content -Path 'bin\win32\flowseal-bundle-version.txt' -Value $bundle.version -NoNewline
+
+      - name: Validate every bundled Windows strategy without opening WinDivert
+        run: node scripts/check-windows-strategies.js
 
       - name: Build Windows
         uses: nick-fields/retry@v3
@@ -237,7 +227,7 @@ jobs:
           timeout_minutes: 15
           max_attempts: 3
           retry_wait_seconds: 10
-          command: npm run build:win
+          command: npm run build:win -- --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -262,7 +252,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref == 'refs/heads/main' && 'main' || github.ref }}
+          ref: ${{ needs.prepare.outputs.commit_sha }}
 
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
@@ -280,6 +270,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.commit_sha }}
           name: UnblockPro v${{ needs.prepare.outputs.version }}
           body: |
             ## UnblockPro v${{ needs.prepare.outputs.version }}
@@ -291,7 +282,7 @@ jobs:
             | **macOS** Apple Silicon (M1/M2/M3/M4) | `UnblockPro-*-mac-arm64.dmg` | Для Mac с M-процессором |
             | **macOS** Intel | `UnblockPro-*-mac-x64.dmg` | Для Mac с Intel |
             | **Windows** | `UnblockPro-*-win-setup.exe` | Установщик |
-            | **Windows** | `UnblockPro-*-win-portable.exe` | Портативная версия |
+            Windows: используйте установщик. Portable-запуск отключён, поскольку движок должен находиться в защищённом каталоге Program Files.
             
             ### macOS — первый запуск
             

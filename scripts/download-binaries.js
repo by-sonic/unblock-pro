@@ -62,7 +62,9 @@ async function buildWindowsRuntime() {
   execFileSync('powershell', [
     '-NoProfile',
     '-Command',
-    `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${extractDir.replace(/'/g, "''")}' -Force`
+    // PowerShell 7 can pass its PSModulePath to Windows PowerShell, breaking
+    // Expand-Archive module loading. The .NET ZIP reader has no module dependency.
+    `Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${archive.replace(/'/g, "''")}', '${extractDir.replace(/'/g, "''")}')`
   ], { stdio: 'inherit' });
 
   const source = path.join(extractDir, `zapret-discord-youtube-${FLOWSEAL_BUNDLE_VERSION}`, 'bin');

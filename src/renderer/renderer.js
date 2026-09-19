@@ -15,11 +15,29 @@ const autostartToggle = document.getElementById('autostartToggle');
 const autoconnectToggle = document.getElementById('autoconnectToggle');
 const autoupdateToggle = document.getElementById('autoupdateToggle');
 const strategySelect = document.getElementById('strategySelect');
+const targetUrl = document.getElementById('targetUrl');
+const saveTargetBtn = document.getElementById('saveTargetBtn');
+const targetMessage = document.getElementById('targetMessage');
+let isSearching = false;
+
+async function saveCustomTarget() {
+  try {
+    const result = await window.api.setCustomTarget(targetUrl.value.trim());
+    targetUrl.setAttribute('aria-invalid', String(!result.success));
+    if (!result.success) { targetMessage.textContent = result.error; return false; }
+    targetUrl.value = result.url;
+    targetMessage.textContent = result.url ? 'Сохранено. При подключении проверяется только этот URL.' : 'Сохранено. Проверяются YouTube и Discord.';
+    return true;
+  } catch (e) { targetMessage.textContent = e.message; return false; }
+}
 
 // New UI elements
 const connectionTimer = document.getElementById('connectionTimer');
 const timerText = document.getElementById('timerText');
 const serviceBadges = document.getElementById('serviceBadges');
+const badgeDiscord = document.getElementById('badgeDiscord');
+const badgeYoutube = document.getElementById('badgeYoutube');
+const partialNote = document.getElementById('partialNote');
 const strategyProgress = document.getElementById('strategyProgress');
 const strategyProgressText = document.getElementById('strategyProgressText');
 const strategyProgressCount = document.getElementById('strategyProgressCount');
@@ -36,6 +54,9 @@ const logsChevron = document.getElementById('logsChevron');
 const logsBody = document.getElementById('logsBody');
 const logsList = document.getElementById('logsList');
 const logsCount = document.getElementById('logsCount');
+const logsCopy = document.getElementById('logsCopy');
+const logsCopyLabel = document.getElementById('logsCopyLabel');
+const logsReveal = document.getElementById('logsReveal');
 
 // Custom domains elements
 const domainsToggle = document.getElementById('domainsToggle');
@@ -67,6 +88,7 @@ const updateBtn = document.getElementById('updateBtn');
 
 // Error code to user-friendly title mapping
 const ERROR_TITLES = {
+  'BINARY_RUNTIME_FAILED': 'Ошибка процесса tpws',
   'NO_BINARY': 'Бинарник не найден',
   'DOWNLOAD_FAILED': 'Ошибка скачивания',
   'ALL_STRATEGIES_FAILED': 'Стратегии не сработали',
@@ -74,7 +96,8 @@ const ERROR_TITLES = {
   'PERMISSION_DENIED': 'Нет прав доступа',
   'PORT_IN_USE': 'Порт занят',
   'NETWORK_UNAVAILABLE': 'Нет сети',
-  'ALREADY_RUNNING': 'Уже подключено'
+  'ALREADY_RUNNING': 'Уже подключено',
+  'RUNTIME_INTEGRITY': 'Файлы движка изменены'
 };
 
 // Initialize
@@ -117,6 +140,7 @@ function setupEventListeners() {
   minimizeBtn.addEventListener('click', () => window.api.minimizeWindow());
   closeBtn.addEventListener('click', () => window.api.closeWindow());
   connectBtn.addEventListener('click', handleConnectClick);
+  saveTargetBtn.addEventListener('click', saveCustomTarget);
   
   autostartToggle.addEventListener('change', async () => {
     await window.api.setAutoStart(autostartToggle.checked);
@@ -172,6 +196,38 @@ function setupEventListeners() {
       logsList.scrollTop = logsList.scrollHeight;
     }
   });
+
+  logsCopy.addEventListener('click', copyLogs);
+  logsReveal.addEventListener('click', () => window.api.showLogFile());
+}
+
+// Restores the button label after the confirmation flash, so a second copy
+// still reads as a fresh action.
+let copyResetTimer = null;
+
+function flashCopyResult(label, stateClass) {
+  logsCopyLabel.textContent = label;
+  logsCopy.classList.remove('is-done', 'is-failed');
+  if (stateClass) logsCopy.classList.add(stateClass);
+
+  clearTimeout(copyResetTimer);
+  copyResetTimer = setTimeout(() => {
+    logsCopyLabel.textContent = 'Скопировать журнал';
+    logsCopy.classList.remove('is-done', 'is-failed');
+  }, 2000);
+}
+
+async function copyLogs() {
+  try {
+    const result = await window.api.copyLogs();
+    if (result && result.success) {
+      flashCopyResult('Скопировано', 'is-done');
+    } else {
+      flashCopyResult('Не удалось скопировать', 'is-failed');
+    }
+  } catch (e) {
+    flashCopyResult('Не удалось скопировать', 'is-failed');
+  }
 }
 
 async function loadSystemInfo() {
@@ -240,6 +296,7 @@ async function loadStrategies() {
 async function loadSettings() {
   try {
     const settings = await window.api.getSettings();
+    targetUrl.value = settings.customTargetUrl || '';
     autostartToggle.checked = settings.autoStart || false;
     autoconnectToggle.checked = settings.autoConnect || false;
     autoupdateToggle.checked = settings.autoUpdate !== false;
@@ -269,6 +326,9 @@ async function loadLogs() {
 function handleStatusUpdate(status) {
   isConnected = status.connected;
   isDownloading = status.downloading;
+  isSearching = status.searching === true;
+  targetUrl.disabled = isConnected || isSearching || isDownloading;
+  saveTargetBtn.disabled = targetUrl.disabled;
   
   // When backend confirms connected, clear local connecting state
   if (isConnected) {
@@ -276,7 +336,7 @@ function handleStatusUpdate(status) {
   }
   
   // Update status indicator
-  statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error');
+  statusIndicator.classList.remove('connected', 'connecting', 'searching', 'downloading', 'error', 'partial');
   connectBtn.classList.remove('connected', 'connecting', 'downloading');
   statusText.classList.remove('error-text');
   
@@ -294,7 +354,7 @@ function handleStatusUpdate(status) {
     statusIndicator.classList.add('searching');
     statusText.textContent = 'Поиск стратегии...';
     connectBtn.classList.add('connecting');
-    connectBtn.querySelector('.btn-text').textContent = 'Поиск...';
+    connectBtn.querySelector('.btn-text').textContent = 'Отменить подбор';
     downloadSection.style.display = 'none';
     hideConnectionTimer();
     hideServiceBadges();
@@ -311,7 +371,11 @@ function handleStatusUpdate(status) {
     downloadSection.style.display = 'none';
     hideStrategyProgress();
     hideError();
-    showServiceBadges();
+    showServiceBadges(status.outcome);
+    if (status.outcome && status.outcome.level === 'partial') {
+      statusIndicator.classList.add('partial');
+      statusText.textContent = 'Защита частичная';
+    }
     
     // Start connection timer
     if (status.connectedSince) {
@@ -414,12 +478,40 @@ function updateTimerDisplay() {
 
 // ============= Service Badges =============
 
-function showServiceBadges() {
+const SERVICE_HINTS = {
+  discord: 'Discord у вашего провайдера поднять не удалось — ни одна стратегия его не открыла. YouTube при этом работает.',
+  youtube: 'YouTube у вашего провайдера поднять не удалось — ни одна стратегия его не открыла. Discord при этом работает.'
+};
+
+// `outcome` is absent on older states and on a full connection; both mean "всё
+// работает", so the badges stay as they are.
+function showServiceBadges(outcome) {
+  if (outcome && outcome.targetUrl) {
+    serviceBadges.style.display = 'none';
+    partialNote.textContent = `Выбранный сайт доступен (${new URL(outcome.targetUrl).hostname}). YouTube и Discord не проверялись.`;
+    partialNote.style.display = 'block';
+    return;
+  }
   serviceBadges.style.display = 'flex';
+
+  const services = (outcome && outcome.services) || { discord: true, youtube: true };
+  badgeDiscord.classList.toggle('is-blocked', services.discord === false);
+  badgeYoutube.classList.toggle('is-blocked', services.youtube === false);
+
+  const blocked = Object.keys(SERVICE_HINTS).filter((name) => services[name] === false);
+  if (blocked.length === 1) {
+    partialNote.textContent = SERVICE_HINTS[blocked[0]];
+    partialNote.style.display = 'block';
+  } else {
+    partialNote.style.display = 'none';
+  }
 }
 
 function hideServiceBadges() {
   serviceBadges.style.display = 'none';
+  partialNote.style.display = 'none';
+  badgeDiscord.classList.remove('is-blocked');
+  badgeYoutube.classList.remove('is-blocked');
 }
 
 // ============= Error Display =============
@@ -511,6 +603,11 @@ function handleDownloadProgress(progress) {
 // ============= Connect/Disconnect =============
 
 async function handleConnectClick() {
+  if (isSearching) {
+    connectBtn.querySelector('.btn-text').textContent = 'Отмена...';
+    await window.api.stopProxy();
+    return;
+  }
   if (isConnecting || isDownloading) return;
   
   if (isConnected) {
@@ -522,6 +619,7 @@ async function handleConnectClick() {
     }
   } else {
     // Connect
+    if (!await saveCustomTarget()) return;
     isConnecting = true;
     hideError();
     statusIndicator.classList.remove('error');
@@ -646,6 +744,19 @@ document.getElementById('updateHostsBtn')?.addEventListener('click', async () =>
 document.getElementById('clearDiscordCacheBtn')?.addEventListener('click', async () => {
   await window.api.clearDiscordCache();
   alert('Готово. Закройте Discord и запустите снова.');
+});
+
+// For anyone left with a block from an older version: the app now removes it on
+// disconnect, but an existing one has to be cleared once.
+document.getElementById('cleanHostsBtn')?.addEventListener('click', async () => {
+  const result = await window.api.cleanHosts();
+  if (result?.removed) {
+    alert('Записи Discord убраны из hosts. Перезапустите Discord.');
+  } else if (result?.success) {
+    alert('Записей приложения в hosts нет — убирать нечего.');
+  } else {
+    alert('Не удалось убрать записи: ' + (result?.error || 'неизвестная ошибка'));
+  }
 });
 
 document.getElementById('tgLink')?.addEventListener('click', (e) => {

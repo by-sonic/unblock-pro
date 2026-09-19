@@ -4,6 +4,7 @@ out/
 temp/
 bin/darwin/
 bin/win32/
+lists/
 *.tgz
 
 .env

@@ -12,7 +12,10 @@
 //
 // This is the same commit CI builds, so a locally compiled runtime and a shipped
 // one are the same code.
-const ZAPRET_MACOS_COMMIT = '1a1fc38c8ea05b481eebcbd338df48cdcca23c15';
+// 2026-09-18: upstream stopped forcing a 32 KiB resolver-thread stack on macOS
+// after reports of stack-size crashes. Keep the default OS stack size instead.
+// https://github.com/bol-van/zapret/commit/d437963452674faadfd45adcd62466272b5a2fcd
+const ZAPRET_MACOS_COMMIT = 'd437963452674faadfd45adcd62466272b5a2fcd';
 
 // codeload serves the source zip for an exact commit. The archive expands to
 // zapret-<commit>/, which is why callers look for a directory starting with

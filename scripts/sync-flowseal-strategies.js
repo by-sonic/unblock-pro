@@ -4,10 +4,12 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { FLOWSEAL_BUNDLE_VERSION, FLOWSEAL_SOURCE_COMMIT } = require('../src/main/flowseal-bundle');
 
 const repoRoot = path.join(__dirname, '..');
-const ref = process.argv[2] || 'flowseal/main';
+const ref = process.argv[2] || FLOWSEAL_SOURCE_COMMIT;
 const outputPath = path.join(repoRoot, 'src', 'main', 'flowseal-strategies.snapshot.json');
+const listsOutputPath = path.join(repoRoot, 'src', 'main', 'flowseal-lists.snapshot.json');
 
 function git(...args) {
   return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' }).trim();
@@ -42,6 +44,8 @@ function extractArguments(content, file) {
     .split(/\s+/)
     .filter(Boolean)
     .map((arg) => arg
+      // cmd.exe consumes this escape; direct spawn must receive the literal !.
+      .replace(/\^!/g, '!')
       .replace(/%GameFilterTCP%/gi, '12')
       .replace(/%GameFilterUDP%/gi, '12')
       .replace(/%GameFilter%/gi, '12')
@@ -50,6 +54,12 @@ function extractArguments(content, file) {
       .replace(/\\/g, '/'))
     // UnblockPro merges custom domains into the primary lists at runtime.
     .filter((arg) => !/-user\.txt$/i.test(arg));
+}
+
+const commit = git('rev-parse', `${ref}^{commit}`);
+const version = git('show', `${ref}:.service/version.txt`);
+if (commit !== FLOWSEAL_SOURCE_COMMIT || version !== FLOWSEAL_BUNDLE_VERSION) {
+  throw new Error('Update the audited bundle version, commit and checksum together before syncing upstream data.');
 }
 
 const files = git('ls-tree', '-r', '--name-only', ref)
@@ -64,10 +74,14 @@ const strategies = files.map((file) => ({
 
 const snapshot = {
   source: 'Flowseal/zapret-discord-youtube',
-  version: git('show', `${ref}:.service/version.txt`),
-  commit: git('rev-parse', ref),
+  version,
+  commit,
   strategies
 };
 
 fs.writeFileSync(outputPath, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+const lists = Object.fromEntries(['list-general.txt', 'list-google.txt', 'list-exclude.txt'].map((file) => [
+  file, git('show', `${ref}:lists/${file}`).split(/\r?\n/).filter(Boolean)
+]));
+fs.writeFileSync(listsOutputPath, `${JSON.stringify({ source: snapshot.source, version, commit, lists }, null, 2)}\n`, 'utf8');
 console.log(`Wrote ${strategies.length} strategies from ${ref} to ${outputPath}`);

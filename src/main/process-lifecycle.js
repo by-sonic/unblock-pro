@@ -19,6 +19,8 @@ const DEFAULT_PROBE_TIMEOUT_MS = 700;
 const DEFAULT_POLL_INTERVAL_MS = 150;
 const DEFAULT_GRACE_MS = 1500;
 const DEFAULT_KILL_TIMEOUT_MS = 3000;
+const controlledTerminations = new WeakSet();
+const FATAL_SIGNALS = new Set(['SIGKILL', 'SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGILL', 'SIGTRAP', 'SIGFPE', 'SIGSYS']);
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -106,6 +108,7 @@ function terminateChild(child, options = {}) {
       resolve(true);
       return;
     }
+    controlledTerminations.add(child);
 
     let settled = false;
     let graceTimer = null;
@@ -143,19 +146,35 @@ function terminateChild(child, options = {}) {
 
 // Turns a dead child into something a user or a bug report can act on.
 // A signal is not an exit code: reporting `код: null` for a SIGKILLed process
-// hid the real cause, which on Apple Silicon is almost always the kernel
-// refusing to run an unsigned binary.
-function describeChildExit(child, stderrTail = '', platform = process.platform) {
+// hides useful evidence. SIGKILL alone cannot establish a signing failure;
+// macOS crash reports (.ips) are needed to identify the actual termination cause.
+function describeChildExit(child, stderrTail = '') {
   const stderrLine = String(stderrTail).trim().split('\n').filter(Boolean).pop();
-  if (stderrLine) return stderrLine;
-
   const signal = child.signalCode;
-  if (!signal) return `код выхода: ${child.exitCode}`;
-
-  if (signal === 'SIGKILL' && platform === 'darwin') {
-    return 'убит системой (SIGKILL) — вероятно, macOS отклонила подпись бинарника';
+  if (signal) {
+    const detail = `сигнал: ${signal}`;
+    return stderrLine ? `${detail}; ${stderrLine}` : detail;
   }
-  return `сигнал: ${signal}`;
+  if (stderrLine) return stderrLine;
+  return `код выхода: ${child.exitCode}`;
+}
+
+function isUnexpectedFatalExit(child) {
+  return Boolean(child && FATAL_SIGNALS.has(child.signalCode) && !controlledTerminations.has(child));
+}
+
+// Count distinct consecutive crashed attempts, not close-event notifications.
+function createRuntimeCrashGuard({ limit = 2 } = {}) {
+  let count = 0;
+  const seen = new WeakSet();
+  return {
+    record(child) {
+      if (!child || seen.has(child)) return count >= limit;
+      seen.add(child);
+      count = isUnexpectedFatalExit(child) ? count + 1 : 0;
+      return count >= limit;
+    }
+  };
 }
 
 // Runs the binary once before the strategy loop. If it cannot execute at all,
@@ -188,8 +207,10 @@ function probeBinaryRuns(binaryPath, options = {}) {
 
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      // Our own timeout kill means it ran (and hung), which is not the failure
-      // this check is looking for.
+      if (killedByUs) {
+        resolve({ ok: false, timedOut: true, reason: 'проверка запуска превысила время ожидания' });
+        return;
+      }
       if (signal && !killedByUs) {
         resolve({
           ok: false,
@@ -206,8 +227,10 @@ function probeBinaryRuns(binaryPath, options = {}) {
 module.exports = {
   DEFAULT_GRACE_MS,
   DEFAULT_KILL_TIMEOUT_MS,
+  createRuntimeCrashGuard,
   describeChildExit,
   hasExited,
+  isUnexpectedFatalExit,
   probeBinaryRuns,
   probePort,
   terminateChild,

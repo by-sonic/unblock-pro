@@ -35,6 +35,7 @@ const BLOCK_NOTICE_PATTERN = 'blocked|\\u0437\\u0430\\u0431\\u043b\\u043e\\u043a
 const PROBE_RULES = Object.freeze([
   Object.freeze({
     kind: 'youtube-home',
+    service: 'youtube',
     tier: 'full',  // ~1 MB of HTML — never pay for it on a doomed strategy
     url: 'https://www.youtube.com/',
     label: 'YouTube Web',
@@ -44,6 +45,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'youtube-video',
+    service: 'youtube',
     tier: 'screen',  // 404 + empty body, a few bytes
     url: 'https://redirector.googlevideo.com/',
     label: 'YouTube video (googlevideo)',
@@ -55,6 +57,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'discord-api',
+    service: 'discord',
     tier: 'screen',  // tiny JSON
     url: 'https://discord.com/api/v10/gateway',
     label: 'Discord API',
@@ -65,6 +68,7 @@ const PROBE_RULES = Object.freeze([
   }),
   Object.freeze({
     kind: 'discord-cdn',
+    service: 'discord',
     tier: 'full',  // small PNG, but still a real download
     url: 'https://cdn.discordapp.com/embed/avatars/0.png',
     label: 'Discord CDN',
@@ -75,6 +79,28 @@ const PROBE_RULES = Object.freeze([
 ]);
 
 const RULES_BY_URL = new Map(PROBE_RULES.map((rule) => [rule.url, rule]));
+
+// Which service a probe speaks for. Acceptance is per service: a strategy that
+// fixes YouTube but not Discord is a usable result on an ISP where Discord
+// cannot be unblocked at all, and rejecting it outright leaves the user with
+// nothing. See strategy-outcome.js.
+function serviceOfUrl(url) {
+  const rule = RULES_BY_URL.get(url);
+  return rule ? rule.service : null;
+}
+
+// Endpoints of one tier ('screen' | 'full'), grouped by service, so the sweep
+// can screen both services cheaply, drop the ones that are already lost, and
+// spend the expensive probes only on services still in play.
+function endpointsByService(tier) {
+  const grouped = {};
+  for (const rule of PROBE_RULES) {
+    const inTier = tier === 'screen' ? rule.tier === 'screen' : rule.tier !== 'screen';
+    if (!inTier) continue;
+    (grouped[rule.service] = grouped[rule.service] || []).push(rule.url);
+  }
+  return grouped;
+}
 
 // Verification requires every probe to pass, so failing any one is already enough
 // to reject a strategy. That makes the order free to choose — and cheapest-first
@@ -118,8 +144,9 @@ function matches(pattern, text) {
 
 function validateProbe(url, status, body = '', bodyHex = '') {
   const rule = RULES_BY_URL.get(url);
-  // Preserve permissive behaviour for URLs without a dedicated rule.
-  if (!rule) return status > 0 && status < 400;
+  // Custom targets prove a TLS-authenticated HTTP response from this URL.
+  // Redirects count as reachability, but are not followed to unrelated hosts.
+  if (!rule) return status >= 200 && status < 400 && !matches(BLOCK_NOTICE_PATTERN, body);
 
   if (!rule.statuses.includes(status)) return false;
   if (rule.bodyPattern && !matches(rule.bodyPattern, body)) return false;
@@ -151,11 +178,13 @@ function psQuote(value) {
 function buildPowerShellProbeScript() {
   const lines = [
     'param(',
-    '  [Parameter(Mandatory=$true)][string]$Url,',
+    '  [string]$Url,',
+    '  [string]$UrlBase64,',
     '  [Parameter(Mandatory=$true)][string]$Kind,',
     '  [int]$TimeoutSec = 10',
     ')',
     '',
+    'if ($UrlBase64) { $Url = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($UrlBase64)) }',
     `$sampleBytes = ${BODY_SAMPLE_BYTES}`,
     '$status = 0',
     '$text = ""',
@@ -182,6 +211,8 @@ function buildPowerShellProbeScript() {
     'try {',
     '  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12',
     '  $request = [System.Net.HttpWebRequest]::Create($Url)',
+    '  $request.AllowAutoRedirect = $false',
+    '  $request.Proxy = $null',
     '  $request.Timeout = $TimeoutSec * 1000',
     '  $request.ReadWriteTimeout = $TimeoutSec * 1000',
     '  $request.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"',
@@ -216,8 +247,8 @@ function buildPowerShellProbeScript() {
   }
 
   lines.push('}');
-  lines.push('# Unknown kind: fall back to the permissive status check.');
-  lines.push('if ($status -gt 0 -and $status -lt 400) { exit 0 }');
+  lines.push('# Custom target: HTTPS response without following redirects.');
+  lines.push(`if ($status -ge 200 -and $status -lt 400 -and -not ($text -imatch ${psQuote(BLOCK_NOTICE_PATTERN)})) { exit 0 }`);
   lines.push('exit 1');
 
   return lines.join('\r\n') + '\r\n';
@@ -234,7 +265,9 @@ module.exports = {
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS,
   buildPowerShellProbeScript,
+  endpointsByService,
   probeKind,
   probeLabel,
+  serviceOfUrl,
   validateProbe
 };

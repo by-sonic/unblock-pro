@@ -1,0 +1,26 @@
+name: Предложение
+description: Идея или пожелание к приложению
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу это решает
+      description: Опишите ситуацию, в которой вам не хватает текущих возможностей.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Как это могло бы работать
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Чем пользуетесь сейчас
+      description: Обходные пути или другие приложения, которые закрывают эту задачу.
+    validations:
+      required: false

@@ -7,8 +7,10 @@ const path = require('node:path');
 const { after, test } = require('node:test');
 
 const {
+  createRuntimeCrashGuard,
   describeChildExit,
   hasExited,
+  isUnexpectedFatalExit,
   probeBinaryRuns,
   probePort,
   terminateChild,
@@ -166,13 +168,14 @@ test('describeChildExit prefers stderr, then signal, then exit code', () => {
   assert.equal(describeChildExit({ exitCode: null, signalCode: 'SIGTERM' }, ''), 'сигнал: SIGTERM');
 });
 
-test('describeChildExit names the macOS signing cause instead of "код: null"', () => {
+test('describeChildExit preserves the signal without guessing a signing cause', () => {
   // A SIGKILLed process has exitCode null. Reporting that as "код: null" is what
   // made #39-style reports impossible to act on.
   const killed = { exitCode: null, signalCode: 'SIGKILL' };
 
   assert.match(describeChildExit(killed, '', 'darwin'), /SIGKILL/);
-  assert.match(describeChildExit(killed, '', 'darwin'), /подпись/);
+  assert.doesNotMatch(describeChildExit(killed, '', 'darwin'), /подпись/);
+  assert.match(describeChildExit(killed, 'last diagnostic line', 'darwin'), /SIGKILL; last diagnostic line/);
   assert.equal(describeChildExit(killed, '', 'win32'), 'сигнал: SIGKILL');
   assert.ok(!describeChildExit(killed, '', 'darwin').includes('null'));
 });
@@ -191,14 +194,30 @@ test('probeBinaryRuns rejects a binary that cannot be executed', async () => {
   assert.ok(result.reason && result.reason.length > 0, 'must explain why');
 });
 
-test('probeBinaryRuns treats a hang as runnable rather than broken', async () => {
+test('probeBinaryRuns rejects a timeout without blaming the OS for its own kill', async () => {
   // Our own timeout kill must not be reported as the kernel killing the binary.
   const result = await probeBinaryRuns(process.execPath, {
     args: ['-e', 'setInterval(() => {}, 1000);'],
     timeoutMs: 300
   });
 
-  assert.deepEqual(result, { ok: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.equal(result.signal, undefined);
+});
+
+test('runtime crash guard stops after two distinct fatal attempts and ignores controlled termination', async () => {
+  const guard = createRuntimeCrashGuard();
+  const first = { signalCode: 'SIGKILL', exitCode: null };
+  assert.equal(guard.record(first), false);
+  assert.equal(guard.record(first), false, 'the same child must not count twice');
+  assert.equal(guard.record({ signalCode: 'SIGSEGV', exitCode: null }), true);
+  const normal = spawnIdleChild();
+  await terminateChild(normal);
+  assert.equal(isUnexpectedFatalExit(normal), false);
+  assert.equal(guard.record(normal), false, 'controlled cleanup resets the streak');
+  assert.equal(guard.record({ signalCode: null, exitCode: 1 }), false);
+  assert.equal(guard.record({ signalCode: 'SIGABRT', exitCode: null }), false);
 });
 
 test('waitForStartupWindow returns early when the child dies', async () => {

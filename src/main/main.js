@@ -1,43 +1,63 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, dialog, clipboard, shell } = require('electron');
 const path = require('path');
 const { spawn, exec, execFile, execFileSync, execSync } = require('child_process');
 const fs = require('fs');
 const https = require('https');
 const crypto = require('crypto');
 const dns = require('dns');
+const os = require('os');
 const tls = require('tls');
 const sudo = require('sudo-prompt');
 const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
 const {
   collectBlockHostnames,
   hasCurrentBlock,
+  buildHostsUpdateScript,
   isSafeHostsRewrite,
   parsePfEnableToken,
+  planHostsRemoval,
   replaceMarkedBlock
 } = require('./system-files');
 const { copyFileResilient } = require('./safe-copy');
+const { inspectProtectedWindowsRuntime, systemPowerShellPath } = require('./windows-protected-runtime');
+const { runMacCleanup } = require('./macos-cleanup');
+const { appendLogLine, buildLogReport, readLogTail } = require('./log-report');
 const {
+  describeIntegrityFailure,
+  repairRuntimeFromReference,
+  verifyRuntimeAgainstReference
+} = require('./runtime-integrity');
+const {
+  createRuntimeCrashGuard,
   describeChildExit,
   hasExited,
-  probeBinaryRuns,
   terminateChild,
   waitForPortState,
   waitForStartupWindow
 } = require('./process-lifecycle');
+const { probeSocksRuntime } = require('./mac-runtime');
 const { buildMirrorUrls } = require('./mirror-urls');
+const { buildStrategySweepBatch, parseSweepResult } = require('./windows-batch');
+const { runServiceProbes } = require('./service-probe-run');
+const { normalizeTargetUrl, buildTargetOutcome, includeTargetInLists } = require('./custom-target');
+const { HOSTS_DATA } = require('./hosts-data');
+const { legacyBlockData } = require('./hosts-legacy');
 const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
 const {
   BODY_SAMPLE_BYTES,
-  ORDERED_ENDPOINTS,
   PROBE_TIMEOUTS,
   PATIENT_TIMEOUTS,
-  REMAINING_ENDPOINTS,
-  SCREENING_ENDPOINTS,
   buildPowerShellProbeScript,
-  probeKind,
-  probeLabel,
   validateProbe
 } = require('./connectivity-probes');
+const {
+  buildOutcome,
+  describeOutcome,
+  describeTally,
+  isAcceptable,
+  pickBetterOutcome,
+  tallyFailures
+} = require('./strategy-outcome');
 const {
   FLOWSEAL_BUNDLE_MARKER,
   FLOWSEAL_BUNDLE_SHA256,
@@ -70,11 +90,17 @@ let probeCounter = 0;
 // kills the other's process and can credit a strategy for traffic the other one
 // carried. The generation token cannot help there — both loops share it.
 let isSearching = false;
+let stopPromise = null;
+let searchCompletion = null;
+let cleanupFailed = false;
+let quitRequested = false;
 // Set when the user asks to disconnect or quit while a search is running. The
 // loop yields on every probe, so without this it would keep spawning processes
 // (or commit a "working" strategy, re-enabling the system proxy) after the user
 // has already left.
 let cancelRequested = false;
+let activeTargetUrl = '';
+let elevatedCancelFile = null;
 // How long winws gets to install its WinDivert filters before it counts as up.
 const WINWS_STARTUP_MS = 3000;
 let warnedAboutBundledArch = false;
@@ -82,6 +108,9 @@ const TPWS_PORT = 1080;
 let isConnected = false;
 let isDownloading = false;
 let currentStrategy = null;
+// What the connected strategy actually unblocks. Non-null and partial means the
+// user is connected but one of the services could not be fixed on this ISP.
+let currentOutcome = null;
 let lastError = null;
 let lastErrorCode = null;
 let disconnectReason = null;
@@ -170,6 +199,7 @@ function getBinaryPath() {
     if (isMachOBinaryRunnable(binary)) return binary;
     return path.join(binDir, 'tpws');
   } else if (process.platform === 'win32') {
+    if (app.isPackaged) return path.join(process.resourcesPath, 'bin', 'winws.exe');
     return path.join(binDir, 'winws.exe');
   }
   
@@ -181,34 +211,81 @@ function isWindowsBundleCurrent(platformDir = getResourcePath()) {
   return isFlowsealBundleCurrent(platformDir);
 }
 
+// The trusted copy of the Windows runtime: the one inside the installed
+// application. The installer is perMachine, so it sits under Program Files where
+// an unprivileged process cannot write — unlike the runtime directory in
+// %APPDATA% that the engine is actually launched from.
+function getRuntimeReferenceDir() {
+  if (process.platform !== 'win32' || !app.isPackaged) return null;
+
+  // The portable build unpacks its resources into a temp directory the user can
+  // write to, so the "reference" there is exactly as forgeable as the runtime it
+  // would be vouching for. Better to report that no check is possible than to
+  // compare a copy against itself and call it verified.
+  if (process.env.PORTABLE_EXECUTABLE_DIR) return null;
+
+  return path.join(process.resourcesPath, 'bin');
+}
+
+// Runs before every elevated launch. Returns { ok } or { ok: false, error }.
+async function ensureWindowsRuntimeIntegrity() {
+  if (app.isPackaged) {
+    if (!isRunningAsAdmin()) return { ok: false, error: 'Перезапустите установленное приложение с правами администратора. Запуск скрипта из временного каталога запрещён.' };
+    const protectedRuntime = inspectProtectedWindowsRuntime({
+      resourcesPath: process.resourcesPath, executablePath: process.execPath,
+      requiredFiles: FLOWSEAL_REQUIRED_WINDOWS_FILES
+    });
+    return protectedRuntime.ok ? protectedRuntime : {
+      ok: false,
+      error: `Не удалось подтвердить защиту каталога движка. Установите приложение в Program Files через установщик; portable-подключение отключено. ${protectedRuntime.error}`
+    };
+  }
+  const runtimeDir = getResourcePath();
+  const referenceDir = getRuntimeReferenceDir();
+
+  const result = verifyRuntimeAgainstReference(runtimeDir, referenceDir, FLOWSEAL_REQUIRED_WINDOWS_FILES);
+
+  if (!result.hasReference) {
+    // Portable build or a dev checkout: there is no admin-only copy to compare
+    // against. Say that plainly instead of implying the check passed.
+    sendLog({
+      type: 'warning',
+      message: 'Проверка целостности движка недоступна в этой сборке — эталонной копии нет'
+    });
+    return { ok: true };
+  }
+
+  if (result.ok) return { ok: true };
+
+  sendLog({
+    type: 'warning',
+    message: `Файлы движка не совпадают с эталоном (${describeIntegrityFailure(result)}) — восстанавливаю из приложения`
+  });
+
+  const { failed } = await repairRuntimeFromReference(
+    runtimeDir,
+    referenceDir,
+    FLOWSEAL_REQUIRED_WINDOWS_FILES,
+    { copyFile: (src, dest) => copyFileResilient(src, dest) }
+  );
+
+  const after = verifyRuntimeAgainstReference(runtimeDir, referenceDir, FLOWSEAL_REQUIRED_WINDOWS_FILES);
+  if (after.ok) {
+    sendLog({ type: 'success', message: 'Движок восстановлен из встроенной копии' });
+    return { ok: true };
+  }
+
+  // Refuse rather than run an unverified binary as administrator.
+  const detail = describeIntegrityFailure(after) || (failed[0] && failed[0].error) || 'причина неизвестна';
+  return {
+    ok: false,
+    error: `Файлы движка не совпадают с эталоном и восстановить их не удалось (${detail}). Подключение отменено — переустановите приложение.`
+  };
+}
+
 // ============= HOST LISTS & PATTERN FILES =============
 
-// Domain lists matching Flowseal/zapret-discord-youtube v1.9.9c.
-// IMPORTANT: list-general = Discord + Cloudflare ONLY (no YouTube!)
-// YouTube goes in list-google with separate filter rules
-const HOST_LIST_GENERAL = [
-  'cloudflare-ech.com', 'encryptedsni.com', 'cloudflareaccess.com', 'cloudflareapps.com',
-  'cloudflarebolt.com', 'cloudflareclient.com', 'cloudflareinsights.com', 'cloudflareok.com',
-  'cloudflarepartners.com', 'cloudflareportal.com', 'cloudflarepreview.com', 'cloudflareresolve.com',
-  'cloudflaressl.com', 'cloudflarestatus.com', 'cloudflarestorage.com', 'cloudflarestream.com',
-  'cloudflaretest.com', 'cloudfront.net', 'dis.gd', 'discord-attachments-uploads-prd.storage.googleapis.com',
-  'discord.app', 'discord.co', 'discord.com', 'discord.design', 'discord.dev', 'discord.gift',
-  'discord.gifts', 'discord.gg', 'discord.media', 'discord.new', 'discord.store', 'discord.status',
-  'discord-activities.com', 'discordactivities.com', 'discordapp.com', 'discordapp.net',
-  'discordcdn.com', 'discordmerch.com', 'discordpartygames.com', 'discordsays.com',
-  'discordsez.com', 'discordstatus.com',
-  'frankerfacez.com', 'ffzap.com', 'betterttv.net',
-  '7tv.app', '7tv.io', 'localizeapi.com', 'klipy.com'
-].join('\n');
-
-const HOST_LIST_GOOGLE = [
-  'yt3.ggpht.com', 'yt4.ggpht.com', 'yt3.googleusercontent.com',
-  'googlevideo.com', 'jnn-pa.googleapis.com', 'stable.dl2.discordapp.net',
-  'wide-youtube.l.google.com', 'youtube-nocookie.com', 'youtube-ui.l.google.com',
-  'youtube.com', 'youtubeembeddedplayer.googleapis.com', 'youtubekids.com', 'youtube.googleapis.com',
-  'youtubei.googleapis.com', 'youtu.be', 'yt-video-upload.l.google.com',
-  'ytimg.com', 'ytimg.l.google.com', 'play.google.com', 'google.ru'
-].join('\n');
+const { HOST_LIST_GENERAL, HOST_LIST_GOOGLE, HOST_LIST_EXCLUDE } = require('./flowseal-lists');
 
 // Discord-only list: apply gentler desync to Discord TLS first, syndata for the rest
 const HOST_LIST_DISCORD = [
@@ -222,33 +299,7 @@ const HOST_LIST_DISCORD = [
   'router.discordapp.net'
 ].join('\n');
 
-// Exclude list — Russian/local services that should NOT be processed by DPI bypass
-const HOST_LIST_EXCLUDE = [
-  'pusher.com', 'live-video.net', 'ttvnw.net', 'twitch.tv',
-  'mail.ru', 'citilink.ru', 'yandex.com', 'yandex.net', 'yandex.org', 'yandex.md',
-  'yandex.ru', 'yandexadexchange.net', 'yandexcloud.net', 'yandexcom.net',
-  'yandexmetrica.com', 'yandexwebcache.net', 'yandexwebcache.org', 'yastat.net',
-  'yastatic-net.ru', 'yastatic.net', 'ya.ru', 'adfox.ru', 'admetrica.ru',
-  'naydex.net', 'rostaxi.org', 'turbopages.org', 'webvisor.com', 'webvisor.org',
-  'nvidia.com', 'donationalerts.com', 'vk.com', 'yandex.kz', 'mts.ru', 'multimc.org',
-  'dns-shop.ru', 'habr.com', '3dnews.ru', 'microsoft.com', 'microsoftonline.com',
-  'live.com', 'sharepoint.com', 'minecraft.net', 'xboxlive.com',
-  'akamaitechnologies.com', 'msi.com', '2ip.ru', 'boosty.to', 'tanki.su',
-  'lesta.ru', 'korabli.su', 'tanksblitz.ru', 'reg.ru', 'epicgames.dev',
-  'epicgames.com', 'unrealengine.com', 'riotgames.com', 'riotcdn.net',
-  'leagueoflegends.com', 'playvalorant.com', 'marketplace.visualstudio.com',
-  'gallery.vsassets.io', 'gallerycdn.vsassets.io', 'gosuslugi.ru', 'gov.ru',
-  'nalog.ru', 'spb.ru', 'mos.ru', 'vk.ru', 'vk.me', 'vkvideo.ru', 'ok.ru',
-  'mycdn.me', 'okcdn.ru', 'odkl.ru', 'wb.ru', 'geobasket.ru', 'paywb.com',
-  'rwb.ru', 'wb-basket.ru', 'wbbasket.ru', 'wbpay.ru', 'wibes.ru',
-  'wildberries.ru', 'ozon.by', 'ozon.com', 'ozon.com.by', 'ozon.com.kz',
-  'ozon.kz', 'ozon.ru', 'ozon.tm', 'ozone.ru', 'ozonru.me',
-  'ozonusercontent.com', 'alfabank.ru', 'gazprombank.ru', 'gpb.ru',
-  'dbo-dengi.online', 'mtsdengi.ru', 'psbank.ru', 'bankline.ru', 'rosbank.ru',
-  'abr.ru', 'rshb.ru', 'sber.ru', 'sberbank.com', 'sberbank.ru',
-  'cdn-tinkoff.ru', 'tbank-online.com', 'tbank.ru', 't-bank-app.ru',
-  'tochka-tech.com', 'tochka.com', 'vtb.ru', 'steamcommunity.com'
-].join('\n');
+
 
 // Private/reserved IP ranges to exclude from processing
 const IPSET_EXCLUDE = [
@@ -275,15 +326,16 @@ function ensureHostLists() {
     ? HOST_LIST_EXCLUDE + '\n' + customExclude
     : HOST_LIST_EXCLUDE;
 
-  fs.writeFileSync(path.join(hostListsDir, 'list-general.txt'), generalWithCustom, 'utf8');
-  fs.writeFileSync(path.join(hostListsDir, 'list-google.txt'), HOST_LIST_GOOGLE, 'utf8');
-  fs.writeFileSync(path.join(hostListsDir, 'list-discord.txt'), HOST_LIST_DISCORD, 'utf8');
-  fs.writeFileSync(path.join(hostListsDir, 'list-exclude.txt'), excludeWithCustom, 'utf8');
+  const lists = includeTargetInLists({
+    'list-general.txt': generalWithCustom,
+    'list-google.txt': HOST_LIST_GOOGLE,
+    'list-discord.txt': HOST_LIST_DISCORD,
+    'list-exclude.txt': excludeWithCustom,
+    'list-all.txt': generalWithCustom + '\n' + HOST_LIST_GOOGLE + '\n' + HOST_LIST_DISCORD
+  }, activeTargetUrl || settings.customTargetUrl || '');
+  for (const [name, content] of Object.entries(lists)) fs.writeFileSync(path.join(hostListsDir, name), content, 'utf8');
   fs.writeFileSync(path.join(hostListsDir, 'ipset-exclude.txt'), IPSET_EXCLUDE, 'utf8');
   fs.writeFileSync(path.join(hostListsDir, 'ipset-all.txt'), IPSET_ALL, 'utf8');
-
-  const HOST_LIST_ALL = generalWithCustom + '\n' + HOST_LIST_GOOGLE + '\n' + HOST_LIST_DISCORD;
-  fs.writeFileSync(path.join(hostListsDir, 'list-all.txt'), HOST_LIST_ALL, 'utf8');
 
   return hostListsDir;
 }
@@ -1185,9 +1237,9 @@ function getStrategiesForPlatform() {
     const listsDir = ensureHostLists();
     return buildDarwinStrategies(listsDir);
   } else if (process.platform === 'win32') {
-    const binDir = getResourcePath();
+    const binDir = app.isPackaged ? path.dirname(getBinaryPath()) : getResourcePath();
     const listsDir = ensureHostLists();
-    ensureBinPatternFiles(binDir);
+    if (!app.isPackaged) ensureBinPatternFiles(binDir);
     return reorderStrategies(buildWin32Strategies(binDir, listsDir));
   }
   return [];
@@ -1197,6 +1249,7 @@ function sendStatus(extra = {}) {
   if (mainWindow && mainWindow.webContents) {
     mainWindow.webContents.send('status', { 
       connected: isConnected,
+      outcome: currentOutcome,
       downloading: isDownloading,
       strategy: currentStrategy,
       binaryExists: fs.existsSync(getBinaryPath() || ''),
@@ -1210,11 +1263,48 @@ function sendStatus(extra = {}) {
   }
 }
 
+// Where the log lives on disk. userData is writable without elevation on both
+// platforms and survives an app update.
+function getLogFilePath() {
+  return path.join(app.getPath('userData'), 'unblockpro.log');
+}
+
+// os.release() reports the Darwin kernel version on macOS ("24.6.0"), which is
+// not what a user or a bug report means by "версия macOS".
+function describeOsVersion() {
+  if (process.platform === 'darwin') {
+    try {
+      return execSync('sw_vers -productVersion', { encoding: 'utf8', stdio: 'pipe', timeout: 2000 }).trim();
+    } catch (e) {
+      return os.release();
+    }
+  }
+  return os.release();
+}
+
+function buildCurrentLogReport() {
+  const platformNames = { darwin: 'macOS', win32: 'Windows' };
+  return buildLogReport({
+    fileText: readLogTail(getLogFilePath()),
+    entries: logEntries,
+    systemInfo: {
+      appVersion: app.getVersion(),
+      osName: platformNames[process.platform] || process.platform,
+      osVersion: describeOsVersion(),
+      arch: process.arch,
+      strategy: currentStrategy
+    }
+  });
+}
+
 function sendLog(entry) {
   // entry: { type: 'info'|'success'|'error'|'warning', message: string, timestamp: number }
   console.log(`[${entry.type}] ${entry.message}`);
   const logEntry = { ...entry, timestamp: Date.now() };
   logEntries.push(logEntry);
+  // The window keeps a short tail; the file keeps the whole sweep, which is the
+  // only copy that outlives a restart and can be attached to an issue.
+  appendLogLine(getLogFilePath(), logEntry);
   // Keep only last 100 entries
   if (logEntries.length > 100) logEntries.shift();
   if (mainWindow && mainWindow.webContents) {
@@ -1235,7 +1325,13 @@ function updateTrayMenu() {
     { label: 'Открыть', click: () => mainWindow.show() },
     { type: 'separator' },
     {
-      label: isConnected ? '● Подключено' : (isSearching ? '◌ Подбор стратегии…' : '○ Отключено'),
+      // A partial connection says so here too — the tray is the only status many
+      // users ever look at.
+      label: isConnected
+        ? (currentOutcome && currentOutcome.level === 'partial'
+          ? `● Подключено частично (${describeOutcome(currentOutcome)})`
+          : '● Подключено')
+        : (isSearching ? '◌ Подбор стратегии…' : '○ Отключено'),
       enabled: false
     },
     // Disabled while a search runs: the search owns the bypass process, the port
@@ -1252,7 +1348,7 @@ function updateTrayMenu() {
       enabled: isConnected || isSearching
     },
     { type: 'separator' },
-    { label: 'Выход', click: () => { app.isQuitting = true; stopProxy(); app.quit(); }}
+    { label: 'Выход', click: () => app.quit() }
   ]);
   
   tray.setContextMenu(contextMenu);
@@ -1396,7 +1492,7 @@ async function downloadAndExtractBinaries() {
     }
     
     // Windows strategies are audited against the pinned Flowseal bundle.
-    // macOS continues to use the latest upstream zapret release for tpws.
+    // macOS compiles the reviewed, pinned zapret source for tpws.
     const downloadUrl = process.platform === 'win32'
       ? FLOWSEAL_BUNDLE_URL
       : ZAPRET_MACOS_ARCHIVE_URL;
@@ -1667,25 +1763,22 @@ async function enableQuicBlock() {
   });
 }
 
-function disableQuicBlock() {
-  if (!quicBlockEnabled || process.platform !== 'darwin') return;
-  quicBlockEnabled = false;
-
-  const token = pfEnableToken;
-  pfEnableToken = null;
-  // Reload the untouched system ruleset, then hand back our enable reference so
-  // pf can return to whatever state it was in before we started.
-  const release = token ? `/sbin/pfctl -X ${token} 2>/dev/null; ` : '';
-  const command = `/sbin/pfctl -f /etc/pf.conf 2>/dev/null; ${release}exit 0`;
-
-  try {
-    execSync(command, { stdio: 'pipe', shell: '/bin/sh' });
-  } catch (e) {
-    // Fallback: try via sudo-prompt (credentials may still be cached)
-    try {
-      sudo.exec(command, { name: 'UnblockPro' }, () => {});
-    } catch (e2) {}
-  }
+// Undoes the macOS system changes that need root: the pf ruleset and the hosts
+// block. Both go into one command on purpose — each elevated call is a password
+// dialog, and disconnecting should cost at most one.
+//
+// When there is nothing to undo, no command runs at all, so a disconnect that
+// changed nothing never prompts.
+async function disableQuicBlock(hostsCleanup = null) {
+  if (process.platform !== 'darwin') return { ok: true };
+  const result = await runMacCleanup({ quicBlockEnabled, pfEnableToken, hostsCleanup }, {
+    execSync, sudoExec: sudo.exec.bind(sudo)
+  });
+  if (result.pfRestored) quicBlockEnabled = false;
+  if (result.tokenReleased) pfEnableToken = null;
+  if (hostsCleanup && result.hostsRestored) sendLog({ type: 'info', message: 'Записи приложения убраны из hosts' });
+  if (!result.ok) sendLog({ type: 'warning', message: `Очистка системных настроек не завершена: ${result.error}` });
+  return result;
 }
 
 // ============= SYSTEM PROXY (macOS) =============
@@ -1757,7 +1850,9 @@ function setCleanDns(services) {
 
 function restoreDns() {
   if (process.platform !== 'darwin') return;
-  const services = [...new Set([...Object.keys(originalDnsSettings), ...getActiveNetworkServices()])];
+  // Restore only services changed by this session. Repeated quit/cleanup must
+  // never reset unrelated custom DNS to DHCP after the snapshot was consumed.
+  const services = Object.keys(originalDnsSettings);
   for (const service of services) {
     try {
       const orig = originalDnsSettings[service];
@@ -1767,9 +1862,9 @@ function restoreDns() {
       } else {
         execSync(`networksetup -setdnsservers "${service}" Empty`, { stdio: 'pipe' });
       }
+      delete originalDnsSettings[service];
     } catch (e) {}
   }
-  originalDnsSettings = {};
 }
 
 function flushDnsCache() {
@@ -1828,33 +1923,15 @@ function testSingleConnection(port, timeoutSec, url) {
   });
 }
 
-async function runProbeGroup(urls, groupLabel, runProbe) {
-  const results = await Promise.all(urls.map((url) => runProbe(url)));
-  const failed = urls.filter((_, i) => !results[i]).map(probeLabel);
-  if (failed.length > 0) {
-    sendLog({
-      type: 'warning',
-      message: `${groupLabel}: не прошли проверку — ${failed.join(', ')}`
-    });
-    return false;
-  }
-  return true;
-}
-
 async function testProxyConnection(port = TPWS_PORT, timeouts = PROBE_TIMEOUTS) {
   const { screenTimeoutSec, fullTimeoutSec } = timeouts;
-
-  // Cheapest probes first, on a short budget. Acceptance still requires every
-  // probe to pass, so this changes nothing about which strategy wins — it only
-  // stops a doomed strategy from costing a full YouTube page download and a
-  // 15-second hang before it is rejected.
-  const screen = (url) => testSingleConnection(port, screenTimeoutSec, url);
-  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
-
-  const full = (url) => testSingleConnection(port, fullTimeoutSec, url);
-  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', full)) return false;
-
-  return true;
+  return runServiceProbes({
+    targetUrl: activeTargetUrl,
+    shouldAbort: () => cancelRequested,
+    screen: (url) => testSingleConnection(port, screenTimeoutSec, url),
+    full: (url) => testSingleConnection(port, fullTimeoutSec, url),
+    log: sendLog
+  });
 }
 
 // ============= DIRECT CONNECTION TEST (Windows) =============
@@ -1862,11 +1939,13 @@ async function testProxyConnection(port = TPWS_PORT, timeouts = PROBE_TIMEOUTS) 
 function testSingleDirectConnection(url, timeoutSec = 10) {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    let req;
+    const deadline = setTimeout(() => { finish(false); if (req) req.destroy(); }, timeoutSec * 1000);
+    const finish = (ok) => { if (!settled) { settled = true; clearTimeout(deadline); resolve(ok); } };
 
     try {
       const urlObj = new URL(url);
-      const req = https.get({
+      req = https.get({
         hostname: urlObj.hostname,
         path: urlObj.pathname + urlObj.search,
         family: 4, lookup: ipv4Lookup,
@@ -1954,9 +2033,7 @@ function testDiscordWebSocketGateway(timeoutSec = 12) {
 
 async function testDirectConnection(timeouts = PROBE_TIMEOUTS) {
   const { screenTimeoutSec, fullTimeoutSec } = timeouts;
-  // winws works at driver level — test with direct HTTPS requests (no SOCKS proxy)
-  // IMPORTANT: Must verify BOTH YouTube AND Discord work, including Discord media
-  // ports (2053,8443 etc.) which are needed for voice/video calls.
+  // winws works at driver level — test with direct HTTPS requests (no SOCKS proxy).
   
   // Discord media — test TLS on the voice/media ports that DPI often blocks
   const discordMediaEndpoints = [
@@ -1964,37 +2041,29 @@ async function testDirectConnection(timeouts = PROBE_TIMEOUTS) {
     'https://discord.gg/'
   ];
 
-  // Cheapest probes first on a short budget — a doomed strategy is rejected on a
-  // few bytes instead of a full YouTube page plus a long hang. Acceptance still
-  // requires all of them, so the verdict is unchanged; only the order and the
-  // budget are. Covers YouTube web + video delivery and Discord API + CDN, so a
-  // partially working route is still not accepted.
-  const screen = (url) => testSingleDirectConnection(url, screenTimeoutSec);
-  if (!await runProbeGroup(SCREENING_ENDPOINTS, 'Быстрая проверка', screen)) return false;
+  // Same per-service evaluation as the macOS path: screen both services cheaply,
+  // then spend the expensive probes only on the ones still alive, and report
+  // what each service ended up with instead of one all-or-nothing boolean.
+  const result = await runServiceProbes({
+    targetUrl: activeTargetUrl,
+    shouldAbort: () => cancelRequested,
+    screen: (url) => testSingleDirectConnection(url, screenTimeoutSec),
+    full: (url) => testSingleDirectConnection(url, fullTimeoutSec),
+    discordExtra: () => testDiscordWebSocketGateway(fullTimeoutSec),
+    log: sendLog
+  });
 
-  const probe = (url) => testSingleDirectConnection(url, fullTimeoutSec);
-  if (!await runProbeGroup(REMAINING_ENDPOINTS, 'Полная проверка', probe)) return false;
-
-  // CRITICAL: Test WebSocket to gateway — Discord app uses this to load. If broken, app stays on "Проблемы с подключением".
-  const gatewayWsOk = await testDiscordWebSocketGateway(fullTimeoutSec);
-  if (!gatewayWsOk) {
-    sendLog({ type: 'warning', message: 'Discord gateway (WebSocket) не прошёл — приложение не загрузится' });
-    return false;
-  }
-  
-  // Test Discord media (voice/video)
-  let discordMediaOk = false;
-  for (const url of discordMediaEndpoints) {
-    if (await testSingleDirectConnection(url, fullTimeoutSec)) {
-      discordMediaOk = true;
-      break;
+  // Informational only — voice/media never decided acceptance and still does not.
+  if (result.outcome.services.discord) {
+    for (const url of discordMediaEndpoints) {
+      if (await testSingleDirectConnection(url, fullTimeoutSec)) {
+        sendLog({ type: 'info', message: 'Discord media: доступен' });
+        break;
+      }
     }
   }
-  if (discordMediaOk) {
-    sendLog({ type: 'info', message: 'Discord media: доступен' });
-  }
-  
-  return true; // YouTube + Discord API + Discord WebSocket all passed
+
+  return result;
 }
 
 // ============= WINDOWS ELEVATION & MONITORING =============
@@ -2004,8 +2073,11 @@ let winwsMonitorInterval = null;
 function isRunningAsAdmin() {
   if (process.platform !== 'win32') return true;
   try {
-    execSync('net session', { stdio: 'pipe' });
-    return true;
+    // net session also fails for administrators with the Server service off.
+    const script = '([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)';
+    return execFileSync(systemPowerShellPath(), ['-NoProfile', '-NonInteractive', '-Command', script], {
+      encoding: 'utf8', windowsHide: true, timeout: 10000
+    }).trim() === 'True';
   } catch (e) {
     return false;
   }
@@ -2022,13 +2094,13 @@ function startWinwsMonitor() {
           isConnected = false;
           const prevStrategy = currentStrategy;
           currentStrategy = null;
+          currentOutcome = null;
           connectedSince = null;
           disconnectReason = 'PROCESS_CRASHED';
           lastError = 'Процесс обхода завершился неожиданно';
           lastErrorCode = 'PROCESS_CRASHED';
-          updateTrayMenu();
           sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу` });
-          sendStatus();
+          void handleConnectedProcessExit(lastError);
         }
       }
     } catch (e) {}
@@ -2075,6 +2147,9 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
   const batchFile = path.join(tempDir, 'unblock-test.bat');
   const wsTestScript = path.join(tempDir, 'unblock-test-ws.ps1');
   const probeScript = path.join(tempDir, 'unblock-test-probe.ps1');
+  const cancelFile = path.join(tempDir, `unblock-cancel-${process.pid}.txt`);
+  try { fs.unlinkSync(cancelFile); } catch (e) {}
+  elevatedCancelFile = cancelFile;
 
   // Clean old temp files
   try { fs.unlinkSync(resultFile); } catch(e) {}
@@ -2087,83 +2162,22 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
 
   const hostsUpdateScript = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
 
-  // Generate batch script that tests all strategies with one UAC prompt
-  let bat = '@echo off\r\n';
-  bat += 'setlocal EnableDelayedExpansion\r\n';
-  bat += `set "RESULT=${resultFile}"\r\n`;
-  bat += `set "PROGRESS=${progressFile}"\r\n`;
-  bat += 'taskkill /F /IM winws.exe >nul 2>&1\r\n';
-  bat += 'timeout /t 1 /nobreak >nul\r\n';
-  bat += ':: Update hosts and clear Discord cache at each connection start\r\n';
-  bat += `if exist "${hostsUpdateScript}" powershell -ExecutionPolicy Bypass -NoProfile -File "${hostsUpdateScript}"\r\n`;
-  bat += 'rd /s /q "%APPDATA%\\discord\\Cache" 2>nul\r\n';
-  bat += 'rd /s /q "%APPDATA%\\discord\\Code Cache" 2>nul\r\n';
-  bat += 'rd /s /q "%APPDATA%\\discord\\GPUCache" 2>nul\r\n';
-  bat += '\r\n';
-
-  for (let i = 0; i < strategies.length; i++) {
-    const s = strategies[i];
-    // Quote args that contain spaces or path separators with spaces
-    const quotedArgs = s.args.map(a => {
-      // If arg contains = with a path value, quote the path part
-      const eqIdx = a.indexOf('=');
-      if (eqIdx !== -1) {
-        const key = a.substring(0, eqIdx + 1);
-        const val = a.substring(eqIdx + 1);
-        if (val.includes(' ') || val.includes('\\')) {
-          return `${key}"${val}"`;
-        }
-      }
-      return a;
-    }).join(' ');
-    bat += `:: Strategy ${i + 1}: ${s.name}\r\n`;
-    bat += `echo ${i + 1}/${totalStrategies}:${s.name}> "%PROGRESS%"\r\n`;
-    bat += `cd /d "${binDirectory}"\r\n`;
-    bat += `start "" /b "${finalBinaryPath}" ${quotedArgs}\r\n`;
-    bat += 'timeout /t 4 /nobreak >nul\r\n';
-    // Every probe validates the response body, not just the status code: an ISP
-    // notice page answering 200 used to be accepted and the strategy enabled
-    // while nothing actually worked. Rules come from connectivity-probes.js so
-    // this path and the Node path cannot diverge.
-    for (const url of ORDERED_ENDPOINTS) {
-      bat += `:: probe ${probeLabel(url)}\r\n`;
-      // Same tiering as the Node path: the cheap screening probes get the short
-      // budget, so a strategy DPI will break is rejected in seconds. And, as in
-      // the Node path, a deliberately-preferred first strategy (the user's pick,
-      // or the one that worked last time) gets the generous budget so a slow
-      // network cannot cost it its place.
-      const strategyTimeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
-      const probeTimeout = SCREENING_ENDPOINTS.includes(url)
-        ? strategyTimeouts.screenTimeoutSec
-        : strategyTimeouts.fullTimeoutSec;
-      bat += `powershell -ExecutionPolicy Bypass -NoProfile -File "${probeScript}" -Url "${url}" -Kind "${probeKind(url)}" -TimeoutSec ${probeTimeout}\r\n`;
-      bat += 'if !errorlevel! neq 0 (\r\n';
-      bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-      bat += '  timeout /t 1 /nobreak >nul\r\n';
-      bat += '  goto :strat_next_' + i + '\r\n';
-      bat += ')\r\n';
-    }
-    // Require Discord gateway WebSocket (app won\'t load without it)
-    bat += `powershell -ExecutionPolicy Bypass -File "${wsTestScript.replace(/\\/g, '\\\\')}"\r\n`;
-    bat += 'if !errorlevel! neq 0 (\r\n';
-    bat += '  taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += '  goto :strat_next_' + i + '\r\n';
-    bat += ')\r\n';
-    bat += `echo WORKS:${s.name}> "%RESULT%"\r\n`;
-    bat += 'goto :end\r\n';
-    bat += ':strat_next_' + i + '\r\n';
-    bat += 'taskkill /F /IM winws.exe >nul 2>&1\r\n';
-    bat += 'timeout /t 1 /nobreak >nul\r\n';
-    bat += '\r\n';
-  }
-
-  bat += 'echo NONE> "%RESULT%"\r\n';
-  bat += 'taskkill /F /IM winws.exe >nul 2>&1\r\n';
-  bat += 'goto :realend\r\n';
-  bat += ':end\r\n';
-  bat += ':: Strategy found — winws stays running\r\n';
-  bat += ':realend\r\n';
-  bat += 'endlocal\r\n';
+  // Generated in windows-batch.js so the control flow is testable without a UAC
+  // prompt — it now has to decide per service and retry a partial candidate.
+  const bat = buildStrategySweepBatch({
+    strategies,
+    binaryPath: finalBinaryPath,
+    binDirectory,
+    resultFile,
+    progressFile,
+    hostsUpdateScript,
+    probeScript,
+    wsTestScript,
+    totalStrategies,
+    firstIsPreferred,
+    targetUrl: activeTargetUrl,
+    cancelFile
+  });
 
   fs.writeFileSync(batchFile, bat, { encoding: 'utf8' });
 
@@ -2206,10 +2220,9 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
 
       // Read result file
       try {
-        const resultContent = fs.readFileSync(resultFile, 'utf8').trim();
-        if (resultContent.startsWith('WORKS:')) {
-          const strategyName = resultContent.substring(6).trim();
-          resolve({ success: true, strategy: strategyName });
+        const parsed = parseSweepResult(fs.readFileSync(resultFile, 'utf8'));
+        if (parsed.found) {
+          resolve({ success: true, strategy: parsed.strategy, outcome: parsed.target ? buildTargetOutcome(activeTargetUrl, true) : buildOutcome(parsed.services) });
         } else {
           resolve({ success: false, error: 'Ни одна стратегия не сработала', errorCode: 'ALL_STRATEGIES_FAILED' });
         }
@@ -2226,20 +2239,20 @@ async function startProxyWindowsElevated(finalBinaryPath, strategies, totalStrat
   try { fs.unlinkSync(probeScript); } catch(e) {}
   try { fs.unlinkSync(wsTestScript); } catch(e) {}
 
+  elevatedCancelFile = null;
+  try { fs.unlinkSync(cancelFile); } catch (e) {}
+  if (cancelRequested) {
+    await killStrayWinws();
+    sendStatus({ searching: false });
+    return { success: false, cancelled: true };
+  }
+
   if (result.success) {
-    isConnected = true;
-    currentStrategy = result.strategy;
-    connectedSince = Date.now();
-    strategyProgress = null;
-    clearError();
-    // Save as last working strategy
-    const s = loadSettings(); s.lastWorkingStrategy = result.strategy; saveSettings(s);
-    updateTrayMenu();
-    sendLog({ type: 'success', message: `Стратегия ${result.strategy} работает!` });
+    commitConnectedStrategy(result.strategy, result.outcome);
     sendStatus({ searching: false });
     // Monitor winws.exe since we can't track the elevated process directly
     startWinwsMonitor();
-    return { success: true, strategy: result.strategy };
+    return { success: true, strategy: result.strategy, outcome: result.outcome };
   } else {
     lastError = result.error;
     lastErrorCode = result.errorCode || 'ALL_STRATEGIES_FAILED';
@@ -2307,7 +2320,41 @@ async function killStrayWinws(timeoutMs = 5000) {
 
 // Public entry point: holds the "one search at a time" lock and always releases
 // it. The search itself lives in runProxyStartAttempt().
+// Commits a strategy the sweep accepted. Partial results are committed too, but
+// only on the retry pass and never silently: the user is told which service is
+// still blocked, and a partial is not remembered as `lastWorkingStrategy` — the
+// next connect should look for something better rather than pin the half-fix.
+function commitConnectedStrategy(strategyName, outcome) {
+  isConnected = true;
+  currentStrategy = strategyName;
+  currentOutcome = outcome;
+  connectedSince = Date.now();
+  strategyProgress = null;
+  clearError();
+
+  if (outcome.level === 'full') {
+    const s = loadSettings();
+    s.lastWorkingStrategy = strategyName;
+    s.lastWorkingTargetUrl = activeTargetUrl;
+    saveSettings(s);
+    sendLog({ type: 'success', message: `Стратегия ${strategyName}: ${describeOutcome(outcome)}` });
+  } else {
+    sendLog({
+      type: 'warning',
+      message: `Стратегия ${strategyName}: ${describeOutcome(outcome)}. Подключаю частично — это лучшее, что нашлось у вашего провайдера.`
+    });
+  }
+
+  updateTrayMenu();
+}
+
 async function startProxy() {
+  if (quitRequested) return { success: false, error: 'Приложение завершает работу' };
+  if (stopPromise || cleanupFailed) {
+    const cleanup = await (stopPromise || stopProxy());
+    if (!cleanup.success) return cleanup;
+  }
+  if (quitRequested) return { success: false, error: 'Приложение завершает работу' };
   if (isSearching) {
     lastError = 'Подбор стратегии уже идёт';
     lastErrorCode = 'SEARCH_IN_PROGRESS';
@@ -2316,13 +2363,35 @@ async function startProxy() {
   }
 
   isSearching = true;
+  let finishSearch;
+  searchCompletion = new Promise(resolve => { finishSearch = resolve; });
   cancelRequested = false;
   updateTrayMenu();
   try {
+    activeTargetUrl = normalizeTargetUrl(loadSettings().customTargetUrl || '');
     return await runProxyStartAttempt();
+  } catch (e) {
+    await stopProxy();
+    lastError = e.message;
+    lastErrorCode = 'START_FAILED';
+    sendLog({ type: 'error', message: e.message });
+    return { success: false, error: e.message };
   } finally {
-    isSearching = false;
-    updateTrayMenu();
+    // A cancelled search may still have an outstanding elevation callback.
+    try {
+      if (!isConnected && (cancelRequested || quicBlockEnabled || pfEnableToken !== null || Object.keys(originalDnsSettings).length > 0)) {
+        const error = lastError;
+        const errorCode = lastErrorCode;
+        const cleanup = await stopProxy();
+        if (cleanup.success) { lastError = error; lastErrorCode = errorCode; }
+      }
+    } finally {
+      isSearching = false;
+      finishSearch();
+      searchCompletion = null;
+      updateTrayMenu();
+      sendStatus();
+    }
   }
 }
 
@@ -2337,23 +2406,33 @@ async function runProxyStartAttempt() {
   // Clear previous errors
   clearError();
   strategyProgress = null;
+  const macCrashGuard = createRuntimeCrashGuard();
+  const failMacRuntime = async (reason) => {
+    await stopProxy();
+    lastError = `Ошибка runtime tpws: ${reason}. Подбор остановлен. Для определения причины нужен отчёт tpws .ips из ~/Library/Logs/DiagnosticReports или /Library/Logs/DiagnosticReports.`;
+    lastErrorCode = 'BINARY_RUNTIME_FAILED';
+    strategyProgress = null;
+    sendLog({ type: 'error', message: lastError });
+    sendStatus({ searching: false });
+    return { success: false, error: lastError };
+  };
   sendLog({ type: 'info', message: 'Начало подключения...' });
 
-  if (process.platform === 'win32' && app.isPackaged && !isWindowsBundleCurrent()) {
-    try {
-      const bundledDir = path.join(process.resourcesPath, 'bin');
-      if (installBundledFlowsealBundle(bundledDir, getResourcePath())) {
-        sendLog({ type: 'info', message: `Windows runtime Flowseal ${FLOWSEAL_BUNDLE_VERSION} установлен из приложения` });
-      }
-    } catch (e) {
-      sendLog({ type: 'warning', message: `Не удалось распаковать встроенный Windows runtime: ${e.message}` });
+  // Validate the installed runtime before any download, script or system write.
+  if (process.platform === 'win32' && app.isPackaged) {
+    const integrity = await ensureWindowsRuntimeIntegrity();
+    if (!integrity.ok) {
+      lastError = integrity.error;
+      lastErrorCode = 'RUNTIME_INTEGRITY';
+      sendLog({ type: 'error', message: lastError });
+      return { success: false, error: lastError };
     }
   }
 
   const binaryPath = getBinaryPath();
 
   const binaryMissing = !binaryPath || !fs.existsSync(binaryPath);
-  const windowsBundleStale = process.platform === 'win32' && !isWindowsBundleCurrent();
+  const windowsBundleStale = process.platform === 'win32' && !app.isPackaged && !isWindowsBundleCurrent();
   const macBinaryInvalid = process.platform === 'darwin' && !isMachOBinaryRunnable(binaryPath);
 
   // Refresh existing Windows installs too: older runtimes do not include the
@@ -2398,25 +2477,11 @@ async function runProxyStartAttempt() {
     // every strategy in this run fail to bind.
     await killStrayTpws();
 
-    // Verify tpws can execute at all before blaming the strategies for failing.
-    let runCheck = await probeBinaryRuns(finalBinaryPath);
-    if (!runCheck.ok && runCheck.signal === 'SIGKILL') {
-      sendLog({ type: 'warning', message: 'tpws убит системой — подписываю бинарник ad-hoc и пробую снова' });
-      if (await adHocSignBinary(finalBinaryPath)) {
-        runCheck = await probeBinaryRuns(finalBinaryPath);
-        if (runCheck.ok) {
-          sendLog({ type: 'success', message: 'Подпись исправлена, tpws запускается' });
-        }
-      }
-    }
-    if (!runCheck.ok) {
-      lastError = `tpws не запускается: ${runCheck.reason}. Перебор стратегий не поможет — проблема в самом бинарнике.`;
-      lastErrorCode = 'BINARY_NOT_EXECUTABLE';
-      sendLog({ type: 'error', message: lastError });
-      strategyProgress = null;
-      sendStatus({ searching: false });
-      return { success: false, error: lastError };
-    }
+    // --help does not enter the event loop. Exercise a real SOCKS listener and
+    // loopback CONNECT request before touching system DNS, proxy or pf settings.
+    const runCheck = await probeSocksRuntime(finalBinaryPath);
+    if (cancelRequested) return { success: false, error: 'Отменено' };
+    if (!runCheck.ok) return await failMacRuntime(runCheck.reason);
 
     // Set clean DNS (1.1.1.1, 8.8.8.8) to avoid ISP DNS poisoning for Discord
     setCleanDns(services);
@@ -2446,7 +2511,7 @@ async function runProxyStartAttempt() {
       firstIsPreferred = true;
       sendLog({ type: 'info', message: `Выбрана стратегия: ${selected.name}` });
     }
-  } else if (settings.lastWorkingStrategy) {
+  } else if (settings.lastWorkingStrategy && (settings.lastWorkingTargetUrl || '') === activeTargetUrl) {
     // Try last working strategy first, then all others
     const lastWorking = allStrategies.find(s => s.name === settings.lastWorkingStrategy);
     if (lastWorking) {
@@ -2458,7 +2523,21 @@ async function runProxyStartAttempt() {
   }
   
   const totalStrategies = strategies.length;
-  
+
+  // Windows: the engine is about to be run with administrator rights out of a
+  // directory the user can write to. Check it against the copy shipped inside
+  // the installation before that happens, not only once at download time.
+  if (process.platform === 'win32') {
+    const integrity = await ensureWindowsRuntimeIntegrity();
+    if (!integrity.ok) {
+      lastError = integrity.error;
+      lastErrorCode = 'RUNTIME_INTEGRITY';
+      sendLog({ type: 'error', message: integrity.error });
+      sendStatus({ searching: false });
+      return { success: false, error: integrity.error };
+    }
+  }
+
   sendLog({ type: 'info', message: `Начинаю перебор ${totalStrategies} стратегий...` });
 
   // macOS: update hosts for Discord voice servers (all regions)
@@ -2466,7 +2545,7 @@ async function runProxyStartAttempt() {
     try {
       const hostsResult = await updateHostsMacOS();
       if (hostsResult.success && !hostsResult.alreadyExists) {
-        sendLog({ type: 'info', message: 'Hosts обновлён для Discord голоса (все регионы)' });
+        sendLog({ type: 'info', message: 'Hosts обновлён (Discord, Telegram, GitHub)' });
       }
     } catch (e) {
       sendLog({ type: 'warning', message: 'Не удалось обновить hosts — голос Discord может не работать' });
@@ -2489,12 +2568,9 @@ async function runProxyStartAttempt() {
   // Windows: update hosts and clear Discord cache at each connection start, then check admin
   if (process.platform === 'win32') {
     const tempDir = app.getPath('temp');
-    await prepareHostsUpdateForBatch(tempDir);
     if (isRunningAsAdmin()) {
-      const psPath = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
-      if (fs.existsSync(psPath)) {
-        try { execSync(`powershell -ExecutionPolicy Bypass -NoProfile -File "${psPath}"`, { stdio: 'pipe' }); } catch (e) {}
-      }
+      const hostsResult = updateHostsWindowsDirect();
+      if (!hostsResult.success) sendLog({ type: 'warning', message: `Hosts не обновлён: ${hostsResult.error}` });
       const discordBase = path.join(process.env.APPDATA || '', 'discord');
       for (const d of ['Cache', 'Code Cache', 'GPUCache']) {
         try {
@@ -2506,6 +2582,7 @@ async function runProxyStartAttempt() {
     }
     // If not running as admin, use elevated batch approach (single UAC prompt)
     if (!isRunningAsAdmin()) {
+      await prepareHostsUpdateForBatch(tempDir);
       sendLog({ type: 'info', message: 'Нет прав администратора — запуск через UAC...' });
       return await startProxyWindowsElevated(finalBinaryPath, strategies, totalStrategies, firstIsPreferred);
     }
@@ -2523,6 +2600,11 @@ async function runProxyStartAttempt() {
     const driverFile = path.join(binDirectory, 'WinDivert64.sys');
     const dllFile = path.join(binDirectory, 'WinDivert.dll');
     if (!fs.existsSync(driverFile) || !fs.existsSync(dllFile)) {
+      if (app.isPackaged) {
+        lastError = 'Файлы установленного движка отсутствуют. Переустановите приложение.';
+        lastErrorCode = 'RUNTIME_INTEGRITY';
+        return { success: false, error: lastError };
+      }
       sendLog({ type: 'warning', message: 'WinDivert файлы отсутствуют, перекачиваю бинарники...' });
       try { fs.unlinkSync(finalBinaryPath); } catch(e) {}
       const dlResult = await downloadAndExtractBinaries();
@@ -2545,19 +2627,47 @@ async function runProxyStartAttempt() {
     }
   }
 
-  for (let i = 0; i < strategies.length; i++) {
-    const strategy = strategies[i];
+  // A strategy that fixes only one of the two services is remembered instead of
+  // discarded. If the whole list runs out without a full match, the best partial
+  // is queued once more and accepted — otherwise an ISP that simply cannot be
+  // beaten on Discord leaves the user with nothing, YouTube included (#59).
+  const queue = [...strategies];
+  const probeFailures = {};
+  let bestPartial = null;
+  let acceptPartial = false;
+
+  const queueRetry = () => {
+    if (acceptPartial || !bestPartial || cancelRequested) return false;
+    acceptPartial = true;
+    queue.push(bestPartial.strategy);
+    sendLog({
+      type: 'info',
+      message: `Полностью рабочей стратегии нет. Возвращаюсь к ${bestPartial.strategy.name} — ${describeOutcome(bestPartial.outcome)}`
+    });
+    return true;
+  };
+
+  for (let i = 0; i < queue.length || queueRetry(); i++) {
+    const strategy = queue[i];
     // Only the deliberately-preferred first strategy waits the long budget. For
     // the rest, a hung probe used to cost 15s each — over ~50 strategies that was
-    // most of a quarter-hour spent waiting on answers that never come.
-    const timeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
+    // most of a quarter-hour spent waiting on answers that never come. The retry
+    // pass gets it too: it is a deliberate pick, and losing it to one impatient
+    // probe would drop the user back to nothing.
+    const timeouts = ((i === 0 && firstIsPreferred) || acceptPartial) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
 
     if (cancelRequested) break;
 
-    // Update strategy progress
-    strategyProgress = { current: i + 1, total: totalStrategies, name: strategy.name };
+    // Update strategy progress. On the retry pass the index runs past the list,
+    // so clamp it rather than showing "53/52".
+    strategyProgress = { current: Math.min(i + 1, totalStrategies), total: totalStrategies, name: strategy.name };
     sendStatus({ searching: true });
-    sendLog({ type: 'info', message: `[${i + 1}/${totalStrategies}] Тестирование: ${strategy.name}` });
+    sendLog({
+      type: 'info',
+      message: acceptPartial
+        ? `Повторный запуск запасной стратегии: ${strategy.name}`
+        : `[${i + 1}/${totalStrategies}] Тестирование: ${strategy.name}`
+    });
     
     // Stop any previous test process and wait for it to be reaped. Returning
     // early here used to leave an orphan holding the port, which made every
@@ -2612,6 +2722,7 @@ async function runProxyStartAttempt() {
             isConnected = false;
             const prevStrategy = currentStrategy;
             currentStrategy = null;
+            currentOutcome = null;
             connectedSince = null;
             disconnectReason = code === 0 ? 'PROCESS_EXITED' : 'PROCESS_CRASHED';
             const exitDetail = code === null ? `сигнал: ${signal || 'неизвестен'}` : `код: ${code}`;
@@ -2619,11 +2730,8 @@ async function runProxyStartAttempt() {
               ? 'Процесс обхода завершился'
               : `Процесс обхода завершился с ошибкой (${exitDetail})`;
             lastErrorCode = 'PROCESS_CRASHED';
-            disableSystemProxy();
-            restoreDns();
-            updateTrayMenu();
             sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу (${exitDetail})` });
-            sendStatus();
+            void handleConnectedProcessExit(lastError);
           }
         });
 
@@ -2634,16 +2742,24 @@ async function runProxyStartAttempt() {
           shouldAbort: () => hasExited(child)
         });
 
+        if (cancelRequested) {
+          await terminateChild(child);
+          break;
+        }
+
         if (hasExited(child)) {
+          const repeatedCrash = macCrashGuard.record(child);
           sendLog({
             type: 'warning',
             message: `${strategy.name}: процесс не запустился — ${describeChildExit(child, stderrTail)}`
           });
           if (generation === proxyGeneration) proxyProcess = null;
+          if (repeatedCrash) return await failMacRuntime(`процесс аварийно завершился в двух последовательных попытках (${describeChildExit(child, stderrTail)})`);
           continue; // Process died, try next strategy
         }
 
         if (!listening) {
+          macCrashGuard.record(child);
           sendLog({ type: 'warning', message: `${strategy.name}: порт ${TPWS_PORT} не доступен` });
           proxyProcess = null;
           await terminateChild(child);
@@ -2653,8 +2769,9 @@ async function runProxyStartAttempt() {
         // Enable system SOCKS proxy so all traffic goes through tpws
         enableSystemProxy(TPWS_PORT);
 
-        // Actually test if connection works through the proxy
-        const works = await testProxyConnection(TPWS_PORT, timeouts);
+        // Actually test what works through the proxy, service by service.
+        const { outcome, failed } = await testProxyConnection(TPWS_PORT, timeouts);
+        tallyFailures(probeFailures, failed);
 
         // The probes above take seconds; the user may have disconnected or quit
         // in the meantime. Committing now would switch the system proxy back on
@@ -2666,23 +2783,33 @@ async function runProxyStartAttempt() {
           break;
         }
 
-        if (works) {
-          // Strategy verified working
-          isConnected = true;
-          currentStrategy = strategy.name;
-          connectedSince = Date.now();
-          strategyProgress = null;
-          clearError();
-          // Save as last working strategy
-          const s = loadSettings(); s.lastWorkingStrategy = strategy.name; saveSettings(s);
-          updateTrayMenu();
-          sendLog({ type: 'success', message: `Стратегия ${strategy.name} работает!` });
+        // A probe can succeed just before tpws crashes. Never accept that
+        // outcome or save it for partial replay once its process is gone.
+        const repeatedCrash = macCrashGuard.record(child);
+        if (hasExited(child)) {
+          disableSystemProxy();
+          if (generation === proxyGeneration) proxyProcess = null;
+          const reason = describeChildExit(child, stderrTail);
+          sendLog({ type: 'warning', message: `${strategy.name}: процесс завершился во время проверки — ${reason}` });
+          if (repeatedCrash) return await failMacRuntime(`процесс аварийно завершился в двух последовательных попытках (${reason})`);
+          continue;
+        }
+
+        if (isAcceptable(outcome, acceptPartial)) {
+          commitConnectedStrategy(strategy.name, outcome);
           sendStatus({ searching: false });
-          return { success: true, strategy: strategy.name };
+          return { success: true, strategy: strategy.name, outcome };
         } else {
-          // Strategy didn't work — clean up and try next. Wait for the exit so
-          // the next iteration starts with a free port.
-          sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          // Not (yet) good enough — clean up and try the next one. Wait for the
+          // exit so the next iteration starts with a free port.
+          if (outcome.level === 'partial') {
+            sendLog({ type: 'info', message: `${strategy.name}: ${describeOutcome(outcome)} — запоминаю как запасной вариант` });
+            if (pickBetterOutcome(bestPartial && bestPartial.outcome, outcome) === outcome) {
+              bestPartial = { strategy, outcome };
+            }
+          } else {
+            sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          }
           disableSystemProxy();
           proxyProcess = null;
           await terminateChild(child);
@@ -2735,8 +2862,9 @@ async function runProxyStartAttempt() {
           continue;
         }
 
-        // winws is running — test if DPI bypass actually works
-        const works = await testDirectConnection(timeouts);
+        // winws is running — test what the DPI bypass actually achieves.
+        const { outcome, failed } = await testDirectConnection(timeouts);
+        tallyFailures(probeFailures, failed);
 
         if (cancelRequested) {
           proxyProcess = null;
@@ -2745,16 +2873,9 @@ async function runProxyStartAttempt() {
           break;
         }
 
-        if (works) {
-          // Strategy verified working!
-          isConnected = true;
-          currentStrategy = strategy.name;
-          connectedSince = Date.now();
-          strategyProgress = null;
-          clearError();
-          // Save as last working strategy
-          const s = loadSettings(); s.lastWorkingStrategy = strategy.name; saveSettings(s);
-          
+        if (isAcceptable(outcome, acceptPartial)) {
+          commitConnectedStrategy(strategy.name, outcome);
+
           // Set up close handler for the connected process. Generation-gated for
           // the same reason as the macOS handler: on a quick reconnect the old
           // process's close event would otherwise clear the handle that now
@@ -2767,26 +2888,31 @@ async function runProxyStartAttempt() {
               isConnected = false;
               const prevStrategy = currentStrategy;
               currentStrategy = null;
+              currentOutcome = null;
               connectedSince = null;
               disconnectReason = 'PROCESS_CRASHED';
               // Not `код: ${code}`: a process killed by a signal has no exit code,
               // and printing the raw null is what made these reports unusable.
               lastError = `Процесс обхода завершился неожиданно (${describeChildExit(child, winwsStderr)})`;
               lastErrorCode = 'PROCESS_CRASHED';
-              updateTrayMenu();
               sendLog({ type: 'error', message: `Стратегия ${prevStrategy} прекратила работу` });
-              sendStatus();
+              void handleConnectedProcessExit(lastError);
             }
           });
 
-          updateTrayMenu();
-          sendLog({ type: 'success', message: `Стратегия ${strategy.name} работает!` });
           sendStatus({ searching: false });
-          return { success: true, strategy: strategy.name };
+          return { success: true, strategy: strategy.name, outcome };
         } else {
-          // Strategy didn't work — wait for it to actually exit before the next
-          // one starts, so its WinDivert filters cannot blame the successor.
-          sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          // Wait for it to actually exit before the next one starts, so its
+          // WinDivert filters cannot blame the successor.
+          if (outcome.level === 'partial') {
+            sendLog({ type: 'info', message: `${strategy.name}: ${describeOutcome(outcome)} — запоминаю как запасной вариант` });
+            if (pickBetterOutcome(bestPartial && bestPartial.outcome, outcome) === outcome) {
+              bestPartial = { strategy, outcome };
+            }
+          } else {
+            sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
+          }
           proxyProcess = null;
           await terminateChild(child);
           continue;
@@ -2800,35 +2926,69 @@ async function runProxyStartAttempt() {
   }
 
   if (cancelRequested) {
+    await stopProxy();
     strategyProgress = null;
     sendLog({ type: 'info', message: 'Подбор стратегии отменён' });
     sendStatus({ searching: false });
     return { success: false, error: 'Отменено' };
   }
 
-  // All strategies failed
-  lastError = 'Ни одна стратегия не сработала. Попробуйте позже или обратитесь в поддержку';
+  // All strategies failed. Say what actually failed rather than only that
+  // something did: "Discord API — 52 из 52" means the ISP blocks Discord and no
+  // strategy can help, which is a different problem — and a different answer to
+  // the user — than a couple of scattered failures.
+  const tally = describeTally(probeFailures, totalStrategies);
+  await stopProxy();
+  lastError = tally
+    ? `Ни одна стратегия не сработала. Чаще всего не проходило: ${tally}`
+    : 'Ни одна стратегия не сработала. Попробуйте позже или обратитесь в поддержку';
   lastErrorCode = 'ALL_STRATEGIES_FAILED';
   strategyProgress = null;
   sendLog({ type: 'error', message: `Все ${totalStrategies} стратегий не сработали` });
+  if (tally) sendLog({ type: 'error', message: `Не проходили проверки: ${tally}` });
   sendStatus({ searching: false });
   return { success: false, error: lastError };
 }
 
 function stopProxy() {
+  if (stopPromise) return stopPromise;
+  stopPromise = performStopProxy().finally(() => { stopPromise = null; });
+  return stopPromise;
+}
+
+async function stopAndWaitForSearch() {
+  const searching = searchCompletion;
+  const result = await stopProxy();
+  if (searching) {
+    await searching;
+    return stopProxy();
+  }
+  return result;
+}
+
+async function performStopProxy() {
   // Tell a running search to stand down. It yields on every probe, so without
   // this it would carry on spawning processes after the user disconnected or quit.
   cancelRequested = true;
+  if (elevatedCancelFile) {
+    try { fs.writeFileSync(elevatedCancelFile, 'cancel', 'ascii'); } catch (e) {}
+  }
 
   // Disable system proxy FIRST (before killing tpws)
   disableSystemProxy();
   
   // Restore original DNS settings
   restoreDns();
-  
-  // Restore QUIC (remove pf block)
-  disableQuicBlock();
-  
+
+  // Take our Discord block back out of hosts. Prepared unelevated so that when
+  // there is no block the elevated step below is skipped entirely.
+  const hostsCleanup = prepareHostsRemoval();
+
+  // Restore QUIC (remove pf block) — on macOS this also applies the hosts
+  // cleanup, in the same elevated call, so a disconnect costs one prompt at most.
+  const macCleanup = disableQuicBlock(hostsCleanup);
+  const windowsCleanup = applyHostsRemovalWindows(hostsCleanup);
+
   // Stop winws monitor if running
   stopWinwsMonitor();
   
@@ -2856,14 +3016,36 @@ function stopProxy() {
 
   isConnected = false;
   currentStrategy = null;
+  currentOutcome = null;
   connectedSince = null;
   strategyProgress = null;
+  const cleanup = await macCleanup;
+  const dnsPending = Object.keys(originalDnsSettings).length > 0;
+  cleanupFailed = !cleanup.ok || !windowsCleanup.ok || dnsPending;
+  if (cleanupFailed) {
+    lastError = cleanup.error || windowsCleanup.error || (dnsPending ? 'Не удалось восстановить исходные DNS. Повторите отключение.' : 'Не удалось восстановить системные настройки');
+    lastErrorCode = 'CLEANUP_FAILED';
+    updateTrayMenu();
+    sendStatus();
+    return { success: false, error: lastError };
+  }
   clearError();
   updateTrayMenu();
   sendLog({ type: 'info', message: 'Отключено пользователем' });
   sendStatus();
   
   return { success: true };
+}
+
+async function handleConnectedProcessExit(message) {
+  const result = await stopProxy();
+  if (result.success) {
+    disconnectReason = 'PROCESS_CRASHED';
+    lastError = message;
+    lastErrorCode = 'PROCESS_CRASHED';
+    sendLog({ type: 'error', message });
+    sendStatus();
+  }
 }
 
 // ============= WINDOW & TRAY =============
@@ -3020,7 +3202,7 @@ ipcMain.handle('start-proxy', async () => {
 });
 
 ipcMain.handle('stop-proxy', () => {
-  return stopProxy();
+  return stopAndWaitForSearch();
 });
 
 ipcMain.handle('download-binaries', async () => {
@@ -3032,6 +3214,7 @@ ipcMain.handle('get-status', () => {
     connected: isConnected,
     downloading: isDownloading,
     strategy: currentStrategy,
+    outcome: currentOutcome,
     binaryExists: fs.existsSync(getBinaryPath() || ''),
     error: lastError,
     errorCode: lastErrorCode,
@@ -3043,6 +3226,34 @@ ipcMain.handle('get-status', () => {
 
 ipcMain.handle('get-logs', () => {
   return logEntries;
+});
+
+// Copying goes through the main process on purpose: the renderer would need a
+// secure-context clipboard permission, and the report has to be assembled from
+// the log file plus app/OS facts that only the main process holds.
+ipcMain.handle('copy-logs', () => {
+  try {
+    const report = buildCurrentLogReport();
+    clipboard.writeText(report);
+    return { success: true, length: report.length };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('show-log-file', () => {
+  try {
+    const logFile = getLogFilePath();
+    if (!fs.existsSync(logFile)) {
+      // Nothing has been logged yet: reveal the folder rather than a dead path.
+      shell.openPath(app.getPath('userData'));
+      return { success: true, revealed: 'folder' };
+    }
+    shell.showItemInFolder(logFile);
+    return { success: true, revealed: 'file' };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
 });
 
 ipcMain.handle('clear-error', () => {
@@ -3061,66 +3272,79 @@ ipcMain.handle('open-external', (event, url) => {
   }
 });
 
-// Update hosts file for Discord voice — Flowseal: "для подключения к голосовому чату Discord"
-const HOSTS_URL = 'https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/.service/hosts';
+// The hosts block the app writes with elevated rights. The content is pinned and
+// shipped (see hosts-data.js): it used to be fetched from a moving upstream
+// branch at connect time, with no commit and no checksum, and written as root.
 const HOSTS_MARKER = '# UnblockPro Discord/Telegram hosts';
-
-// Embedded fallback hosts data — used when GitHub download fails.
-// Includes Telegram web hosts and Discord voice servers (finland10000-10199.discord.media).
-function generateFallbackHostsData() {
-  const lines = [];
-  // Telegram web
-  const tgDomains = [
-    'telegram.me', 'telegram.dog', 'telegram.space', 'telesco.pe', 'tg.dev',
-    'kws2.web.telegram.org', 'kws2-1.web.telegram.org', 'kws1-1.web.telegram.org',
-    'kws1.web.telegram.org', 'telegram.org', 't.me', 'api.telegram.org',
-    'pluto.web.telegram.org', 'pluto-1.web.telegram.org', 'flora.web.telegram.org',
-    'td.telegram.org', 'venus.web.telegram.org', 'web.telegram.org',
-    'kws4-1.web.telegram.org', 'kws4.web.telegram.org', 'kws5-1.web.telegram.org',
-    'kws5.web.telegram.org', 'zws1-1.web.telegram.org', 'zws1.web.telegram.org',
-    'zws2-1.web.telegram.org', 'zws2.web.telegram.org', 'zws4-1.web.telegram.org',
-    'zws5-1.web.telegram.org', 'zws5.web.telegram.org'
-  ];
-  for (const d of tgDomains) lines.push(`149.154.167.220 ${d}`);
-  lines.push('');
-
-  // Discord voice servers — ALL regions, ports 10000-10099
-  const voiceIp = '104.25.158.178';
-  const regions = [
-    'finland', 'russia',
-    'us-east', 'us-west', 'us-south', 'us-central',
-    'eu-central', 'eu-west',
-    'brazil', 'hongkong', 'india', 'japan', 'singapore',
-    'southafrica', 'south-korea', 'sydney',
-    'bucharest', 'tel-aviv', 'newark', 'milan',
-    'rotterdam', 'madrid', 'stockholm', 'buenos-aires',
-    'atlanta', 'seattle', 'santa-clara', 'oregon'
-  ];
-  for (const region of regions) {
-    for (let i = 10000; i <= 10099; i++) {
-      lines.push(`${voiceIp} ${region}${i}.discord.media`);
-    }
-  }
-  return lines.join('\n');
-}
 
 function getHostsPath() {
   if (process.platform === 'darwin') return '/etc/hosts';
   return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts');
 }
-// The elevated script only needs to move an already-validated file into place.
-// Block detection, removal and the integrity check all happen in Node, where
-// they are unit-tested, instead of as PowerShell string surgery.
-function buildHostsUpdateScript(hostsPath, tempFile) {
-  return [
-    '$hostsPath = "' + hostsPath.replace(/"/g, '""') + '"',
-    '$newPath = "' + tempFile.replace(/"/g, '""') + '"',
-    'if (-not (Test-Path -LiteralPath $newPath)) { exit 1 }',
-    'if (-not (Test-Path -LiteralPath $hostsPath)) { exit 2 }',
-    'try { Copy-Item -LiteralPath $hostsPath -Destination ($hostsPath + ".unblockpro.bak") -Force } catch {}',
-    'try { [System.IO.File]::Copy($newPath, $hostsPath, $true) } catch { exit 3 }',
-    'exit 0'
-  ].join('; ');
+
+// Prepares the removal of our hosts block, without touching the real file.
+//
+// The block pins Discord voice addresses, which is what the bypass needs while
+// it runs — and exactly what breaks Discord once it stops: hosts wins over DNS,
+// so a pinned address keeps being used with the bypass off, and even under a
+// VPN (#60). The block therefore must not outlive the session.
+//
+// Returns a descriptor for the elevated step to consume, or null when there is
+// nothing to do — that null is what keeps a plain disconnect prompt-free.
+function prepareHostsRemoval() {
+  const hostsPath = getHostsPath();
+
+  let current = '';
+  try {
+    current = fs.readFileSync(hostsPath, 'latin1');
+  } catch (e) {
+    return null;
+  }
+
+  // The hostnames of an *old* block, not of the one we ship now: a block written
+  // before the closing sentinel existed is delimited by walking its lines, and
+  // the current list no longer contains the ~2800 voice entries those versions
+  // wrote. Matching against it would strip the marker and leave the rest behind.
+  const plan = planHostsRemoval(current, HOSTS_MARKER, legacyBlockData());
+  if (!plan.changed) {
+    if (plan.reason === 'unsafe') {
+      sendLog({ type: 'warning', message: 'Пропускаю очистку hosts — проверка целостности не пройдена' });
+    }
+    return null;
+  }
+
+  return { hostsPath, original: current, next: plan.next };
+}
+
+// Windows counterpart of the macOS branch in disableQuicBlock(): the packaged app
+// runs elevated by manifest, so the common case writes the file directly and
+// nobody sees a prompt.
+function applyHostsRemovalWindows(cleanup) {
+  if (!cleanup || process.platform !== 'win32') return { ok: true };
+  if (!isRunningAsAdmin()) return { ok: false, error: 'Для очистки hosts перезапустите приложение от администратора.' };
+  try {
+    if (fs.readFileSync(cleanup.hostsPath, 'latin1') !== cleanup.original) throw new Error('hosts изменился; повторите очистку');
+    fs.copyFileSync(cleanup.hostsPath, cleanup.hostsPath + '.unblockpro.bak');
+    fs.writeFileSync(cleanup.hostsPath, cleanup.next, 'latin1');
+    sendLog({ type: 'info', message: 'Записи приложения убраны из hosts' });
+    return { ok: true };
+  } catch (error) { return { ok: false, error: error.message }; }
+}
+
+function updateHostsWindowsDirect() {
+  if (!isRunningAsAdmin()) return { success: false, error: 'Требуются права администратора' };
+  const hostsPath = getHostsPath();
+  try {
+    const current = fs.readFileSync(hostsPath, 'latin1');
+    const ownHostnames = collectBlockHostnames(legacyBlockData() + '\n' + HOSTS_DATA);
+    const next = replaceMarkedBlock(current, HOSTS_MARKER, app.getVersion(), HOSTS_DATA, { ownHostnames });
+    if (!isSafeHostsRewrite(current, next, HOSTS_MARKER, { ownHostnames })) throw new Error('unsafe hosts rewrite');
+    if (next !== current) {
+      fs.copyFileSync(hostsPath, hostsPath + '.unblockpro.bak');
+      fs.writeFileSync(hostsPath, next, 'latin1');
+    }
+    return { success: true };
+  } catch (error) { return { success: false, error: error.message }; }
 }
 async function prepareHostsUpdateForBatch(tempDir) {
   const tempFile = path.join(tempDir, 'unblock-pro-hosts-discord.txt');
@@ -3136,22 +3360,9 @@ async function prepareHostsUpdateForBatch(tempDir) {
     }
   } catch (e) {}
 
-  // Try downloading latest from GitHub
-  const downloaded = await new Promise((resolve) => {
-    const req = https.get(HOSTS_URL, { family: 4, lookup: ipv4Lookup, timeout: 10000 }, (res) => {
-      if (res.statusCode !== 200) { resolve(null); return; }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-  });
-
-  // Use downloaded data or fall back to embedded data
-  const hostsData = downloaded || generateFallbackHostsData();
-  const nextHosts = replaceMarkedBlock(currentHosts, HOSTS_MARKER, app.getVersion(), hostsData);
-  const ownHostnames = collectBlockHostnames(hostsData);
+  const hostsData = HOSTS_DATA;
+  const ownHostnames = collectBlockHostnames(legacyBlockData() + '\n' + hostsData);
+  const nextHosts = replaceMarkedBlock(currentHosts, HOSTS_MARKER, app.getVersion(), hostsData, { ownHostnames });
 
   if (!isSafeHostsRewrite(currentHosts, nextHosts, HOSTS_MARKER, { ownHostnames })) {
     sendLog({ type: 'warning', message: 'Пропускаю обновление hosts — проверка целостности не пройдена' });
@@ -3180,24 +3391,10 @@ async function updateHostsMacOS() {
     }
   } catch (e) {}
 
-  let hostsData;
-  try {
-    hostsData = await new Promise((resolve) => {
-      const req = https.get(HOSTS_URL, { family: 4, lookup: ipv4Lookup, timeout: 10000 }, (res) => {
-        if (res.statusCode !== 200) { resolve(null); return; }
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => { req.destroy(); resolve(null); });
-    });
-  } catch (e) {}
-  hostsData = hostsData || generateFallbackHostsData();
+  const hostsData = HOSTS_DATA;
 
-  const tempFile = path.join(app.getPath('temp'), 'unblock-pro-hosts-add.txt');
-  const nextHosts = replaceMarkedBlock(current, HOSTS_MARKER, app.getVersion(), hostsData);
-  const ownHostnames = collectBlockHostnames(hostsData);
+  const ownHostnames = collectBlockHostnames(legacyBlockData() + '\n' + hostsData);
+  const nextHosts = replaceMarkedBlock(current, HOSTS_MARKER, app.getVersion(), hostsData, { ownHostnames });
 
   // Replacing the whole file is the only way to drop a stale block, so refuse
   // unless every system and user line provably survives.
@@ -3206,69 +3403,74 @@ async function updateHostsMacOS() {
     return { success: false, error: 'unsafe hosts rewrite' };
   }
 
-  fs.writeFileSync(tempFile, nextHosts, 'latin1');
-
-  return new Promise((resolve) => {
-    // Back up first: if anything goes wrong the user has /etc/hosts.unblockpro.bak.
-    sudo.exec(
-      `/bin/cp "${hostsPath}" "${hostsPath}.unblockpro.bak" 2>/dev/null; /bin/cat "${tempFile}" > "${hostsPath}" && rm -f "${tempFile}"`,
-      { name: 'UnblockPro' },
-      (error) => {
-        try { fs.unlinkSync(tempFile); } catch (e) {}
-        if (error) {
-          resolve({ success: false, error: error.message || 'Permission denied' });
-        } else {
-          sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
-          resolve({ success: true });
-        }
-      }
-    );
+  const result = await runMacCleanup({ hostsCleanup: { hostsPath, original: current, next: nextHosts } }, {
+    execSync, sudoExec: sudo.exec.bind(sudo)
   });
+  if (result.ok) sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
+  return { success: result.ok, error: result.error };
 }
+
+ipcMain.handle('clean-hosts', async () => {
+  const cleanup = prepareHostsRemoval();
+  if (!cleanup) return { success: true, removed: false };
+
+  if (process.platform === 'win32') {
+    const result = applyHostsRemovalWindows(cleanup);
+    return { success: result.ok, removed: result.ok, error: result.error };
+  }
+  const result = await runMacCleanup({ hostsCleanup: cleanup }, { execSync, sudoExec: sudo.exec.bind(sudo) });
+  return { success: result.ok, removed: result.hostsRestored, error: result.error };
+});
 
 ipcMain.handle('update-hosts-for-discord', async () => {
   if (process.platform === 'darwin') {
     return await updateHostsMacOS();
   }
-  const tempDir = app.getPath('temp');
-  const tempFile = path.join(tempDir, 'unblock-pro-hosts-discord.txt');
+  if (process.platform === 'win32' && app.isPackaged) return updateHostsWindowsDirect();
   const hostsPath = getHostsPath();
-  const psScriptPath = path.join(tempDir, 'unblock-pro-update-hosts.ps1');
+
+  // Goes through the same merge and the same integrity guard as the connect
+  // path. It used to write the *downloaded body* over the hosts file wholesale:
+  // the temp file handed to the elevated copy was the raw response, not the
+  // merged result, so pressing this button replaced the user's entire hosts file
+  // — localhost and all — with the upstream list.
+  const prepared = await prepareHostsUpdateForBatch(app.getPath('temp'));
+  if (!prepared.success) {
+    return { success: false, error: 'Проверка целостности hosts не пройдена — файл не тронут' };
+  }
+  if (!prepared.psScriptPath) {
+    return { success: true, hostsPath, alreadyExists: true };
+  }
+
+  const command = `powershell -ExecutionPolicy Bypass -NoProfile -File "${prepared.psScriptPath.replace(/\\/g, '\\\\')}"`;
+
+  if (isRunningAsAdmin()) {
+    try {
+      execSync(command, { stdio: 'pipe' });
+      sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
+      return { success: true, hostsPath };
+    } catch (e) {
+      return { success: false, error: e.message || 'Ошибка' };
+    } finally {
+      try { fs.unlinkSync(prepared.psScriptPath); } catch (e) {}
+    }
+  }
+
+  sendLog({ type: 'info', message: 'Запрос прав для записи в hosts...' });
   return new Promise((resolve) => {
-    const req = https.get(HOSTS_URL, { family: 4, lookup: ipv4Lookup, timeout: 15000 }, (res) => {
-      if (res.statusCode !== 200) {
-        resolve({ success: false, error: `HTTP ${res.statusCode}` });
+    sudo.exec(command, { name: 'UnblockPro update hosts' }, (err) => {
+      try { fs.unlinkSync(prepared.psScriptPath); } catch (e) {}
+      if (err && (err.message || '').toLowerCase().includes('cancel')) {
+        resolve({ success: false, error: 'Отклонено' });
         return;
       }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        try {
-          const body = Buffer.concat(chunks).toString('utf8');
-          fs.writeFileSync(tempFile, body, 'utf8');
-          const psScript = buildHostsUpdateScript(hostsPath, tempFile);
-          fs.writeFileSync(psScriptPath, psScript, 'utf8');
-          sendLog({ type: 'info', message: 'Запрос прав для записи в hosts...' });
-          sudo.exec(`powershell -ExecutionPolicy Bypass -NoProfile -File "${psScriptPath.replace(/\\/g, '\\\\')}"`, { name: 'UnblockPro update hosts' }, (err) => {
-            try { fs.unlinkSync(psScriptPath); } catch (e) {}
-            if (err && (err.message || '').toLowerCase().includes('cancel')) {
-              resolve({ success: false, error: 'Отклонено' });
-              return;
-            }
-            if (err) {
-              resolve({ success: false, error: err.message || 'Ошибка' });
-              return;
-            }
-            sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
-            resolve({ success: true, hostsPath });
-          });
-        } catch (e) {
-          resolve({ success: false, error: e.message });
-        }
-      });
+      if (err) {
+        resolve({ success: false, error: err.message || 'Ошибка' });
+        return;
+      }
+      sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
+      resolve({ success: true, hostsPath });
     });
-    req.on('error', (e) => resolve({ success: false, error: e.message }));
-    req.on('timeout', () => { req.destroy(); resolve({ success: false, error: 'Timeout' }); });
   });
 });
 
@@ -3322,7 +3524,9 @@ ipcMain.handle('install-update', async () => {
 
   // Clean up proxy BEFORE triggering quit — prevents before-quit from blocking
   // with heavy execSync calls (taskkill, pkill, networksetup).
-  try { stopProxy(); } catch (e) {}
+  quitRequested = true;
+  const stopped = await stopAndWaitForSearch();
+  if (!stopped.success) { quitRequested = false; return { ok: false, error: stopped.error }; }
   app.isQuitting = true;
 
   await new Promise(resolve => setTimeout(resolve, 300));
@@ -3388,6 +3592,21 @@ ipcMain.handle('set-selected-strategy', (event, strategyName) => {
   settings.selectedStrategy = strategyName; // 'auto' or strategy name
   saveSettings(settings);
   return { success: true };
+});
+
+ipcMain.handle('set-custom-target', (event, value) => {
+  if (isSearching || isConnected) return { success: false, error: 'Сначала остановите подключение или отмените подбор' };
+  try {
+    const customTargetUrl = normalizeTargetUrl(value);
+    const settings = loadSettings();
+    settings.customTargetUrl = customTargetUrl;
+    // Report persistence errors; silently losing a target would select the
+    // default services next time while the user expects their own site.
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    activeTargetUrl = customTargetUrl;
+    ensureHostLists();
+    return { success: true, url: customTargetUrl };
+  } catch (e) { return { success: false, error: e.message }; }
 });
 
 ipcMain.handle('get-custom-domains', () => {
@@ -3476,24 +3695,31 @@ if (!gotTheLock) {
     emergencyCleanup();
   });
 
-  app.on('before-quit', () => {
+  app.on('before-quit', (event) => {
     if (app.isQuitting) {
       // Already cleaned up by install-update handler — skip heavy execSync calls
       // to avoid blocking the quit/update sequence.
       return;
     }
-    app.isQuitting = true;
-    stopProxy();
-    if (process.platform === 'win32') {
-      try { execSync('taskkill /F /IM winws.exe', { stdio: 'pipe', timeout: 3000 }); } catch (e) {}
-    }
+    event.preventDefault();
+    quitRequested = true;
+    stopAndWaitForSearch().then(result => {
+      if (!result.success) {
+        quitRequested = false;
+        dialog.showErrorBox('Очистка не завершена', result.error + '\nПовторите отключение перед выходом.');
+        return;
+      }
+      app.isQuitting = true;
+      app.quit();
+    }).catch(error => { quitRequested = false; dialog.showErrorBox('Очистка не завершена', error.message); });
   });
 
   // Ensure proxy cleanup on any exit scenario
   function emergencyCleanup() {
     try { disableSystemProxy(); } catch (e) {}
     try { restoreDns(); } catch (e) {}
-    try { disableQuicBlock(); } catch (e) {}
+    // Normal quit awaits privileged cleanup in before-quit. The process exit
+    // event cannot await a password dialog, so do not report false success here.
     try { stopWinwsMonitor(); } catch (e) {}
     try { if (proxyProcess) proxyProcess.kill(); } catch (e) {}
     if (process.platform === 'darwin') {
@@ -3509,7 +3735,7 @@ if (!gotTheLock) {
   }
 
   process.on('exit', emergencyCleanup);
-  process.on('SIGTERM', () => { emergencyCleanup(); process.exit(0); });
-  process.on('SIGINT', () => { emergencyCleanup(); process.exit(0); });
+  process.on('SIGTERM', () => { stopAndWaitForSearch().finally(() => process.exit(0)); });
+  process.on('SIGINT', () => { stopAndWaitForSearch().finally(() => process.exit(0)); });
 
 } // end of gotTheLock else block

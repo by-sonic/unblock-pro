@@ -1,82 +1,152 @@
 #!/usr/bin/env node
-/**
- * Run connectivity tests (YouTube, Discord API, Discord WebSocket).
- * Run this while winws is active to verify the current strategy.
- * Usage: node scripts/run-connectivity-tests.js
- */
-const https = require('https');
-const tls = require('tls');
+'use strict';
 
-const TIMEOUT = 12000;
+// Read-only diagnostics through the current system network route. These probes
+// do not install or start a strategy, or prove video playback / Discord voice.
+const https = require('node:https');
+const crypto = require('node:crypto');
+const {
+  BODY_SAMPLE_BYTES,
+  PROBE_RULES,
+  probeLabel,
+  validateProbe
+} = require('../src/main/connectivity-probes');
 
-function get(url) {
+const TIMEOUT_MS = 12000;
+const GATEWAY_URL = 'https://gateway.discord.gg/?v=10&encoding=json';
+const LIMITATION = 'Endpoint checks only: video playback, Discord voice and the effect of a particular strategy are not verified. VPN/proxy routing can affect results.';
+
+function probeHttps(url, { timeoutMs = TIMEOUT_MS, request = https.get } = {}) {
   return new Promise((resolve) => {
-    const u = new URL(url);
-    const req = https.get({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      timeout: TIMEOUT,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0' }
-    }, (res) => {
-      res.resume();
-      resolve(res.statusCode > 0 && res.statusCode < 500);
-    });
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => { req.destroy(); resolve(false); });
-  });
-}
-
-function testGatewayWs() {
-  return new Promise((resolve) => {
+    const started = Date.now();
+    let req;
+    let response;
     let done = false;
-    const finish = (ok) => {
+    let status = 0;
+    let bytes = 0;
+    const chunks = [];
+    const finish = (error = null) => {
       if (done) return;
       done = true;
-      try { s.destroy(); } catch (e) {}
-      resolve(ok);
+      clearTimeout(deadline);
+      const body = Buffer.concat(chunks, bytes);
+      const ok = !error && validateProbe(url, status, body.toString('utf8'), body.subarray(0, 8).toString('hex'));
+      response?.destroy();
+      req?.destroy();
+      resolve({ url, label: probeLabel(url), ok, status, bytes, elapsedMs: Date.now() - started,
+        error: error || (ok ? null : 'response-validation-failed') });
     };
-    let s;
+    // Covers DNS, connection establishment and slow responses, unlike a socket timeout.
+    const deadline = setTimeout(() => finish('total-timeout'), timeoutMs);
     try {
-      s = tls.connect({
-        host: 'gateway.discord.gg',
-        port: 443,
-        servername: 'gateway.discord.gg',
-        rejectUnauthorized: true
-      }, () => {
-        const key = Buffer.allocUnsafe(16);
-        for (let i = 0; i < 16; i++) key[i] = Math.floor(Math.random() * 256);
-        const req = `GET /?v=10&encoding=json HTTP/1.1\r\nHost: gateway.discord.gg\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key.toString('base64')}\r\nSec-WebSocket-Version: 13\r\n\r\n`;
-        s.write(req);
+      req = request(url, {
+        agent: false,
+        maxHeaderSize: 16384,
+        headers: { 'User-Agent': 'Mozilla/5.0 UnblockPro connectivity diagnostics', 'Accept-Encoding': 'identity' }
+      }, (res) => {
+        if (done) { res.destroy(); return; }
+        response = res;
+        status = res.statusCode || 0;
+        res.on('data', (chunk) => {
+          if (done) return;
+          const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          const sample = data.subarray(0, BODY_SAMPLE_BYTES - bytes);
+          chunks.push(sample);
+          bytes += sample.length;
+          if (bytes === BODY_SAMPLE_BYTES) finish();
+        });
+        res.on('end', () => finish());
+        res.on('aborted', () => finish('response-aborted'));
+        res.on('error', (error) => finish(error.code || 'response-error'));
+        res.on('close', () => { if (!done) finish('response-closed-before-end'); });
       });
-      s.setEncoding('utf8');
-      let data = '';
-      s.on('data', (chunk) => {
-        data += chunk;
-        if (data.includes('\r\n\r\n')) finish(data.split('\r\n')[0].includes('101'));
-      });
-      s.on('error', () => finish(false));
-      s.on('timeout', () => finish(false));
-      s.setTimeout(TIMEOUT);
-    } catch (e) {
-      resolve(false);
+      req.on('error', (error) => finish(error.code || 'request-error'));
+      req.on('close', () => { if (!done && !response) finish('request-closed-before-response'); });
+    } catch (error) {
+      finish(error.code || 'request-setup-error');
     }
   });
 }
 
-async function main() {
-  console.log('Connectivity tests (run with winws active)\n');
-  const yt = await get('https://www.youtube.com/');
-  console.log('YouTube:        ', yt ? 'OK' : 'FAIL');
-  const dcApi = await get('https://discord.com/api/v10/gateway');
-  console.log('Discord API:    ', dcApi ? 'OK' : 'FAIL');
-  const dcWs = await testGatewayWs();
-  console.log('Discord Gateway (WebSocket):', dcWs ? 'OK' : 'FAIL');
-  console.log('');
-  if (yt && dcApi && dcWs) {
-    console.log('All passed — strategy is OK for Discord app + YouTube.');
-  } else {
-    console.log('Some tests failed — try another strategy or reconnect.');
-  }
+function probeGateway({ timeoutMs = TIMEOUT_MS, request = https.get, randomBytes = crypto.randomBytes } = {}) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let req;
+    let upgradedSocket;
+    let response;
+    let done = false;
+    const finish = (ok, error = null, status = 0) => {
+      if (done) return;
+      done = true;
+      clearTimeout(deadline);
+      upgradedSocket?.destroy();
+      response?.destroy();
+      req?.destroy();
+      resolve({ url: GATEWAY_URL, label: 'Discord Gateway WebSocket', ok, status,
+        elapsedMs: Date.now() - started, error });
+    };
+    const deadline = setTimeout(() => finish(false, 'total-timeout'), timeoutMs);
+    try {
+      const key = randomBytes(16).toString('base64');
+      const expectedAccept = crypto.createHash('sha1')
+        .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+      req = request(GATEWAY_URL, {
+        agent: false,
+        maxHeaderSize: 16384,
+        headers: { Upgrade: 'websocket', Connection: 'Upgrade',
+          'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' }
+      });
+      req.on('upgrade', (res, socket) => {
+        if (done) { socket.destroy(); return; }
+        upgradedSocket = socket;
+        const connection = String(res.headers.connection || '').toLowerCase().split(',').map((value) => value.trim());
+        const valid = res.statusCode === 101 &&
+          String(res.headers.upgrade || '').toLowerCase() === 'websocket' &&
+          connection.includes('upgrade') && res.headers['sec-websocket-accept'] === expectedAccept;
+        finish(valid, valid ? null : 'invalid-websocket-handshake', res.statusCode || 0);
+      });
+      req.on('response', (res) => {
+        if (done) { res.destroy(); return; }
+        response = res;
+        finish(false, 'websocket-upgrade-rejected', res.statusCode || 0);
+      });
+      req.on('error', (error) => finish(false, error.code || 'request-error'));
+      req.on('close', () => { if (!done) finish(false, 'request-closed-before-upgrade'); });
+    } catch (error) {
+      finish(false, error.code || 'request-setup-error');
+    }
+  });
 }
 
-main().catch(console.error);
+async function runDiagnostics({ httpProbe = probeHttps, gatewayProbe = probeGateway } = {}) {
+  const results = await Promise.all([
+    ...PROBE_RULES.map((rule) => httpProbe(rule.url)),
+    gatewayProbe()
+  ]);
+  return { schemaVersion: 1, checkedAt: new Date().toISOString(),
+    allEndpointChecksPassed: results.every((result) => result.ok), limitation: LIMITATION, results };
+}
+
+async function main(args = process.argv.slice(2)) {
+  if (args.includes('--help')) {
+    console.log('Usage: node scripts/run-connectivity-tests.js [--json]\n' + LIMITATION);
+    return;
+  }
+  if (args.some((arg) => arg !== '--json')) throw new Error('Unknown argument. Use --help.');
+  const report = await runDiagnostics();
+  if (args.includes('--json')) console.log(JSON.stringify(report, null, 2));
+  else {
+    for (const result of report.results) {
+      console.log(`${result.label}: ${result.ok ? 'PASS' : 'FAIL'} (HTTP ${result.status}, ${result.elapsedMs} ms)${result.error ? ` — ${result.error}` : ''}`);
+    }
+    console.log(LIMITATION);
+  }
+  process.exitCode = report.allEndpointChecksPassed ? 0 : 1;
+}
+
+if (require.main === module) main().catch((error) => {
+  console.error(error.message);
+  process.exitCode = 2;
+});
+
+module.exports = { GATEWAY_URL, LIMITATION, probeHttps, probeGateway, runDiagnostics };
