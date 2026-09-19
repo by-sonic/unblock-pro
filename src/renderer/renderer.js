@@ -15,6 +15,21 @@ const autostartToggle = document.getElementById('autostartToggle');
 const autoconnectToggle = document.getElementById('autoconnectToggle');
 const autoupdateToggle = document.getElementById('autoupdateToggle');
 const strategySelect = document.getElementById('strategySelect');
+const targetUrl = document.getElementById('targetUrl');
+const saveTargetBtn = document.getElementById('saveTargetBtn');
+const targetMessage = document.getElementById('targetMessage');
+let isSearching = false;
+
+async function saveCustomTarget() {
+  try {
+    const result = await window.api.setCustomTarget(targetUrl.value.trim());
+    targetUrl.setAttribute('aria-invalid', String(!result.success));
+    if (!result.success) { targetMessage.textContent = result.error; return false; }
+    targetUrl.value = result.url;
+    targetMessage.textContent = result.url ? 'Сохранено. При подключении проверяется только этот URL.' : 'Сохранено. Проверяются YouTube и Discord.';
+    return true;
+  } catch (e) { targetMessage.textContent = e.message; return false; }
+}
 
 // New UI elements
 const connectionTimer = document.getElementById('connectionTimer');
@@ -73,6 +88,7 @@ const updateBtn = document.getElementById('updateBtn');
 
 // Error code to user-friendly title mapping
 const ERROR_TITLES = {
+  'BINARY_RUNTIME_FAILED': 'Ошибка процесса tpws',
   'NO_BINARY': 'Бинарник не найден',
   'DOWNLOAD_FAILED': 'Ошибка скачивания',
   'ALL_STRATEGIES_FAILED': 'Стратегии не сработали',
@@ -124,6 +140,7 @@ function setupEventListeners() {
   minimizeBtn.addEventListener('click', () => window.api.minimizeWindow());
   closeBtn.addEventListener('click', () => window.api.closeWindow());
   connectBtn.addEventListener('click', handleConnectClick);
+  saveTargetBtn.addEventListener('click', saveCustomTarget);
   
   autostartToggle.addEventListener('change', async () => {
     await window.api.setAutoStart(autostartToggle.checked);
@@ -279,6 +296,7 @@ async function loadStrategies() {
 async function loadSettings() {
   try {
     const settings = await window.api.getSettings();
+    targetUrl.value = settings.customTargetUrl || '';
     autostartToggle.checked = settings.autoStart || false;
     autoconnectToggle.checked = settings.autoConnect || false;
     autoupdateToggle.checked = settings.autoUpdate !== false;
@@ -308,6 +326,9 @@ async function loadLogs() {
 function handleStatusUpdate(status) {
   isConnected = status.connected;
   isDownloading = status.downloading;
+  isSearching = status.searching === true;
+  targetUrl.disabled = isConnected || isSearching || isDownloading;
+  saveTargetBtn.disabled = targetUrl.disabled;
   
   // When backend confirms connected, clear local connecting state
   if (isConnected) {
@@ -333,7 +354,7 @@ function handleStatusUpdate(status) {
     statusIndicator.classList.add('searching');
     statusText.textContent = 'Поиск стратегии...';
     connectBtn.classList.add('connecting');
-    connectBtn.querySelector('.btn-text').textContent = 'Поиск...';
+    connectBtn.querySelector('.btn-text').textContent = 'Отменить подбор';
     downloadSection.style.display = 'none';
     hideConnectionTimer();
     hideServiceBadges();
@@ -465,6 +486,12 @@ const SERVICE_HINTS = {
 // `outcome` is absent on older states and on a full connection; both mean "всё
 // работает", so the badges stay as they are.
 function showServiceBadges(outcome) {
+  if (outcome && outcome.targetUrl) {
+    serviceBadges.style.display = 'none';
+    partialNote.textContent = `Выбранный сайт доступен (${new URL(outcome.targetUrl).hostname}). YouTube и Discord не проверялись.`;
+    partialNote.style.display = 'block';
+    return;
+  }
   serviceBadges.style.display = 'flex';
 
   const services = (outcome && outcome.services) || { discord: true, youtube: true };
@@ -576,6 +603,11 @@ function handleDownloadProgress(progress) {
 // ============= Connect/Disconnect =============
 
 async function handleConnectClick() {
+  if (isSearching) {
+    connectBtn.querySelector('.btn-text').textContent = 'Отмена...';
+    await window.api.stopProxy();
+    return;
+  }
   if (isConnecting || isDownloading) return;
   
   if (isConnected) {
@@ -587,6 +619,7 @@ async function handleConnectClick() {
     }
   } else {
     // Connect
+    if (!await saveCustomTarget()) return;
     isConnecting = true;
     hideError();
     statusIndicator.classList.remove('error');

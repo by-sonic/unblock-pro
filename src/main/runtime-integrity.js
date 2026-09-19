@@ -72,7 +72,7 @@ function verifyRuntimeAgainstReference(runtimeDir, referenceDir, files) {
     }
   }
 
-  result.ok = result.hasReference && result.mismatched.length === 0 && result.missing.length === 0;
+  result.ok = result.hasReference && result.unreferenced.length === 0 && result.mismatched.length === 0 && result.missing.length === 0;
   return result;
 }
 
@@ -110,6 +110,7 @@ function describeIntegrityFailure(result) {
   const parts = [];
   if (result.mismatched.length > 0) parts.push(`изменены: ${result.mismatched.join(', ')}`);
   if (result.missing.length > 0) parts.push(`отсутствуют: ${result.missing.join(', ')}`);
+  if (result.unreferenced && result.unreferenced.length > 0) parts.push(`нет эталона: ${result.unreferenced.join(', ')}`);
   return parts.join('; ');
 }
 

@@ -27,6 +27,7 @@ const {
   probeKind,
   probeLabel
 } = require('./connectivity-probes');
+const { normalizeTargetUrl } = require('./custom-target');
 
 const DEFAULT_SETTLE_SECONDS = 4;
 
@@ -52,10 +53,14 @@ function buildStrategySweepBatch({
   wsTestScript,
   totalStrategies = strategies.length,
   firstIsPreferred = false,
+  targetUrl = '',
+  cancelFile = '',
   settleSeconds = DEFAULT_SETTLE_SECONDS
 }) {
+  targetUrl = normalizeTargetUrl(targetUrl);
   const lines = [];
   const add = (line) => lines.push(line);
+  const checkCancel = () => { if (cancelFile) add('if exist "' + cancelFile + '" goto :cancelled'); };
 
   const screening = endpointsByService('screen');
   const remaining = endpointsByService('full');
@@ -78,6 +83,7 @@ function buildStrategySweepBatch({
 
   // One probe invocation, writing its verdict into the service flag.
   const emitProbe = (url, timeoutSec, flag) => {
+    checkCancel();
     add(':: probe ' + probeLabel(url));
     add('powershell -ExecutionPolicy Bypass -NoProfile -File "' + probeScript + '" -Url "' + url + '" -Kind "' + probeKind(url) + '" -TimeoutSec ' + timeoutSec);
     add('if !errorlevel! neq 0 set "' + flag + '=0"');
@@ -86,11 +92,25 @@ function buildStrategySweepBatch({
   strategies.forEach((strategy, i) => {
     const timeouts = (i === 0 && firstIsPreferred) ? PATIENT_TIMEOUTS : PROBE_TIMEOUTS;
 
+    checkCancel();
     add(':: Strategy ' + (i + 1) + ': ' + strategy.name);
     add('echo ' + (i + 1) + '/' + totalStrategies + ':' + strategy.name + '> "%PROGRESS%"');
     add('cd /d "' + binDirectory + '"');
     add('start "" /b "' + binaryPath + '" ' + strategy.args.map(quoteArg).join(' '));
     add('timeout /t ' + settleSeconds + ' /nobreak >nul');
+    if (targetUrl) {
+      checkCancel();
+      // Base64's alphabet contains none of cmd's expansion/metacharacters.
+      add('powershell -ExecutionPolicy Bypass -NoProfile -File "' + probeScript + '" -UrlBase64 "' + Buffer.from(targetUrl, 'utf8').toString('base64') + '" -Kind "' + (probeKind(targetUrl) || 'custom') + '" -TimeoutSec ' + timeouts.fullTimeoutSec);
+      add('if !errorlevel! neq 0 goto :target_next_' + i);
+      checkCancel();
+      add('echo TARGET:' + strategy.name + '> "%RESULT%"');
+      add('goto :end');
+      add(':target_next_' + i);
+      add('taskkill /F /IM winws.exe >nul 2>&1');
+      add('timeout /t 1 /nobreak >nul');
+      return;
+    }
     add('set "YT=1"');
     add('set "DC=1"');
 
@@ -153,7 +173,13 @@ function buildStrategySweepBatch({
     add('goto :end');
   });
 
+  add('goto :realend');
+  add(':cancelled');
+  add('taskkill /F /IM winws.exe >nul 2>&1');
+  add('echo CANCELLED> "%RESULT%"');
+  add('goto :realend');
   add(':end');
+  checkCancel();
   add(':: Strategy found — winws stays running');
   add(':realend');
   add('endlocal');
@@ -164,6 +190,9 @@ function buildStrategySweepBatch({
 // Reads what the batch wrote: WORKS:<name>, PARTIAL:<yt><dc>:<name>, or NONE.
 function parseSweepResult(resultContent) {
   const content = String(resultContent || '').trim();
+  if (content.startsWith('TARGET:')) {
+    return { found: true, strategy: content.substring(7).trim(), target: true };
+  }
 
   if (content.startsWith('WORKS:')) {
     return { found: true, strategy: content.substring(6).trim(), services: { youtube: true, discord: true } };

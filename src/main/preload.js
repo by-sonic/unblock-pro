@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('api', {
   // Strategy selection
   getStrategies: () => ipcRenderer.invoke('get-strategies'),
   setSelectedStrategy: (name) => ipcRenderer.invoke('set-selected-strategy', name),
+  setCustomTarget: (url) => ipcRenderer.invoke('set-custom-target', url),
   
   // Updates
   installUpdate: () => ipcRenderer.invoke('install-update'),

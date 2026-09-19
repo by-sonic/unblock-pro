@@ -127,40 +127,17 @@ jobs:
           }
           "
 
-      # A binary that passes every static check and still gets SIGKILLed on exec
-      # is exactly what was reported on Apple Silicon (M4, macOS 27): universal,
-      # both slices present, dead the moment it runs. The runner is arm64, so
-      # actually running it here turns that report into a build gate.
-      - name: Verify the bundled tpws can actually execute
+      # --help never enters the event loop; exercise the actual listener and a
+      # local SOCKS5 request without changing any system network settings.
+      # Pinned tpws rejects loopback CONNECT by policy; a valid REP=2 is expected.
+      - name: Smoke test the bundled tpws SOCKS runtime
         shell: bash
         run: |
           echo "runner arch: $(uname -m), macOS $(sw_vers -productVersion)"
-
-          echo "--- signature ---"
-          codesign -dv --verbose=4 bin/darwin/tpws 2>&1 | sed 's/^/  /' || echo "  (codesign reported nothing)"
-
-          echo "--- exec (no GNU timeout on the runner, so watchdog it) ---"
-          bin/darwin/tpws --help >"$RUNNER_TEMP/tpws-help.txt" 2>&1 &
-          pid=$!
-          ( sleep 10; kill -9 $pid 2>/dev/null ) >/dev/null 2>&1 &
-          watchdog=$!
-          # Actions runs bash with -e, and `wait` returns the child's status, so
-          # a non-zero exit would abort the step before the verdict is printed.
-          code=0
-          wait $pid 2>/dev/null || code=$?
-          kill $watchdog 2>/dev/null || true
-
-          echo "  exit status: $code"
-          echo "  output:"
-          head -5 "$RUNNER_TEMP/tpws-help.txt" 2>/dev/null | sed 's/^/    /' || true
-
-          # A non-zero exit is fine — plenty of tools return non-zero for --help.
-          # Only being killed by a signal means the binary cannot run at all.
-          if [ "$code" -ge 128 ]; then
-            echo "FAIL: killed by signal $((code - 128)) on $(uname -m) — the shipped binary cannot run"
-            exit 1
-          fi
-          echo "ok: tpws executes on $(uname -m)"
+          # Sign the artifact we just compiled, including both universal slices.
+          codesign --force --sign - bin/darwin/tpws
+          codesign --verify --verbose bin/darwin/tpws
+          node scripts/check-mac-runtime.js bin/darwin/tpws
 
       - name: Build macOS
         uses: nick-fields/retry@v3
@@ -211,6 +188,9 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Verify renderer layout and protected-runtime bootstrap
+        run: npx electron scripts/renderer-smoke.js
 
       - name: Create bin directory
         run: mkdir bin\win32

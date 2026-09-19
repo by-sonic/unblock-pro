@@ -244,6 +244,13 @@
             <option value="auto">Автоподбор</option>
           </select>
         </div>
+        <div class="target-setting">
+          <label class="setting-label" for="targetUrl">Сайт для подбора (необязательно)</label>
+          <p class="setting-desc" id="targetHelp">Пусто — проверять YouTube и Discord. URL — подбирать только для этого сайта. HTTPS, порт 443; ответ 2xx/3xx означает доступность URL, а не всех функций сайта. Переходы по редиректам не проверяются.</p>
+          <input id="targetUrl" type="url" maxlength="2048" placeholder="https://example.com/" aria-describedby="targetHelp targetMessage" autocomplete="off" spellcheck="false">
+          <button id="saveTargetBtn" type="button" class="target-save">Сохранить сайт</button>
+          <p id="targetMessage" class="setting-desc" role="status" aria-live="polite"></p>
+        </div>
         <div class="setting-row">
           <div class="setting-info">
             <span class="setting-label">Автозапуск</span>

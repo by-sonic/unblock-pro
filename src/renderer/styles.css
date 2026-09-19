@@ -167,12 +167,27 @@ body {
 /* Main content */
 .main-content {
   flex: 1;
+  min-height: 0;
   padding: 24px;
   display: flex;
   flex-direction: column;
   gap: 16px;
   overflow-y: auto;
 }
+
+/* Cards keep their content height; the containing pane owns scrolling. */
+.main-content > * {
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.target-setting { padding: 14px 16px; border-bottom: 1px solid var(--border-color); }
+.target-setting .setting-desc { margin: 8px 0; line-height: 1.5; }
+.target-setting input { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-primary); color: var(--text-primary); }
+.target-setting input:focus { outline: 2px solid var(--accent-blue); outline-offset: 2px; }
+.target-setting input[aria-invalid="true"] { border-color: var(--accent-red); }
+.target-save { margin-top: 10px; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-hover); color: var(--text-primary); cursor: pointer; }
+.target-setting :disabled { opacity: .6; cursor: default; }
 
 /* Status section */
 .status-section {

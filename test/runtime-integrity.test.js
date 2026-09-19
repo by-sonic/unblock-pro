@@ -97,7 +97,8 @@ test('a file the reference does not carry cannot be judged', (t) => {
   const result = verifyRuntimeAgainstReference(runtime, reference, [...FILES, 'extra.bin']);
 
   assert.deepEqual(result.unreferenced, ['extra.bin']);
-  assert.equal(result.ok, true, 'остальные файлы всё ещё проверены');
+  assert.equal(result.ok, false, 'a missing required reference must fail closed');
+  assert.match(describeIntegrityFailure(result), /extra\.bin/);
 });
 
 test('a directory in place of a file is not mistaken for one', (t) => {

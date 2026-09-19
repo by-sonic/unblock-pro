@@ -18,8 +18,14 @@
 
 const { endpointsByService, probeLabel } = require('./connectivity-probes');
 const { SERVICES, buildOutcome } = require('./strategy-outcome');
+const { normalizeTargetUrl, buildTargetOutcome } = require('./custom-target');
 
-async function runServiceProbes({ screen, full, discordExtra = null, log = () => {} }) {
+async function runServiceProbes({ screen, full, targetUrl = '', shouldAbort = () => false, discordExtra = null, log = () => {} }) {
+  if (targetUrl) {
+    const url = normalizeTargetUrl(targetUrl);
+    const passed = !shouldAbort() && await full(url);
+    return { outcome: buildTargetOutcome(url, passed && !shouldAbort()), failed: passed ? [] : ['Выбранный сайт'] };
+  }
   const failed = [];
   const alive = {};
 

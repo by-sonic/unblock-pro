@@ -167,9 +167,9 @@ function removeMarkedBlock(content, baseMarker, options = {}) {
 
 // Removes any previous block, then appends the new one between a versioned
 // opening marker and the closing sentinel.
-function replaceMarkedBlock(content, baseMarker, version, blockBody) {
+function replaceMarkedBlock(content, baseMarker, version, blockBody, options = {}) {
   const cleaned = removeMarkedBlock(content, baseMarker, {
-    ownHostnames: collectBlockHostnames(blockBody)
+    ownHostnames: options.ownHostnames || collectBlockHostnames(blockBody)
   });
   const marker = buildBlockMarker(baseMarker, version);
   const base = cleaned.length > 0 ? cleaned.replace(/\n*$/, '\n') : '';

@@ -54,6 +54,7 @@ function listServices(names) {
 }
 
 function describeOutcome(outcome) {
+  if (outcome && outcome.targetUrl) return outcome.services.target ? 'выбранный сайт доступен; YouTube и Discord не проверялись' : 'выбранный сайт недоступен';
   if (!outcome || outcome.level === 'none') return 'ничего не работает';
   if (outcome.level === 'full') return `${listServices(outcome.passed)} работают`;
 
