@@ -46,7 +46,7 @@ Program Files. Portable-сборка больше не выпускается и
 ### Системные требования
 
 - **Windows 10 / 11 (x64).** Windows 7 и 8 не поддерживаются: движок обхода (WinDivert + runtime сборки Flowseal) использует системные API, которых там нет. Для Win7 смотрите [ByeDPI Manager](https://github.com/BDManual/ByeDPIManager-Manual/blob/main/win7.md).
-- **macOS 11 Big Sur или новее**, Intel и Apple Silicon (universal-бинарник `tpws` вложен в приложение).
+- **macOS 12 Monterey или новее**, Intel и Apple Silicon (universal-бинарник `tpws` вложен в приложение). Требование связано с [Electron 38+](https://www.electronjs.org/blog/electron-38-0).
 
 ### Другие платформы
 

@@ -67,6 +67,7 @@
       }
     ],
     "mac": {
+      "minimumSystemVersion": "12.0.0",
       "category": "public.app-category.utilities",
       "icon": "assets/icon.icns",
       "target": [
