@@ -7,7 +7,7 @@ const crypto = require('crypto');
 const dns = require('dns');
 const os = require('os');
 const tls = require('tls');
-const sudo = require('sudo-prompt');
+const sudo = require('@vscode/sudo-prompt');
 const { isMachOBinary, isMachOBinaryRunnable } = require('./binary-format');
 const {
   collectBlockHostnames,

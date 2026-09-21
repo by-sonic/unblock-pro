@@ -57,6 +57,12 @@ Program Files. Portable-сборка больше не выпускается и
 
 ---
 
+## Исправление подключения на macOS
+
+**Хотфикс 2.0.22:** устранена ошибка `Node.util.isObject is not a function`
+при подключении и очистке на macOS. Обновите 2.0.21 до нового выпуска;
+[подробности и инструкция](docs/release-2.0.22.md).
+
 ## Что нового в Windows
 
 - Все 22 стратегии `general*.bat` синхронизированы с [Flowseal/zapret-discord-youtube 1.10.2](https://github.com/Flowseal/zapret-discord-youtube/releases/tag/1.10.2), включая `ALT13` и `EXP`; `ALT13` проверяется первой
