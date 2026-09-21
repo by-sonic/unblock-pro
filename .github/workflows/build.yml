@@ -91,6 +91,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Verify elevation API in the actual Electron runtime
+        run: npx electron scripts/elevation-smoke.js
+
       - name: Create bin directory
         run: mkdir -p bin/darwin
 
@@ -156,6 +159,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Verify packaged macOS elevation dependency
+        run: npx electron scripts/elevation-smoke.js --packaged
+
       - name: Remove debug files
         run: rm -f dist/builder-debug.yml
 
@@ -199,6 +205,9 @@ jobs:
       - name: Verify renderer layout and protected-runtime bootstrap
         run: npx electron scripts/renderer-smoke.js
 
+      - name: Verify elevation API in the actual Electron runtime
+        run: npx electron scripts/elevation-smoke.js
+
       - name: Create bin directory
         run: mkdir bin\win32
         shell: cmd
@@ -230,6 +239,9 @@ jobs:
           command: npm run build:win -- --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify packaged Windows elevation dependency
+        run: npx electron scripts/elevation-smoke.js --packaged
 
       - name: Remove debug files
         run: del dist\builder-debug.yml 2>nul || true
