@@ -25,6 +25,29 @@ $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $request = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${payload}')) | ConvertFrom-Json
 $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+Add-Type -TypeDefinition 'using System; using System.Text; using System.Runtime.InteropServices; public static class ProtectedVolumeDevice { [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern uint QueryDosDevice(string name, StringBuilder target, int max); }'
+function Test-DirectLocalVolumeTarget([string]$name) {
+  $prefix = [char]92 + 'Device' + [char]92 + 'HarddiskVolume'
+  if (-not $name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+  return ($name.Substring($prefix.Length) -match '^[0-9]+$')
+}
+function Test-PhysicalVolumeRoot([string]$candidate) {
+  # A SUBST or network drive root can refer to a removable ordinary directory.
+  # Only a direct local volume may use the narrower root ACL policy.
+  if ($candidate.Length -ne 3 -or $candidate[1] -ne ':' -or $candidate[2] -ne [char]92 -or -not [char]::IsLetter($candidate[0])) { return $false }
+  $target = New-Object Text.StringBuilder 1024
+  if ([ProtectedVolumeDevice]::QueryDosDevice($candidate.Substring(0, 2), $target, $target.Capacity) -eq 0) { return $false }
+  return (Test-DirectLocalVolumeTarget $target.ToString())
+}
+function Test-DangerousRights([long]$rights, [bool]$fullWriteCheck) {
+  # A volume root may allow creating unrelated entries (GENERIC_WRITE), and
+  # DELETE on the volume root itself cannot delete an existing child. Neither
+  # permission permits replacing Program Files. DELETE_CHILD and the ability
+  # to rewrite the root ACL remain forbidden, as do all writes below the root.
+  $dangerous = [long]0x100C0040
+  if ($fullWriteCheck) { $dangerous = [long]0x500D0156 }
+  return (($rights -band $dangerous) -ne 0)
+}
 function Inspect-Path([string]$candidate, [bool]$fullWriteCheck) {
   $item = Get-Item -LiteralPath $candidate -Force
   if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Reparse point: $candidate" }
@@ -34,15 +57,15 @@ function Inspect-Path([string]$candidate, [bool]$fullWriteCheck) {
   if ($null -eq $descriptor.DiscretionaryAcl) { throw "Null DACL: $candidate" }
   $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
   if ($trusted -notcontains $owner) { throw "Untrusted owner: $candidate" }
-  # All ancestors must prohibit replacement/deletion of existing descendants.
-  # Adding an unrelated child to a volume root does not permit replacement.
-  $dangerous = 0x500D0040
-  if ($fullWriteCheck) { $dangerous = 0x500D0156 }
   foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
     if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
     if (($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) { continue }
     if ($trusted -contains $rule.IdentityReference.Value) { continue }
-    if (([int]$rule.FileSystemRights -band $dangerous) -ne 0) { throw "Unprivileged write access: $candidate" }
+    $rights = [int]$rule.FileSystemRights
+    if (Test-DangerousRights $rights $fullWriteCheck) {
+      $hex = '{0:X8}' -f $rights
+      throw "Unprivileged write access: $candidate (SID $($rule.IdentityReference.Value), rights 0x$hex)"
+    }
   }
 }
 try {
@@ -65,7 +88,11 @@ try {
     if ($null -eq $parent) { break }
     $cursor = $parent.FullName
     # Root permits Users to create their own directories, but not replace ours.
-    if ($null -eq [IO.Directory]::GetParent($cursor)) { Inspect-Path $cursor $false; break }
+    if ($null -eq [IO.Directory]::GetParent($cursor)) {
+      if (-not (Test-PhysicalVolumeRoot $cursor)) { throw "Unsupported volume root: $cursor" }
+      Inspect-Path $cursor $false
+      break
+    }
   }
   Inspect-Path $exe $true
   foreach ($item in Get-ChildItem -LiteralPath $runtime -Force -Recurse) { Inspect-Path $item.FullName $true }

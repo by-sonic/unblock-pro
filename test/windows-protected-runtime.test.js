@@ -66,6 +66,64 @@ try {
 `));
 }
 
+test('volume root permits creation rights but keeps replacement rights forbidden', { skip: !onWindows }, () => {
+  const script = buildProtectedRuntimeInspection(options);
+  const functions = script.slice(0, script.indexOf('\ntry {'));
+  const matrix = [
+    // Creating an unrelated entry or deleting the volume root itself cannot
+    // replace Program Files. The same bits remain forbidden below the root.
+    [0x00000004, false, false], // create subdirectory
+    [0x40000000, false, false], // generic write
+    [0x000301bf, false, false], // modify, including DELETE on the root itself
+    [0x40000000, true, true],
+    [0x000301bf, true, true],
+    [0x00000002, true, true], // add a file inside protected directory
+    // Any way to replace Program Files or change the root ACL stays blocked.
+    [0x00000040, false, true], // DELETE_CHILD
+    [0x00040000, false, true], // WRITE_DAC
+    [0x00080000, false, true], // WRITE_OWNER
+    [0x10000000, false, true], // GENERIC_ALL
+    [0x001f01ff, false, true] // FullControl
+  ];
+  const cases = matrix.map(([rights, full, denied]) => `if ((Test-DangerousRights ${rights} $${full}) -ne $${denied}) { throw 'mask ${rights} full=${full}' }`).join('\n');
+  assert.match(powershell(`${functions}\n${cases}\n'PASS'`), /PASS/);
+  assert.match(script, /Test-PhysicalVolumeRoot \$cursor/);
+});
+
+test('real volume root passes its dedicated ACL policy', { skip: !onWindows }, () => {
+  const root = path.parse(process.env.SystemRoot).root;
+  const script = buildProtectedRuntimeInspection({ runtimeDir: root, executablePath: root, requiredFiles: [] });
+  const functions = script.slice(0, script.indexOf('\ntry {'));
+  const result = JSON.parse(powershell(`${functions}\ntry { if (-not (Test-PhysicalVolumeRoot '${root}')) { throw 'Not a physical volume root' }; Inspect-Path '${root}' $false; @{ok=$true} | ConvertTo-Json -Compress } catch { @{ok=$false; error=$_.Exception.Message} | ConvertTo-Json -Compress }`));
+  assert.deepEqual(result, { ok: true });
+});
+
+test('the relaxed root policy excludes aliases and network shares', { skip: !onWindows }, () => {
+  const script = buildProtectedRuntimeInspection(options);
+  const functions = script.slice(0, script.indexOf('\ntry {'));
+  const result = JSON.parse(powershell(`${functions}
+$roots = @(
+  (Test-PhysicalVolumeRoot ([IO.Path]::GetPathRoot($env:SystemRoot))),
+  (Test-PhysicalVolumeRoot 'C:\\Windows'),
+  (Test-PhysicalVolumeRoot '\\\\server\\share\\')
+)
+$prefix = [char]92 + 'Device' + [char]92 + 'HarddiskVolume'
+$targets = @(
+  (Test-DirectLocalVolumeTarget ($prefix + '3')),
+  (Test-DirectLocalVolumeTarget ([char]92 + '??' + [char]92 + 'C:' + [char]92 + 'alias')),
+  (Test-DirectLocalVolumeTarget ([char]92 + 'Device' + [char]92 + 'Mup' + [char]92 + 'server')),
+  (Test-DirectLocalVolumeTarget ($prefix + '3' + [char]92 + 'alias'))
+)
+@{ roots=$roots; targets=$targets } | ConvertTo-Json -Compress
+`));
+  assert.deepEqual(result.roots, [true, false, false]);
+  assert.deepEqual(result.targets, [true, false, false, false]);
+});
+
+test('real Program Files keeps the strict directory policy', { skip: !onWindows }, () => {
+  assert.deepEqual(inspectRealPath(process.env.ProgramFiles), { ok: true });
+});
+
 test('real PowerShell rejects portable directories independent of PORTABLE env', { skip: !onWindows }, (t) => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'unblock-portable-'));
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
