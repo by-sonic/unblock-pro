@@ -10,9 +10,12 @@ const repoRoot = path.join(__dirname, '..');
 const ref = process.argv[2] || FLOWSEAL_SOURCE_COMMIT;
 const outputPath = path.join(repoRoot, 'src', 'main', 'flowseal-strategies.snapshot.json');
 const listsOutputPath = path.join(repoRoot, 'src', 'main', 'flowseal-lists.snapshot.json');
+// Upstream objects normally get fetched into this repository; the scheduled
+// updater keeps them in a separate clone and points here with FLOWSEAL_GIT_DIR.
+const gitDirArgs = process.env.FLOWSEAL_GIT_DIR ? ['--git-dir', process.env.FLOWSEAL_GIT_DIR] : [];
 
 function git(...args) {
-  return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' }).trim();
+  return execFileSync('git', [...gitDirArgs, ...args], { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim();
 }
 
 function strategyName(file) {

@@ -1,7 +1,7 @@
 {
   "source": "Flowseal/zapret-discord-youtube",
-  "version": "1.10.2",
-  "commit": "dfd8e613b099676cf2aa7b474ee5923801514dec",
+  "version": "1.10.4",
+  "commit": "176f56dc3f11ce5915c26abcdde903f93d835b64",
   "lists": {
     "list-general.txt": [
       "^dns.google",
@@ -84,13 +84,16 @@
       "ytimg.com",
       "ytimg.l.google.com",
       "play.google.com",
+      "fonts.googleapis.com",
+      "www.gstatic.com",
       "google.ru"
     ],
     "list-exclude.txt": [
       "pusher.com",
       "twitch.tv",
-      "api.steampowered.com",
+      "steampowered.com",
       "steamcommunity.com",
+      "steamusercontent.com",
       "nvidia.com",
       "msi.com",
       "marketplace.visualstudio.com",
@@ -153,6 +156,7 @@
       "boosty.to",
       "tanki.su",
       "lesta.ru",
+      "lesta.pw",
       "korabli.su",
       "tanksblitz.ru",
       "reg.ru",

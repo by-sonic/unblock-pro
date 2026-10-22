@@ -20,6 +20,7 @@ const {
   buildFlowsealStrategies,
   snapshot
 } = require('../src/main/flowseal-strategies');
+const listsSnapshot = require('../src/main/flowseal-lists.snapshot.json');
 
 function splitProfiles(args) {
   const profiles = [];
@@ -37,10 +38,15 @@ function splitProfiles(args) {
 }
 
 test('pins the audited Flowseal Windows bundle', () => {
-  assert.equal(FLOWSEAL_BUNDLE_VERSION, '1.10.2');
+  // The version itself moves with scripts/update-upstream.js; what must hold is
+  // that the bundle, its URL and both snapshots name the same release.
+  assert.match(FLOWSEAL_BUNDLE_VERSION, /^\d+\.\d+\.\d+[a-z]?$/);
   assert.equal(snapshot.version, FLOWSEAL_BUNDLE_VERSION);
   assert.equal(snapshot.commit, FLOWSEAL_SOURCE_COMMIT);
-  assert.match(FLOWSEAL_BUNDLE_URL, /releases\/download\/1\.10\.2\/.+\.zip$/);
+  assert.equal(listsSnapshot.version, FLOWSEAL_BUNDLE_VERSION);
+  assert.equal(listsSnapshot.commit, FLOWSEAL_SOURCE_COMMIT);
+  assert.match(FLOWSEAL_SOURCE_COMMIT, /^[0-9a-f]{40}$/);
+  assert.ok(FLOWSEAL_BUNDLE_URL.endsWith(`/releases/download/${FLOWSEAL_BUNDLE_VERSION}/zapret-discord-youtube-${FLOWSEAL_BUNDLE_VERSION}.zip`));
   assert.match(FLOWSEAL_BUNDLE_SHA256, /^[a-f0-9]{64}$/);
   assert.ok(FLOWSEAL_REQUIRED_WINDOWS_FILES.includes('ACTIVE_DISCORD_UDP.bin'));
 });
