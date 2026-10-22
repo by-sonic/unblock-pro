@@ -69,10 +69,10 @@ Program Files. Portable-сборка больше не выпускается и
 
 ## Что нового в Windows
 
-- Все 22 стратегии `general*.bat` синхронизированы с [Flowseal/zapret-discord-youtube 1.10.2](https://github.com/Flowseal/zapret-discord-youtube/releases/tag/1.10.2), включая `ALT13` и `EXP`; `ALT13` проверяется первой
+- Все 22 стратегии `general*.bat` синхронизированы с [Flowseal/zapret-discord-youtube 1.10.4](https://github.com/Flowseal/zapret-discord-youtube/releases/tag/1.10.4), включая `ALT13` и `EXP`; `ALT13` проверяется первой
 - Добавлены актуальные Discord/STUN payload-файлы, TCP/UDP-профили, игровые правила и порт `8443`
 - Совместимый runtime входит в приложение, а скачанный bundle проверяется по SHA-256
-- Списки доменов и исключений обновлены до версии Flowseal `1.10.2`
+- Списки доменов и исключений обновлены до версии Flowseal `1.10.4`
 - Автоподбор проверяет не только страницы, но и YouTube video redirect, Discord CDN и WebSocket gateway
 
 ---
@@ -101,7 +101,7 @@ UnblockPro использует технологию [zapret](https://github.com
 | Платформа | Метод |
 |-----------|-------|
 | **macOS** | `tpws` — SOCKS5 прокси с модификацией пакетов. Приложение автоматически настраивает системный прокси |
-| **Windows** | `winws` — перехватывает пакеты на уровне драйвера через WinDivert. Стратегия `ALT13` и runtime синхронизированы с Flowseal `1.10.2` |
+| **Windows** | `winws` — перехватывает пакеты на уровне драйвера через WinDivert. Стратегия `ALT13` и runtime синхронизированы с Flowseal `1.10.4` |
 
 Приложение последовательно тестирует несколько стратегий (split+disorder, split-tls, methodeol, oob и другие), пока не найдёт работающую для вашего провайдера.
 

@@ -19,6 +19,6 @@ test('new upstream domains and exclusions reach both application and package dat
   assert.ok(HOST_LIST_GENERAL.split('\n').includes('live-video.net'));
   assert.ok(HOST_LIST_GENERAL.split('\n').includes('zendesk.com'));
   assert.ok(HOST_LIST_GOOGLE.split('\n').includes('googlevideo.com'));
-  assert.ok(HOST_LIST_EXCLUDE.split('\n').includes('api.steampowered.com'));
+  assert.ok(HOST_LIST_EXCLUDE.split('\n').includes('steampowered.com'));
   assert.equal(HOST_LIST_EXCLUDE.split('\n').includes('live-video.net'), false);
 });

@@ -1,0 +1,141 @@
+name: Upstream update
+
+# Раз в сутки проверяет новый релиз Flowseal/zapret-discord-youtube (Windows)
+# и новые коммиты bol-van/zapret в tpws/ (macOS). Если что-то вышло —
+# scripts/update-upstream.js переносит закрепления (версия, коммит, SHA-256,
+# список файлов, снимки стратегий и списков), тесты прогоняются, и
+# открывается PR из ветки upstream/auto-update. Сборки Windows/macOS на этой
+# ветке запускаются через Build & Release (без релиза: релиз только из main).
+#
+# Приложение по-прежнему ничего не скачивает «latest» во время работы: всё,
+# что оно запускает, приходит закреплённым и проверенным через этот PR.
+#
+# Слияние PR в main выпускает релиз (CI поднимает patch-версию), поэтому PR
+# сливается вручную.
+#
+# Токен: по умолчанию GITHUB_TOKEN. Для него в Settings → Actions → General
+# нужно разрешить «Allow GitHub Actions to create and approve pull requests»,
+# иначе вместо PR будет открыт issue со ссылкой на ветку. Если задан секрет
+# UPSTREAM_PR_TOKEN (fine-grained PAT: contents + pull requests), PR создаётся
+# от его имени и проверки pull_request запускаются как обычно.
+
+on:
+  schedule:
+    - cron: '17 5 * * *'  # 08:17 МСК
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Только проверить и прогнать тесты, без push и PR'
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/upstream-update.yml'
+      - 'scripts/update-upstream.js'
+      - 'scripts/sync-flowseal-strategies.js'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: upstream/auto-update
+      DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry_run == true }}
+      HAS_PAT: ${{ secrets.UPSTREAM_PR_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.repository.default_branch }}
+          token: ${{ secrets.UPSTREAM_PR_TOKEN || github.token }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: npm ci
+
+      - name: Check upstream and move pins
+        id: update
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/update-upstream.js --summary "$RUNNER_TEMP/summary.md"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          git status --short
+
+      - name: Run tests
+        run: npm test
+
+      - name: Push branch and open PR
+        if: steps.update.outputs.changed == 'true' && env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_PR_TOKEN || github.token }}
+          TITLE: ${{ steps.update.outputs.title }}
+        run: |
+          # Не предлагать заново то, что уже отклонили: закрытый без слияния PR
+          # с тем же заголовком означает «эту версию не берём».
+          if gh pr list --head "$BRANCH" --state closed --json title,mergedAt \
+               --jq ".[] | select(.mergedAt == null and .title == env.TITLE)" | grep -q .; then
+            echo "PR \"$TITLE\" уже закрывали без слияния — пропускаю."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add -A
+          git commit -m "$TITLE"
+          git push --force origin "$BRANCH"
+
+          {
+            echo "Автоматическое обновление закреплённых upstream-версий (\`scripts/update-upstream.js\`)."
+            echo
+            cat "$RUNNER_TEMP/summary.md"
+            echo
+            echo "### Проверено автоматически"
+            echo "- SHA-256 архива Flowseal совпадает с digest, который публикует GitHub; \`bin/\` архива побайтно совпадает с тегом."
+            echo "- Снимки стратегий и списков сгенерированы из тега; \`npm test\` прошёл."
+            echo "- Сборки: Build & Release на ветке \`$BRANCH\` (dry-run всех стратегий winws, сборка и smoke tpws)."
+            echo
+            echo "### Не проверено"
+            echo "- Работа стратегий у реального провайдера."
+            echo
+            echo "Слияние в \`main\` выпустит релиз."
+          } > "$RUNNER_TEMP/body.md"
+
+          PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$PR" ]; then
+            gh pr edit "$PR" --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+          elif ! gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+                 --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"; then
+            # GITHUB_TOKEN без разрешения создавать PR: оставить ветку и сообщить issue.
+            URL="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...$BRANCH?expand=1"
+            printf '%s\n\nОткрыть PR: %s\n' "$(cat "$RUNNER_TEMP/body.md")" "$URL" > "$RUNNER_TEMP/issue.md"
+            ISSUE=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number')
+            if [ -z "$ISSUE" ]; then
+              gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md"
+            fi
+          fi
+
+          # Push от GITHUB_TOKEN не запускает другие workflow, а workflow_dispatch — запускает.
+          if [ "$HAS_PAT" != "true" ]; then
+            gh workflow run build.yml --ref "$BRANCH"
+          fi
