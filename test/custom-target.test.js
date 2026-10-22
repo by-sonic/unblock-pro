@@ -102,6 +102,12 @@ test('target verification rejects error/stub responses and does not follow redir
   assert.equal(validateProbe(url, 302, ''), true);
   for (const code of [0, 100, 403, 404, 500]) assert.equal(validateProbe(url, code, ''), false);
   assert.equal(validateProbe(url, 200, 'Доступ ограничен'), false);
+  assert.equal(validateProbe(url, 200, '<html><title>Доступ ограничен</title>' + 'x'.repeat(70000)), false);
+  // A real page may mention the word anywhere in its code (#76).
+  const youtubeShell = '<html><title>YouTube</title><script>' + 'x'.repeat(30000) +
+    'simply_embedded\u003dtrue\u0026blocked_packages_for_sps\u003d[]' + 'x'.repeat(30000);
+  assert.equal(validateProbe('https://www.youtube.com/', 200, youtubeShell), true);
+  assert.equal(validateProbe(url, 200, youtubeShell), true);
   const script = buildPowerShellProbeScript();
   assert.match(script, /FromBase64String/);
   assert.match(script, /AllowAutoRedirect = \$false/);

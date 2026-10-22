@@ -736,6 +736,8 @@ document.getElementById('updateHostsBtn')?.addEventListener('click', async () =>
   const result = await window.api.updateHostsForDiscord();
   if (result?.success) {
     alert('Hosts обновлён. Перезапустите Discord при необходимости.');
+  } else if (result?.notConnected) {
+    alert(result.error);
   } else {
     alert('Ошибка: ' + (result?.error || 'неизвестная ошибка') + '\n\nРазрешите UAC, если запрос прав был отклонён.');
   }
