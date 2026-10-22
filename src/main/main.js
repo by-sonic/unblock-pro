@@ -235,9 +235,21 @@ async function ensureWindowsRuntimeIntegrity() {
       resourcesPath: process.resourcesPath, executablePath: process.execPath,
       requiredFiles: FLOWSEAL_REQUIRED_WINDOWS_FILES
     });
-    return protectedRuntime.ok ? protectedRuntime : {
+    if (protectedRuntime.ok) return protectedRuntime;
+    // Installers before 2.0.24 kept whatever ACL an existing folder had, so
+    // reinstalling did not help (#73); now the installer pins the ACL itself.
+    // A parent outside the install folder is this PC's setting, not ours.
+    const aclPath = (/^(?:Unprivileged write access|Untrusted owner): (.+?)(?: \(SID|$)/.exec(protectedRuntime.error) || [])[1];
+    const installDir = path.dirname(process.execPath).toLowerCase();
+    let advice = 'Установите приложение в Program Files через установщик; portable-подключение отключено.';
+    if (aclPath && aclPath.toLowerCase().startsWith(installDir)) {
+      advice = 'Обычные пользователи могут изменять папку приложения. Запустите установщик UnblockPro поверх текущей версии — он заново выставит права на папку.';
+    } else if (aclPath) {
+      advice = `Обычные пользователи могут изменять системную папку ${aclPath} — на этом компьютере изменены её стандартные права, переустановка UnblockPro этого не исправит.`;
+    }
+    return {
       ok: false,
-      error: `Не удалось подтвердить защиту каталога движка. Установите приложение в Program Files через установщик; portable-подключение отключено. ${protectedRuntime.error}`
+      error: `Не удалось подтвердить защиту каталога движка. ${advice} ${protectedRuntime.error}`
     };
   }
   const runtimeDir = getResourcePath();
@@ -1114,7 +1126,7 @@ function buildDarwinStrategies(listsDir) {
       '--filter-l7=tls', '--split-pos=1,midsld', '--disorder', '--tlsrec=sni',
       '--new', ...HL, '--filter-l7=http', '--hostcase', '--methodeol', '--split-pos=1', '--disorder'] },
     { name: 'multi:oob-tls+hostcase-http', args: [...BASE, ...HL,
-      '--filter-l7=tls', '--split-pos=1,midsld', '--oob', '--disorder',
+      '--filter-l7=tls', '--split-pos=1,midsld', '--oob',
       '--new', ...HL, '--filter-l7=http', '--hostcase', '--hostdot', '--split-pos=1', '--disorder'] },
     { name: 'multi:split-sniext+methodeol', args: [...BASE, ...HL,
       '--filter-l7=tls', '--split-pos=1,sniext', '--disorder', '--tlsrec=sni',
@@ -1133,11 +1145,13 @@ function buildDarwinStrategies(listsDir) {
     { name: 'tlsrec-sniext+disorder', args: [...BASE, '--tlsrec=sniext', '--split-pos=1', '--disorder', '--hostcase', ...HL] },
 
     // === TIER 4: OOB — out-of-band data injection ===
-    { name: 'oob+split+disorder', args: [...BASE, '--oob', '--split-pos=1', '--disorder', ...HL] },
-    { name: 'oob+split-midsld', args: [...BASE, '--oob', '--split-pos=1,midsld', '--disorder', ...HL] },
+    // tpws refuses --oob together with --disorder outside Linux ("guaranteed to
+    // fail"), so on macOS every OOB profile goes without disorder.
+    { name: 'oob+split', args: [...BASE, '--oob', '--split-pos=1', ...HL] },
+    { name: 'oob+split-midsld', args: [...BASE, '--oob', '--split-pos=1,midsld', ...HL] },
     { name: 'oob+tlsrec+split', args: [...BASE, '--oob', '--tlsrec=sni', '--split-pos=1', '--hostcase', ...HL] },
-    { name: 'oob-tls+split+disorder', args: [...BASE, '--oob=tls', '--split-pos=1,midsld', '--disorder', '--hostcase', ...HL] },
-    { name: 'oob-0x01+split+disorder', args: [...BASE, '--oob', '--oob-data=0x01', '--split-pos=1', '--disorder', ...HL] },
+    { name: 'oob-tls+split', args: [...BASE, '--oob=tls', '--split-pos=1,midsld', '--hostcase', ...HL] },
+    { name: 'oob-0x01+split', args: [...BASE, '--oob', '--oob-data=0x01', '--split-pos=1', ...HL] },
 
     // === TIER 5: Multi-profile with Discord-specific rules ===
     { name: 'multi:discord-split+general-disorder', args: [...BASE,
@@ -1146,7 +1160,7 @@ function buildDarwinStrategies(listsDir) {
       '--new', ...HLG, '--filter-l7=tls', '--split-pos=1', '--disorder',
       '--new', ...HLG, '--filter-l7=http', '--hostcase', '--methodeol', '--split-pos=1'] },
     { name: 'multi:discord-oob+general-split', args: [...BASE,
-      ...HLD, '--split-pos=1,midsld', '--oob', '--disorder',
+      ...HLD, '--split-pos=1,midsld', '--oob',
       '--new', ...HLG, '--split-pos=1', '--disorder', '--hostcase'] },
 
     // === TIER 6: Host header manipulation ===
@@ -1157,19 +1171,19 @@ function buildDarwinStrategies(listsDir) {
 
     // === TIER 7: Combined aggressive strategies ===
     { name: 'combined-v1', args: [...BASE, '--split-pos=1,midsld', '--disorder', '--hostcase', '--methodeol', ...HL] },
-    { name: 'combined-v2', args: [...BASE, '--oob', '--methodeol', '--split-pos=1,midsld', '--disorder', '--hostcase', '--hostdot', ...HL] },
+    { name: 'combined-v2', args: [...BASE, '--oob', '--methodeol', '--split-pos=1,midsld', '--hostcase', '--hostdot', ...HL] },
     { name: 'combined-v3', args: [...BASE, '--tlsrec=sni', '--hostpad=256', '--split-pos=2', '--disorder', '--hostcase', ...HL] },
     { name: 'oob+methodeol+split', args: [...BASE, '--oob', '--methodeol', '--split-pos=1', '--hostcase', ...HL] },
-    { name: 'combined-v4', args: [...BASE, '--oob', '--hostpad=256', '--split-pos=1,midsld', '--disorder', '--hostcase', '--methodeol', ...HL] },
+    { name: 'combined-v4', args: [...BASE, '--oob', '--hostpad=256', '--split-pos=1,midsld', '--hostcase', '--methodeol', ...HL] },
     { name: 'combined-v5', args: [...BASE, '--tlsrec=sni', '--methodeol', '--hostdot', '--split-pos=2', '--disorder', '--hostcase', ...HL] },
-    { name: 'combined-v6', args: [...BASE, '--oob=tls', '--tlsrec=sni', '--split-pos=1,midsld', '--disorder', '--hostcase', ...HL] },
-    { name: 'combined-v7', args: [...BASE, '--domcase', '--oob', '--split-pos=host', '--disorder', ...HL] },
+    { name: 'combined-v6', args: [...BASE, '--oob=tls', '--tlsrec=sni', '--split-pos=1,midsld', '--hostcase', ...HL] },
+    { name: 'combined-v7', args: [...BASE, '--domcase', '--oob', '--split-pos=host', ...HL] },
 
     // === TIER 8: Multi-profile split-any-protocol (for edge cases) ===
     { name: 'multi:splitany+disorder', args: [...BASE, ...HL,
       '--split-pos=1,midsld', '--split-any-protocol', '--disorder',
       '--new', ...HL, '--filter-l7=http', '--hostcase', '--methodeol'] },
-    { name: 'split-any+oob+disorder', args: [...BASE, '--split-pos=1', '--split-any-protocol', '--oob', '--disorder', ...HL] },
+    { name: 'split-any+oob', args: [...BASE, '--split-pos=1', '--split-any-protocol', '--oob', ...HL] },
 
     // === TIER 9: Extended split positions ===
     { name: 'split3+disorder', args: [...BASE, '--split-pos=3', '--disorder', '--hostcase', ...HL] },
@@ -1187,7 +1201,6 @@ function buildDarwinStrategies(listsDir) {
     // === TIER 11: TLS record + OOB variants ===
     { name: 'tlsrec+disorder', args: [...BASE, '--tlsrec=sni', '--disorder', '--hostcase', ...HL] },
     { name: 'tlsrec+oob+split', args: [...BASE, '--tlsrec=sni', '--oob', '--split-pos=1', '--hostcase', ...HL] },
-    { name: 'tlsrec+oob+disorder', args: [...BASE, '--tlsrec=sni', '--oob', '--disorder', '--hostcase', ...HL] },
 
     // === TIER 12: Multi-profile tamper-cutoff (reduce false positives) ===
     { name: 'multi:cutoff-tls+cutoff-http', args: [...BASE, ...HL,
@@ -1202,7 +1215,7 @@ function buildDarwinStrategies(listsDir) {
     { name: 'split+disorder-nohl', args: [...BASE, '--split-pos=1', '--disorder', '--hostcase'] },
     { name: 'split-midsld+disorder-nohl', args: [...BASE, '--split-pos=1,midsld', '--disorder', '--hostcase'] },
     { name: 'tlsrec+split+disorder-nohl', args: [...BASE, '--tlsrec=sni', '--split-pos=1', '--disorder', '--hostcase'] },
-    { name: 'oob+split+disorder-nohl', args: [...BASE, '--oob', '--split-pos=1', '--disorder'] },
+    { name: 'oob+split-nohl', args: [...BASE, '--oob', '--split-pos=1'] },
     { name: 'multi:disorder+tlsrec-nohl', args: [...BASE,
       '--filter-l7=tls', '--split-pos=1,midsld', '--disorder', '--tlsrec=sni',
       '--new', '--filter-l7=http', '--hostcase', '--methodeol', '--split-pos=1', '--disorder'] },
@@ -3277,6 +3290,12 @@ ipcMain.handle('open-external', (event, url) => {
 // branch at connect time, with no commit and no checksum, and written as root.
 const HOSTS_MARKER = '# UnblockPro Discord/Telegram hosts';
 
+// Discord keeps its Electron caches here; %APPDATA% does not exist on macOS.
+function discordDataDir() {
+  if (process.platform === 'darwin') return path.join(process.env.HOME || '', 'Library', 'Application Support', 'discord');
+  return path.join(process.env.APPDATA || '', 'discord');
+}
+
 function getHostsPath() {
   if (process.platform === 'darwin') return '/etc/hosts';
   return path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts');
@@ -3423,6 +3442,16 @@ ipcMain.handle('clean-hosts', async () => {
 });
 
 ipcMain.handle('update-hosts-for-discord', async () => {
+  // The block is only correct while the bypass runs; disconnect takes it out
+  // again. Writing it while disconnected left pinned Discord addresses behind
+  // that broke Discord even under a VPN until the app was uninstalled (#46).
+  if (!isConnected) {
+    return {
+      success: false,
+      notConnected: true,
+      error: 'Записи в hosts нужны только пока обход включён: они добавляются при подключении и убираются при отключении. Подключитесь — hosts обновится сам.'
+    };
+  }
   if (process.platform === 'darwin') {
     return await updateHostsMacOS();
   }
@@ -3475,7 +3504,7 @@ ipcMain.handle('update-hosts-for-discord', async () => {
 });
 
 ipcMain.handle('clear-discord-cache', () => {
-  const discordBase = path.join(process.env.APPDATA || '', 'discord');
+  const discordBase = discordDataDir();
   const dirs = ['Cache', 'Code Cache', 'GPUCache'];
   let cleared = 0;
   for (const d of dirs) {

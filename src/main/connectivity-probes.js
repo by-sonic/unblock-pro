@@ -32,6 +32,19 @@ const PNG_MAGIC = '89504e470d0a1a0a';
 // A body served instead of the real response by an ISP notice page.
 const BLOCK_NOTICE_PATTERN = 'blocked|\\u0437\\u0430\\u0431\\u043b\\u043e\\u043a\\u0438\\u0440\\u043e\\u0432\\u0430\\u043d|\\u0434\\u043e\\u0441\\u0442\\u0443\\u043f \\u043e\\u0433\\u0440\\u0430\\u043d\\u0438\\u0447\\u0435\\u043d';
 
+// A custom target is an arbitrary site, and real pages are free to contain these
+// words: YouTube's own shell ships `blocked_packages_for_sps`, which made every
+// strategy fail against https://www.youtube.com/ (#76). A notice page is small,
+// so the phrase counts only in its title or in a body that short.
+const NOTICE_PAGE_MAX_CHARS = 16384;
+const NOTICE_TITLE_PATTERN = `<title[^>]*>[^<]*(?:${BLOCK_NOTICE_PATTERN})`;
+
+function looksLikeBlockNotice(body) {
+  const text = String(body || '');
+  if (matches(NOTICE_TITLE_PATTERN, text)) return true;
+  return text.length < NOTICE_PAGE_MAX_CHARS && matches(BLOCK_NOTICE_PATTERN, text);
+}
+
 const PROBE_RULES = Object.freeze([
   Object.freeze({
     kind: 'youtube-home',
@@ -146,7 +159,7 @@ function validateProbe(url, status, body = '', bodyHex = '') {
   const rule = RULES_BY_URL.get(url);
   // Custom targets prove a TLS-authenticated HTTP response from this URL.
   // Redirects count as reachability, but are not followed to unrelated hosts.
-  if (!rule) return status >= 200 && status < 400 && !matches(BLOCK_NOTICE_PATTERN, body);
+  if (!rule) return status >= 200 && status < 400 && !looksLikeBlockNotice(body);
 
   if (!rule.statuses.includes(status)) return false;
   if (rule.bodyPattern && !matches(rule.bodyPattern, body)) return false;
@@ -248,7 +261,8 @@ function buildPowerShellProbeScript() {
 
   lines.push('}');
   lines.push('# Custom target: HTTPS response without following redirects.');
-  lines.push(`if ($status -ge 200 -and $status -lt 400 -and -not ($text -imatch ${psQuote(BLOCK_NOTICE_PATTERN)})) { exit 0 }`);
+  lines.push(`$notice = ($text -imatch ${psQuote(NOTICE_TITLE_PATTERN)}) -or ($text.Length -lt ${NOTICE_PAGE_MAX_CHARS} -and $text -imatch ${psQuote(BLOCK_NOTICE_PATTERN)})`);
+  lines.push('if ($status -ge 200 -and $status -lt 400 -and -not $notice) { exit 0 }');
   lines.push('exit 1');
 
   return lines.join('\r\n') + '\r\n';

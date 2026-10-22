@@ -221,3 +221,26 @@ test('quit prevents a new start both immediately and after an already-pending cl
   assert.equal((await start).success, false);
   assert.equal(pending.isSearching, false);
 });
+
+test('macOS strategies never ask tpws for --oob together with --disorder', () => {
+  // Outside Linux tpws exits at once with "--oob and --disorder work
+  // simultaneously only in linux", which used to waste 14 of 52 strategies.
+  const start = mainSource.indexOf('function buildDarwinStrategies(listsDir)');
+  const end = mainSource.indexOf('\n// Proven strategies ordered by speed', start);
+  assert.ok(start >= 0 && end > start);
+  const build = vm.runInNewContext(mainSource.slice(start, end) + '\nbuildDarwinStrategies;', { path: path.posix });
+  const strategies = Array.from(build('/lists'));
+  assert.ok(strategies.length >= 40);
+  assert.equal(new Set(strategies.map((s) => s.name)).size, strategies.length, 'names are unique');
+  for (const strategy of strategies) {
+    const profiles = [[]];
+    for (const arg of strategy.args) {
+      if (arg === '--new') profiles.push([]);
+      else profiles[profiles.length - 1].push(arg);
+    }
+    for (const profile of profiles) {
+      const oob = profile.some((arg) => arg === '--oob' || arg.startsWith('--oob='));
+      assert.ok(!(oob && profile.includes('--disorder')), strategy.name);
+    }
+  }
+});
