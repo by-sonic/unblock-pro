@@ -243,6 +243,19 @@ jobs:
       - name: Verify packaged Windows elevation dependency
         run: npx electron scripts/elevation-smoke.js --packaged
 
+      # Real install on the throwaway runner: fresh install over the last
+      # release whose installer broke file ACLs (#79), then uninstall.
+      - name: Install, upgrade over v2.0.25 and uninstall
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $previous = Join-Path $env:RUNNER_TEMP 'previous-setup'
+          gh release download v2.0.25 -R "${{ github.repository }}" -p '*-win-setup.exe' -D $previous
+          $old = Get-ChildItem "$previous\*-win-setup.exe" | Select-Object -First 1
+          $new = Get-ChildItem 'dist\*-win-setup.exe' | Select-Object -First 1
+          ./scripts/check-windows-installer.ps1 -Setup $new.FullName -PreviousSetup $old.FullName
+
       - name: Remove debug files
         run: del dist\builder-debug.yml 2>nul || true
         shell: cmd
