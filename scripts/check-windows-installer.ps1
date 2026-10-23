@@ -39,8 +39,9 @@ function Assert-Installed {
   }
   # Users must be able to read and run the app, or Explorer cannot even start
   # the elevation prompt ("no application is associated with this file").
-  $usersCanRun = (Get-Acl -LiteralPath $exe).Access | Where-Object {
-    $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-545' -and
+  $rules = (Get-Acl -LiteralPath $exe).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+  $usersCanRun = $rules | Where-Object {
+    $_.IdentityReference.Value -eq 'S-1-5-32-545' -and
     $_.AccessControlType -eq 'Allow' -and
     ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute
   }
