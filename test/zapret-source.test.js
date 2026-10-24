@@ -93,3 +93,26 @@ test('the extracted archive directory is verified against the pin', () => {
     'the extracted directory must be matched against the pinned commit'
   );
 });
+
+test('tpws patches ship with the app, stay LF and are applied by both builds', () => {
+  const { TPWS_PATCHES } = require('../src/main/zapret-source');
+  assert.ok(TPWS_PATCHES.length >= 1);
+  for (const file of TPWS_PATCHES) {
+    // Inside src/ so electron-builder packs it for the in-app build.
+    assert.ok(path.relative(path.join(repoRoot, 'src'), file).split(path.sep)[0] !== '..', file);
+    const text = fs.readFileSync(file, 'utf8');
+    assert.ok(!text.includes('\r'), `${path.basename(file)} must keep LF line endings`);
+    assert.match(text, /^--- a\/tpws\//m, 'paths are relative to the zapret root for patch -p1');
+  }
+  // Firefox sends SOCKS4a hostnames to the macOS system proxy (#81).
+  const socks4a = fs.readFileSync(TPWS_PATCHES.find((f) => f.endsWith('tpws-socks4a.patch')), 'utf8');
+  assert.match(socks4a, /^-.*socks4a protocol not supported/m);
+  assert.match(socks4a, /^\+.*resolver_queue\(hostname/m);
+
+  const main = read('src/main/main.js');
+  assert.ok(main.indexOf('for (const patchFile of TPWS_PATCHES)') < main.indexOf("execSync('make mac'"),
+    'the in-app build patches before it compiles');
+  const workflow = read('.github/workflows/build.yml');
+  assert.ok(workflow.indexOf('TPWS_PATCHES') < workflow.indexOf('make -C temp/zapret/tpws mac'),
+    'CI patches before it compiles');
+});

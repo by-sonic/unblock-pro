@@ -1,5 +1,7 @@
 'use strict';
 
+const path = require('path');
+
 // The macOS runtime is compiled from zapret source. This is the one place that
 // says which source.
 //
@@ -29,7 +31,19 @@ const ZAPRET_MACOS_COMMIT = 'd437963452674faadfd45adcd62466272b5a2fcd';
 const ZAPRET_MACOS_ARCHIVE_URL =
   `https://codeload.github.com/bol-van/zapret/zip/${ZAPRET_MACOS_COMMIT}`;
 
+// Our changes on top of that commit, applied with `patch -p1` from the zapret
+// root by CI and by the in-app build alike. A patch that no longer applies to a
+// new upstream commit fails the build instead of shipping tpws without it.
+//
+// tpws-socks4a.patch: upstream tpws refuses SOCKS4a. Firefox maps the macOS
+// system "SOCKS" proxy to SOCKS v4 and, with its default remote-DNS setting,
+// sends hostnames that way, so almost every site failed in Firefox (#81).
+const TPWS_PATCHES = Object.freeze([
+  path.join(__dirname, 'patches', 'tpws-socks4a.patch')
+]);
+
 module.exports = {
+  TPWS_PATCHES,
   ZAPRET_MACOS_ARCHIVE_URL,
   ZAPRET_MACOS_COMMIT
 };

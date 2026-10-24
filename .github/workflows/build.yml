@@ -109,6 +109,12 @@ jobs:
           git -C temp/zapret init
           git -C temp/zapret fetch --depth 1 https://github.com/bol-van/zapret.git "$COMMIT"
           git -C temp/zapret checkout --detach FETCH_HEAD
+          # Same patch list the in-app build applies; a patch that stopped
+          # applying to a new commit must fail here, not ship tpws without it.
+          node -p "require('./src/main/zapret-source').TPWS_PATCHES.join('\n')" | while read -r p; do
+            echo "applying $p"
+            patch -d temp/zapret -p1 --forward < "$p"
+          done
           OPTIMIZE=-O2 make -C temp/zapret/tpws mac
           cp temp/zapret/tpws/tpws bin/darwin/tpws
           chmod 755 bin/darwin/tpws
@@ -148,6 +154,21 @@ jobs:
           codesign --force --sign - bin/darwin/tpws
           codesign --verify --verbose bin/darwin/tpws
           node scripts/check-mac-runtime.js bin/darwin/tpws
+
+      # Firefox talks SOCKS4a to the macOS system "SOCKS" proxy whenever its
+      # remote-DNS setting is on (the default), and upstream tpws refused that,
+      # so nearly every site failed in Firefox (#81).
+      - name: tpws accepts SOCKS4a hostnames
+        shell: bash
+        run: |
+          bin/darwin/tpws --socks --port 11080 --bind-addr 127.0.0.1 & pid=$!
+          trap 'kill $pid' EXIT
+          sleep 1
+          for mode in --socks4a --socks5-hostname; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$mode" 127.0.0.1:11080 http://example.com/ || true)
+            echo "$mode -> $code"
+            test "$code" = 200
+          done
 
       - name: Build macOS
         uses: nick-fields/retry@v3

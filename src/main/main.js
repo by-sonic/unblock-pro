@@ -42,7 +42,7 @@ const { runServiceProbes } = require('./service-probe-run');
 const { normalizeTargetUrl, buildTargetOutcome, includeTargetInLists } = require('./custom-target');
 const { HOSTS_DATA } = require('./hosts-data');
 const { legacyBlockData } = require('./hosts-legacy');
-const { ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
+const { TPWS_PATCHES, ZAPRET_MACOS_ARCHIVE_URL, ZAPRET_MACOS_COMMIT } = require('./zapret-source');
 const {
   BODY_SAMPLE_BYTES,
   PROBE_TIMEOUTS,
@@ -1651,6 +1651,16 @@ async function downloadAndExtractBinaries() {
       // compile the dedicated universal macOS target instead of copying them.
       const tpwsSrcDir = path.join(zapretDir, 'tpws');
       const compiledPath = path.join(tpwsSrcDir, 'tpws');
+      // Same patches CI applies. Fed on stdin: inside app.asar the file is
+      // readable only through Electron's fs, not by an external `patch`.
+      for (const patchFile of TPWS_PATCHES) {
+        try {
+          execSync('patch -p1 --forward', { cwd: zapretDir, input: fs.readFileSync(patchFile), stdio: 'pipe', timeout: 30000 });
+        } catch (e) {
+          const output = `${e.stdout || ''}${e.stderr || ''}`.trim().split('\n').pop() || e.message;
+          throw new Error(`Не удалось применить ${path.basename(patchFile)} к исходникам tpws: ${output}`);
+        }
+      }
       sendLog({ type: 'info', message: `Собираю tpws из zapret ${ZAPRET_MACOS_COMMIT.slice(0, 12)}...` });
       try {
         execSync('make mac', {
