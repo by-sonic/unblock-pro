@@ -1,0 +1,66 @@
+--- a/tpws/tpws_conn.c
++++ b/tpws/tpws_conn.c
+@@ -940,7 +940,7 @@
+ 					else
+ 					{
+ 						// socks4 does not have separate handshake phase. it starts with connect request
+-						// ipv6 and domain resolving are not supported
++						// ipv6 is not supported. socks4a domains are resolved like socks5 ones
+ 						s4_req *m = (s4_req*)buf;
+ 						if (!S4_REQ_HEADER_VALID(m, rd))
+ 						{
+@@ -966,11 +966,41 @@
+ 							socks4_send_rep(conn->fd, S4_REP_FAILED);
+ 							return false;
+ 						}
+-						if (m->ip==htonl(1)) // special ip 0.0.0.1
++						if (ntohl(m->ip) && ntohl(m->ip)<256) // socks4a : ip 0.0.0.x, x!=0
+ 						{
+-							VPRINT("socks4a protocol not supported\n");
+-							socks4_send_rep(conn->fd, S4_REP_FAILED);
+-							return false;
++							// VER CMD PORT IP USERID\0 DOMAIN\0
++							// Firefox speaks socks4a to a system "SOCKS" proxy on macOS when remote dns is on
++							const char *user = buf+sizeof(s4_req), *end = buf+rd;
++							const char *user_end = memchr(user, 0, end-user);
++							const char *dom = user_end ? user_end+1 : end;
++							const char *dom_end = dom<end ? memchr(dom, 0, end-dom) : NULL;
++							char hostname[256];
++							size_t dlen = dom_end ? (size_t)(dom_end-dom) : 0;
++							if (!dlen || dlen>=sizeof(hostname))
++							{
++								DBGPRINT("socks4a request invalid\n");
++								socks4_send_rep(conn->fd, S4_REP_FAILED);
++								return false;
++							}
++							if (params.no_resolve)
++							{
++								VPRINT("socks4a hostnames disabled by --no-resolve\n");
++								socks4_send_rep(conn->fd, S4_REP_FAILED);
++								return false;
++							}
++							memcpy(hostname, dom, dlen);
++							hostname[dlen] = 0;
++							DBGPRINT("socks4a queue resolve hostname '%s' port '%u'\n",hostname,ntohs(m->port));
++							conn->socks_ri = resolver_queue(hostname,ntohs(m->port),conn);
++							if (!conn->socks_ri)
++							{
++								VPRINT("socks4a could not queue resolve item\n");
++								socks4_send_rep(conn->fd, S4_REP_FAILED);
++								return false;
++							}
++							conn->socks_state=S_WAIT_RESOLVE;
++							DBGPRINT("S_WAIT_RESOLVE\n");
++							return true;
+ 						}
+ 						((struct sockaddr_in*)&conn->dest)->sin_family = AF_INET;
+ 						((struct sockaddr_in*)&conn->dest)->sin_port = m->port;
+@@ -1079,7 +1109,7 @@
+ 			DBGPRINT("resolve_complete %s. getaddrinfo result %d\n", ri->dom, ri->ga_res);
+ 			if (ri->ga_res)
+ 			{
+-				socks5_send_rep(conn->fd,S5_REP_HOST_UNREACHABLE);
++				socks_send_rep(conn->socks_ver,conn->fd,S5_REP_HOST_UNREACHABLE);
+ 				return false;;
+ 			}
+ 			else
