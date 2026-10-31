@@ -107,6 +107,7 @@ function startLifecycle(overrides = {}) {
     isConnected: false, cancelRequested: false, activeTargetUrl: '', lastError: null, lastErrorCode: null,
     updateTrayMenu: () => {}, sendStatus: () => {}, sendLog: () => {},
     loadSettings: () => ({}), normalizeTargetUrl: (value) => value,
+    tpwsPort: 1080, resolveProxyPort: (value) => value || 1080,
     runProxyStartAttempt: () => assert.fail('unexpected new search'),
     ...overrides
   });
@@ -228,7 +229,7 @@ test('macOS strategies never ask tpws for --oob together with --disorder', () =>
   const start = mainSource.indexOf('function buildDarwinStrategies(listsDir)');
   const end = mainSource.indexOf('\n// Proven strategies ordered by speed', start);
   assert.ok(start >= 0 && end > start);
-  const build = vm.runInNewContext(mainSource.slice(start, end) + '\nbuildDarwinStrategies;', { path: path.posix });
+  const build = vm.runInNewContext(mainSource.slice(start, end) + '\nbuildDarwinStrategies;', { path: path.posix, tpwsPort: 1080 });
   const strategies = Array.from(build('/lists'));
   assert.ok(strategies.length >= 40);
   assert.equal(new Set(strategies.map((s) => s.name)).size, strategies.length, 'names are unique');
