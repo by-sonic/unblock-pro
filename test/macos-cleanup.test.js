@@ -2,7 +2,7 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { buildMacCleanupCommand, runMacCleanup } = require('../src/main/macos-cleanup');
+const { buildMacCleanupCommand, buildMacConnectCommand, runMacCleanup, runMacConnect } = require('../src/main/macos-cleanup');
 
 const hostsCleanup = { hostsPath: '/etc/hosts', original: '127.0.0.1 localhost\n# our block\n', next: '127.0.0.1 localhost\n' };
 const options = { quicBlockEnabled: true, pfEnableToken: '12345', hostsCleanup };
@@ -74,4 +74,50 @@ test('invalid token and unvalidated hosts bytes fail before execution', async ()
   const deps = { execSync: () => assert.fail(), sudoExec: () => assert.fail() };
   assert.equal((await runMacCleanup({ ...options, pfEnableToken: '123; touch /tmp/oops' }, deps)).ok, false);
   assert.equal((await runMacCleanup({ hostsCleanup: { hostsPath: '/etc/hosts', tempFile: '/tmp/unsafe' } }, deps)).ok, false);
+});
+
+const hostsUpdate = { hostsPath: '/etc/hosts', original: '127.0.0.1 localhost\n', next: '127.0.0.1 localhost\n# our block\n' };
+const pfConfPath = '/Users/me/Library/Application Support/UnblockPro/pf-quic-block.conf';
+
+test('connecting runs pf and hosts in one elevated command, so one password dialog', async () => {
+  const commands = [];
+  const result = await runMacConnect({ pfConfPath, hostsUpdate }, {
+    sudoExec: (command, config, done) => { commands.push(command); done(null, 'UNBLOCK_CONNECT_HOSTS\n', 'Token : 777\n'); }
+  });
+  assert.equal(commands.length, 1);
+  assert.match(commands[0], /pfctl -f '.*Application Support.*pf-quic-block\.conf'/);
+  assert.match(commands[0], /pfctl -E/);
+  assert.match(commands[0], /shasum -a 256/);
+  assert.equal(result.pfLoaded, true);
+  assert.equal(result.hostsUpdated, true);
+  assert.match(result.output, /Token : 777/);
+});
+
+test('nothing to change means no password dialog at all', async () => {
+  const result = await runMacConnect({}, { sudoExec: () => assert.fail('must not prompt') });
+  assert.equal(result.elevated, false);
+  assert.equal(buildMacConnectCommand({}), null);
+});
+
+test('a hosts failure does not lose the pf rules that must be undone on disconnect', async () => {
+  const result = await runMacConnect({ pfConfPath, hostsUpdate }, {
+    sudoExec: (command, config, done) => done(null, '', 'Token : 5\n')
+  });
+  assert.equal(result.pfLoaded, true);
+  assert.equal(result.hostsUpdated, false);
+});
+
+test('a dismissed password dialog changes nothing and reports it', async () => {
+  const denied = new Error('User did not grant permission.');
+  const result = await runMacConnect({ pfConfPath, hostsUpdate }, {
+    sudoExec: (command, config, done) => done(denied)
+  });
+  assert.equal(result.pfLoaded, false);
+  assert.equal(result.hostsUpdated, false);
+  assert.equal(result.error, denied);
+});
+
+test('the connect command refuses a stale hosts plan and never touches other files', () => {
+  assert.throws(() => buildMacConnectCommand({ hostsUpdate: { ...hostsUpdate, hostsPath: '/tmp/hosts' } }));
+  assert.throws(() => buildMacConnectCommand({ hostsUpdate: { ...hostsUpdate, next: '  ' } }));
 });

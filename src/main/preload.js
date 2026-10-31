@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('api', {
   getStrategies: () => ipcRenderer.invoke('get-strategies'),
   setSelectedStrategy: (name) => ipcRenderer.invoke('set-selected-strategy', name),
   setCustomTarget: (url) => ipcRenderer.invoke('set-custom-target', url),
+  setProxyPort: (port) => ipcRenderer.invoke('set-proxy-port', port),
   
   // Updates
   installUpdate: () => ipcRenderer.invoke('install-update'),

@@ -251,6 +251,13 @@
           <button id="saveTargetBtn" type="button" class="target-save">Сохранить сайт</button>
           <p id="targetMessage" class="setting-desc" role="status" aria-live="polite"></p>
         </div>
+        <div class="target-setting" id="portSetting" hidden>
+          <label class="setting-label" for="proxyPort">Порт локального прокси</label>
+          <p class="setting-desc" id="portHelp">Поменяйте, если 1080 занят другой программой. Пусто — 1080.</p>
+          <input id="proxyPort" type="number" min="1024" max="65535" placeholder="1080" aria-describedby="portHelp portMessage" autocomplete="off">
+          <button id="savePortBtn" type="button" class="target-save">Сохранить порт</button>
+          <p id="portMessage" class="setting-desc" role="status" aria-live="polite"></p>
+        </div>
         <div class="setting-row">
           <div class="setting-info">
             <span class="setting-label">Автозапуск</span>
