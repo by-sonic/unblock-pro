@@ -20,7 +20,8 @@ const {
 } = require('./system-files');
 const { copyFileResilient } = require('./safe-copy');
 const { inspectProtectedWindowsRuntime, systemPowerShellPath } = require('./windows-protected-runtime');
-const { runMacCleanup } = require('./macos-cleanup');
+const { runMacCleanup, runMacConnect } = require('./macos-cleanup');
+const { DEFAULT_PROXY_PORT, normalizeProxyPort, resolveProxyPort } = require('./proxy-port');
 const { appendLogLine, buildLogReport, readLogTail } = require('./log-report');
 const {
   describeIntegrityFailure,
@@ -104,7 +105,8 @@ let elevatedCancelFile = null;
 // How long winws gets to install its WinDivert filters before it counts as up.
 const WINWS_STARTUP_MS = 3000;
 let warnedAboutBundledArch = false;
-const TPWS_PORT = 1080;
+// Read from the settings when a connection starts and fixed for its duration.
+let tpwsPort = DEFAULT_PROXY_PORT;
 let isConnected = false;
 let isDownloading = false;
 let currentStrategy = null;
@@ -1112,7 +1114,7 @@ function buildDarwinStrategies(listsDir) {
   const la = path.join(listsDir, 'list-all.txt');
   const le = path.join(listsDir, 'list-exclude.txt');
 
-  const BASE = ['--port', '1080', '--socks'];
+  const BASE = ['--port', String(tpwsPort), '--socks'];
   const HL = [`--hostlist=${la}`, `--hostlist-exclude=${le}`];
 
   const lg = path.join(listsDir, 'list-general.txt');
@@ -1742,9 +1744,9 @@ let quicBlockEnabled = false;
 // after disconnect and kept interfering with other networking tools.
 let pfEnableToken = null;
 
-async function enableQuicBlock() {
-  if (process.platform !== 'darwin') return true;
-
+// Writes the pf ruleset. Returns the path to load, or null when there is nothing
+// to load: the rules are already in the system config, or the file failed.
+function writeQuicBlockConfig() {
   const pfConfPath = path.join(app.getPath('userData'), 'pf-quic-block.conf');
   try {
     let existingConf = '';
@@ -1757,33 +1759,40 @@ async function enableQuicBlock() {
     const alreadyHasAll = rules.every(r => existingConf.includes(r));
     if (alreadyHasAll) {
       quicBlockEnabled = true;
-      return true;
+      return null;
     }
     const newRules = rules.filter(r => !existingConf.includes(r));
     fs.writeFileSync(pfConfPath, existingConf.trimEnd() + '\n' + newRules.join('\n') + '\n');
+    return pfConfPath;
   } catch (e) {
     sendLog({ type: 'warning', message: 'Не удалось создать конфиг для блокировки UDP' });
-    return false;
+    return null;
   }
+}
 
-  return new Promise((resolve) => {
-    // `-E` writes its token to stderr, so keep both streams.
-    sudo.exec(
-      `/sbin/pfctl -f "${pfConfPath}" 2>/dev/null; /sbin/pfctl -E 2>&1; exit 0`,
-      { name: 'UnblockPro' },
-      (error, stdout, stderr) => {
-        if (error) {
-          sendLog({ type: 'warning', message: 'UDP блокировка не установлена — Discord голос и YouTube могут не работать' });
-          resolve(false);
-          return;
-        }
-        pfEnableToken = parsePfEnableToken(`${stdout || ''}\n${stderr || ''}`);
-        quicBlockEnabled = true;
-        sendLog({ type: 'info', message: 'UDP заблокирован (QUIC + Discord Voice) — трафик идёт через TCP' });
-        resolve(true);
-      }
-    );
-  });
+// Everything connecting needs root for, behind a single password dialog.
+async function prepareMacSystem() {
+  const pfConfPath = writeQuicBlockConfig();
+  const hosts = planHostsUpdateMacOS();
+  const result = await runMacConnect({ pfConfPath, hostsUpdate: hosts.update }, { sudoExec: sudo.exec.bind(sudo) });
+
+  if (pfConfPath) {
+    if (result.pfLoaded) {
+      // `-E` writes its token to stderr, so both streams are in the output.
+      pfEnableToken = parsePfEnableToken(result.output);
+      quicBlockEnabled = true;
+      sendLog({ type: 'info', message: 'UDP заблокирован (QUIC + Discord Voice) — трафик идёт через TCP' });
+    } else {
+      sendLog({ type: 'warning', message: 'UDP блокировка не установлена — Discord голос и YouTube могут не работать' });
+    }
+  }
+  if (hosts.update) {
+    if (result.hostsUpdated) {
+      sendLog({ type: 'info', message: 'Hosts обновлён (Discord, Telegram, GitHub)' });
+    } else {
+      sendLog({ type: 'warning', message: 'Не удалось обновить hosts — голос Discord может не работать' });
+    }
+  }
 }
 
 // Undoes the macOS system changes that need root: the pf ruleset and the hosts
@@ -1833,7 +1842,7 @@ function getActiveNetworkServices() {
   }
 }
 
-function enableSystemProxy(port = 1080) {
+function enableSystemProxy(port = tpwsPort) {
   if (process.platform !== 'darwin') return;
   const services = getActiveNetworkServices();
   proxyEnabledServices = [];
@@ -1946,7 +1955,7 @@ function testSingleConnection(port, timeoutSec, url) {
   });
 }
 
-async function testProxyConnection(port = TPWS_PORT, timeouts = PROBE_TIMEOUTS) {
+async function testProxyConnection(port = tpwsPort, timeouts = PROBE_TIMEOUTS) {
   const { screenTimeoutSec, fullTimeoutSec } = timeouts;
   return runServiceProbes({
     targetUrl: activeTargetUrl,
@@ -2392,6 +2401,7 @@ async function startProxy() {
   updateTrayMenu();
   try {
     activeTargetUrl = normalizeTargetUrl(loadSettings().customTargetUrl || '');
+    tpwsPort = resolveProxyPort(loadSettings().proxyPort);
     return await runProxyStartAttempt();
   } catch (e) {
     await stopProxy();
@@ -2496,7 +2506,7 @@ async function runProxyStartAttempt() {
       sendStatus();
       return { success: false, error: lastError };
     }
-    // A crash or forced quit can leave tpws holding port 1080, which would make
+    // A crash or forced quit can leave tpws holding its port, which would make
     // every strategy in this run fail to bind.
     await killStrayTpws();
 
@@ -2509,8 +2519,9 @@ async function runProxyStartAttempt() {
     // Set clean DNS (1.1.1.1, 8.8.8.8) to avoid ISP DNS poisoning for Discord
     setCleanDns(services);
     sendLog({ type: 'info', message: 'DNS установлен на 1.1.1.1 / 8.8.8.8 (защита от подмены)' });
-    // Block QUIC (UDP 443) so YouTube uses TCP which goes through tpws
-    await enableQuicBlock();
+    // Block QUIC (UDP 443) so YouTube uses TCP which goes through tpws, and put
+    // the hosts block in place: one password dialog for both.
+    await prepareMacSystem();
   }
 
   sendStatus({ searching: true });
@@ -2563,16 +2574,7 @@ async function runProxyStartAttempt() {
 
   sendLog({ type: 'info', message: `Начинаю перебор ${totalStrategies} стратегий...` });
 
-  // macOS: update hosts for Discord voice servers (all regions)
   if (process.platform === 'darwin') {
-    try {
-      const hostsResult = await updateHostsMacOS();
-      if (hostsResult.success && !hostsResult.alreadyExists) {
-        sendLog({ type: 'info', message: 'Hosts обновлён (Discord, Telegram, GitHub)' });
-      }
-    } catch (e) {
-      sendLog({ type: 'warning', message: 'Не удалось обновить hosts — голос Discord может не работать' });
-    }
     // Flush DNS cache so new hosts entries and clean DNS take effect immediately
     flushDnsCache();
     sendLog({ type: 'info', message: 'DNS кэш очищен' });
@@ -2705,14 +2707,14 @@ async function runProxyStartAttempt() {
       if (process.platform === 'darwin') {
         // The port must be free before spawning, otherwise tpws cannot bind and
         // the probe below would succeed against a leftover listener instead.
-        if (!(await waitForPortState(TPWS_PORT, false, 5000))) {
+        if (!(await waitForPortState(tpwsPort, false, 5000))) {
           await killStrayTpws();
-          if (!(await waitForPortState(TPWS_PORT, false, 3000))) {
-            // A foreign listener on 1080 will not free itself, so trying the
+          if (!(await waitForPortState(tpwsPort, false, 3000))) {
+            // A foreign listener on the port will not free itself, so trying the
             // remaining strategies would spend ~8s each to arrive at the same
             // wall and then report the misleading "ни одна стратегия не
             // сработала". Name the real obstacle instead.
-            lastError = `Порт ${TPWS_PORT} занят другим процессом (возможно, другой VPN или прокси) — закройте его и попробуйте снова`;
+            lastError = `Порт ${tpwsPort} занят другим процессом (возможно, другой VPN или прокси) — закройте его или выберите другой порт в настройках`;
             lastErrorCode = 'PORT_IN_USE';
             sendLog({ type: 'error', message: lastError });
             strategyProgress = null;
@@ -2761,7 +2763,7 @@ async function runProxyStartAttempt() {
         // Wait for tpws to bind, instead of hoping 2s was enough. Aborts the
         // moment the process dies, so an instantly-failing binary costs
         // milliseconds per strategy rather than the full timeout.
-        const listening = await waitForPortState(TPWS_PORT, true, 8000, {
+        const listening = await waitForPortState(tpwsPort, true, 8000, {
           shouldAbort: () => hasExited(child)
         });
 
@@ -2783,17 +2785,17 @@ async function runProxyStartAttempt() {
 
         if (!listening) {
           macCrashGuard.record(child);
-          sendLog({ type: 'warning', message: `${strategy.name}: порт ${TPWS_PORT} не доступен` });
+          sendLog({ type: 'warning', message: `${strategy.name}: порт ${tpwsPort} не доступен` });
           proxyProcess = null;
           await terminateChild(child);
           continue; // tpws not listening, skip this strategy
         }
 
         // Enable system SOCKS proxy so all traffic goes through tpws
-        enableSystemProxy(TPWS_PORT);
+        enableSystemProxy(tpwsPort);
 
         // Actually test what works through the proxy, service by service.
-        const { outcome, failed } = await testProxyConnection(TPWS_PORT, timeouts);
+        const { outcome, failed } = await testProxyConnection(tpwsPort, timeouts);
         tallyFailures(probeFailures, failed);
 
         // The probes above take seconds; the user may have disconnected or quit
@@ -3407,7 +3409,9 @@ async function prepareHostsUpdateForBatch(tempDir) {
     return { success: false, psScriptPath: null };
   }
 }
-async function updateHostsMacOS() {
+// What the hosts file needs: { update } with the replacement, { current: true }
+// when the block is fresh, or { error }.
+function planHostsUpdateMacOS() {
   const hostsPath = '/etc/hosts';
   let current = '';
   try {
@@ -3416,7 +3420,7 @@ async function updateHostsMacOS() {
     // trusted forever. Discord voice IPs rotate, and a stale pinned address is
     // exactly what leaves voice stuck on "connecting".
     if (hasCurrentBlock(current, HOSTS_MARKER, app.getVersion())) {
-      return { success: true, alreadyExists: true };
+      return { current: true };
     }
   } catch (e) {}
 
@@ -3429,10 +3433,17 @@ async function updateHostsMacOS() {
   // unless every system and user line provably survives.
   if (!isSafeHostsRewrite(current, nextHosts, HOSTS_MARKER, { ownHostnames })) {
     sendLog({ type: 'warning', message: 'Пропускаю обновление hosts — проверка целостности не пройдена' });
-    return { success: false, error: 'unsafe hosts rewrite' };
+    return { error: 'unsafe hosts rewrite' };
   }
+  return { update: { hostsPath, original: current, next: nextHosts } };
+}
 
-  const result = await runMacCleanup({ hostsCleanup: { hostsPath, original: current, next: nextHosts } }, {
+async function updateHostsMacOS() {
+  const plan = planHostsUpdateMacOS();
+  if (plan.current) return { success: true, alreadyExists: true };
+  if (!plan.update) return { success: false, error: plan.error };
+
+  const result = await runMacCleanup({ hostsCleanup: plan.update }, {
     execSync, sudoExec: sudo.exec.bind(sudo)
   });
   if (result.ok) sendLog({ type: 'success', message: 'Hosts обновлён для Discord/Telegram' });
@@ -3631,6 +3642,19 @@ ipcMain.handle('set-selected-strategy', (event, strategyName) => {
   settings.selectedStrategy = strategyName; // 'auto' or strategy name
   saveSettings(settings);
   return { success: true };
+});
+
+ipcMain.handle('set-proxy-port', (event, value) => {
+  if (isSearching || isConnected) return { success: false, error: 'Сначала остановите подключение или отмените подбор' };
+  try {
+    const port = normalizeProxyPort(value);
+    const settings = loadSettings();
+    settings.proxyPort = port;
+    saveSettings(settings);
+    return { success: true, port };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
 });
 
 ipcMain.handle('set-custom-target', (event, value) => {

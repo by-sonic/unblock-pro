@@ -18,6 +18,10 @@ const strategySelect = document.getElementById('strategySelect');
 const targetUrl = document.getElementById('targetUrl');
 const saveTargetBtn = document.getElementById('saveTargetBtn');
 const targetMessage = document.getElementById('targetMessage');
+const portSetting = document.getElementById('portSetting');
+const proxyPort = document.getElementById('proxyPort');
+const savePortBtn = document.getElementById('savePortBtn');
+const portMessage = document.getElementById('portMessage');
 let isSearching = false;
 
 async function saveCustomTarget() {
@@ -29,6 +33,16 @@ async function saveCustomTarget() {
     targetMessage.textContent = result.url ? 'Сохранено. При подключении проверяется только этот URL.' : 'Сохранено. Проверяются YouTube и Discord.';
     return true;
   } catch (e) { targetMessage.textContent = e.message; return false; }
+}
+
+async function saveProxyPort() {
+  try {
+    const result = await window.api.setProxyPort(proxyPort.value.trim());
+    proxyPort.setAttribute('aria-invalid', String(!result.success));
+    if (!result.success) { portMessage.textContent = result.error; return; }
+    proxyPort.value = result.port;
+    portMessage.textContent = `Сохранено. Порт ${result.port} заработает при следующем подключении.`;
+  } catch (e) { portMessage.textContent = e.message; }
 }
 
 // New UI elements
@@ -241,6 +255,8 @@ async function loadSystemInfo() {
     };
     
     platformBadge.textContent = platformNames[info.platform] || info.platform;
+    // Only tpws on macOS listens on a port; winws works inside the network stack.
+    portSetting.hidden = info.platform !== 'darwin';
     
     const versionEl = document.getElementById('versionText');
     if (versionEl && info.version) versionEl.textContent = `v${info.version}`;
@@ -297,6 +313,7 @@ async function loadSettings() {
   try {
     const settings = await window.api.getSettings();
     targetUrl.value = settings.customTargetUrl || '';
+    proxyPort.value = settings.proxyPort || '';
     autostartToggle.checked = settings.autoStart || false;
     autoconnectToggle.checked = settings.autoConnect || false;
     autoupdateToggle.checked = settings.autoUpdate !== false;
@@ -329,6 +346,8 @@ function handleStatusUpdate(status) {
   isSearching = status.searching === true;
   targetUrl.disabled = isConnected || isSearching || isDownloading;
   saveTargetBtn.disabled = targetUrl.disabled;
+  proxyPort.disabled = targetUrl.disabled;
+  savePortBtn.disabled = targetUrl.disabled;
   
   // When backend confirms connected, clear local connecting state
   if (isConnected) {
