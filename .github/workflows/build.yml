@@ -170,6 +170,25 @@ jobs:
             test "$code" = 200
           done
 
+      # The volume probes (#84, #46) the way testSingleConnection sends them on a
+      # Mac: curl through tpws SOCKS, googlevideo as SNI with the YouTube shell
+      # asked for in Host, and the Discord web app, each read to the end. The
+      # runner has no DPI, so this proves the plumbing, not a bypass.
+      - name: Volume probes pass through tpws
+        shell: bash
+        run: |
+          bin/darwin/tpws --socks --port 11081 --bind-addr 127.0.0.1 & pid=$!
+          trap 'kill $pid' EXIT
+          sleep 1
+          check() {
+            code=$(curl -s -o /tmp/probe.bin -w '%{http_code}' --max-time 30 --socks5-hostname 127.0.0.1:11081 "$@" || true)
+            echo "${*: -1} -> $code, $(wc -c < /tmp/probe.bin) bytes"
+          }
+          check -H 'Host: www.youtube.com' 'https://redirector.googlevideo.com/?unblock=volume'
+          test "$code" = 200 && grep -qE 'ytcfg|ytInitialData' /tmp/probe.bin
+          check 'https://discord.com/app'
+          test "$code" = 200 && grep -q 'GLOBAL_ENV' /tmp/probe.bin
+
       - name: Build macOS
         uses: nick-fields/retry@v3
         with:
