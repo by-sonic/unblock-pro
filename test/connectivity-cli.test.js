@@ -29,7 +29,7 @@ function responseRequest(status, body, ending = 'end') {
 }
 
 test('HTTP diagnostics reject ISP pages and HTTP errors, and use production service signatures', async () => {
-  const bodies = [Buffer.from('ytcfg = {}'), Buffer.alloc(0), Buffer.from('{"url":"wss://gateway.discord.gg"}'), Buffer.from('89504e470d0a1a0a', 'hex')];
+  const bodies = [Buffer.from('ytcfg = {}'), Buffer.alloc(0), Buffer.from('{"url":"wss://gateway.discord.gg"}'), Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.from('ytcfg = {}'), Buffer.from('window.GLOBAL_ENV = {}')];
   for (const [i, rule] of PROBE_RULES.entries()) {
     const fixture = responseRequest(rule.statuses[0], bodies[i]);
     assert.equal((await probeHttps(rule.url, fixture)).ok, true, rule.kind);
@@ -60,6 +60,25 @@ test('HTTP diagnostics stop reading at the production body sample limit', async 
   assert.equal(result.ok, true);
   assert.equal(result.bytes, BODY_SAMPLE_BYTES);
   assert.equal(fixture.res.destroyed, true);
+});
+
+test('the googlevideo volume probe keeps googlevideo as SNI, asks for the shell and reads to the end', async () => {
+  const rule = PROBE_RULES.find((candidate) => candidate.kind === 'youtube-video-volume');
+  const body = Buffer.alloc(BODY_SAMPLE_BYTES * 3, 32);
+  body.write('ytcfg');
+  let options;
+  const fixture = responseRequest(200, body, null);
+  const result = probeHttps(rule.url, { timeoutMs: 50, request: (url, requestOptions, callback) => {
+    options = requestOptions;
+    return fixture.request(url, requestOptions, callback);
+  } });
+  const settled = await result;
+  assert.equal(options.servername, 'redirector.googlevideo.com');
+  assert.equal(options.headers.Host, 'www.youtube.com');
+  // The body never ended, so a probe that stopped at the sample would have passed.
+  assert.equal(settled.ok, false);
+  assert.equal(settled.error, 'total-timeout');
+  assert.equal((await probeHttps(rule.url, responseRequest(200, body))).ok, true);
 });
 
 function upgradeRequest(valid) {
@@ -107,7 +126,7 @@ test('JSON report covers all four production HTTP endpoints and WebSocket withou
     return { url, ok: true };
   }, gatewayProbe: async () => ({ ok: false, error: 'total-timeout' }) });
   assert.deepEqual(urls, PROBE_RULES.map((rule) => rule.url));
-  assert.equal(report.results.length, 5);
+  assert.equal(report.results.length, PROBE_RULES.length + 1);
   assert.equal(report.allEndpointChecksPassed, false);
   assert.match(report.limitation, /video playback, Discord voice.*not verified/);
   assert.equal(JSON.parse(JSON.stringify(report)).schemaVersion, 1);

@@ -9,6 +9,7 @@ const {
   BODY_SAMPLE_BYTES,
   PROBE_RULES,
   probeLabel,
+  probeRequest,
   validateProbe
 } = require('../src/main/connectivity-probes');
 
@@ -38,11 +39,17 @@ function probeHttps(url, { timeoutMs = TIMEOUT_MS, request = https.get } = {}) {
     };
     // Covers DNS, connection establishment and slow responses, unlike a socket timeout.
     const deadline = setTimeout(() => finish('total-timeout'), timeoutMs);
+    // A volume probe overrides Host but keeps the URL's host as SNI, and is read
+    // to the end: see the youtube-video-volume rule.
+    const { requestHost, wholeBody } = probeRequest(url);
+    const headers = { 'User-Agent': 'Mozilla/5.0 UnblockPro connectivity diagnostics', 'Accept-Encoding': 'identity' };
+    if (requestHost) headers.Host = requestHost;
     try {
       req = request(url, {
         agent: false,
         maxHeaderSize: 16384,
-        headers: { 'User-Agent': 'Mozilla/5.0 UnblockPro connectivity diagnostics', 'Accept-Encoding': 'identity' }
+        servername: new URL(url).hostname,
+        headers
       }, (res) => {
         if (done) { res.destroy(); return; }
         response = res;
@@ -53,7 +60,7 @@ function probeHttps(url, { timeoutMs = TIMEOUT_MS, request = https.get } = {}) {
           const sample = data.subarray(0, BODY_SAMPLE_BYTES - bytes);
           chunks.push(sample);
           bytes += sample.length;
-          if (bytes === BODY_SAMPLE_BYTES) finish();
+          if (bytes === BODY_SAMPLE_BYTES && !wholeBody) finish();
         });
         res.on('end', () => finish());
         res.on('aborted', () => finish('response-aborted'));

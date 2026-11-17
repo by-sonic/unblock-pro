@@ -20,14 +20,16 @@ const {
 
 const YT_HOME = 'https://www.youtube.com/';
 const YT_VIDEO = 'https://redirector.googlevideo.com/';
+const YT_VOLUME = 'https://redirector.googlevideo.com/?unblock=volume';
 const DC_API = 'https://discord.com/api/v10/gateway';
 const DC_CDN = 'https://cdn.discordapp.com/embed/avatars/0.png';
+const DC_APP = 'https://discord.com/app';
 
 const PNG_HEX = '89504e470d0a1a0a0000000d49484452';
 
 test('auto-selection probes the services users actually need', () => {
-  assert.deepEqual(REQUIRED_YOUTUBE_ENDPOINTS, [YT_HOME, YT_VIDEO]);
-  assert.deepEqual(REQUIRED_DISCORD_ENDPOINTS, [DC_API, DC_CDN]);
+  assert.deepEqual(REQUIRED_YOUTUBE_ENDPOINTS, [YT_HOME, YT_VIDEO, YT_VOLUME]);
+  assert.deepEqual(REQUIRED_DISCORD_ENDPOINTS, [DC_API, DC_CDN, DC_APP]);
 });
 
 test('accepts genuine responses from every probed endpoint', () => {
@@ -58,6 +60,45 @@ test('rejects a hijacked googlevideo redirector answering 200', () => {
   // video-delivery host.
   assert.equal(validateProbe(YT_VIDEO, 200, '<html>welcome</html>'), false);
   assert.equal(validateProbe(YT_VIDEO, 404, 'страница заблокирована'), false);
+});
+
+test('googlevideo volume: the YouTube shell must arrive through a googlevideo connection (#84)', () => {
+  const { probeRequest } = require('../src/main/connectivity-probes');
+  // TLS goes to googlevideo, the front is asked for the shell, the whole body counts.
+  assert.deepEqual(probeRequest(YT_VOLUME), { requestHost: 'www.youtube.com', wholeBody: true });
+  assert.deepEqual(probeRequest(YT_VIDEO), { requestHost: null, wholeBody: false });
+  assert.deepEqual(probeRequest('https://example.com/'), { requestHost: null, wholeBody: false });
+
+  // The real shell, including its own blocked_packages_for_sps (#76).
+  const shell = '<title>YouTube</title>' + 'x'.repeat(20000) + 'ytcfg.set({"blocked_packages_for_sps":[]})';
+  assert.equal(validateProbe(YT_VOLUME, 200, shell), true);
+  assert.equal(validateProbe(YT_VOLUME, 200, '<html>welcome</html>'), false);
+  assert.equal(validateProbe(YT_VOLUME, 403, shell), false);
+  // A front that will not serve another host proves only the handshake, as the screen does.
+  assert.equal(validateProbe(YT_VOLUME, 404, 'Not Found'), true);
+  assert.equal(validateProbe(YT_VOLUME, 404, 'страница заблокирована'), false);
+});
+
+test('the PowerShell probe accepts the volume check only as a real shell or a plain 404', () => {
+  const script = buildPowerShellProbeScript();
+  const branch = script.split("'youtube-video-volume' {")[1].split('exit 1')[0];
+  assert.match(branch, /\$status -eq 404 -and -not \$notice/);
+  assert.match(branch, /\$text -imatch 'ytcfg/);
+  assert.ok(script.indexOf('$notice =') < script.indexOf('switch ($Kind)'), '$notice must exist before the switch');
+});
+
+test('Discord volume: the web app shell must arrive in full (#46)', () => {
+  const { probeRequest } = require('../src/main/connectivity-probes');
+  assert.deepEqual(probeRequest(DC_APP), { requestHost: null, wholeBody: true });
+  assert.equal(validateProbe(DC_APP, 200, '<title>Discord</title><script>window.GLOBAL_ENV = {}</script>'), true);
+  assert.equal(validateProbe(DC_APP, 200, '<html>Доступ ограничен</html>'), false);
+  assert.equal(validateProbe(DC_APP, 403, 'window.GLOBAL_ENV'), false);
+});
+
+test('the PowerShell probe reads volume probes to the end', () => {
+  const script = buildPowerShellProbeScript();
+  assert.ok(script.includes("$wholeBody = @('youtube-video-volume', 'discord-app') -contains $Kind"));
+  assert.match(script, /if \(\$wholeBody -and \$total -eq \$sampleBytes\)/);
 });
 
 test('rejects malformed or truncated Discord gateway JSON', () => {
@@ -207,8 +248,8 @@ test('the remaining probes are grouped per service too', () => {
   const { endpointsByService } = require('../src/main/connectivity-probes');
   const full = endpointsByService('full');
 
-  assert.deepEqual(full.youtube, [YT_HOME]);
-  assert.deepEqual(full.discord, [DC_CDN]);
+  assert.deepEqual(full.youtube, [YT_HOME, YT_VOLUME]);
+  assert.deepEqual(full.discord, [DC_CDN, DC_APP]);
 });
 
 test('grouping covers every rule, so no probe is silently dropped', () => {

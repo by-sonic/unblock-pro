@@ -13,14 +13,19 @@
 // Windows batch, which has no Node available). The PowerShell probe is generated
 // from this table so the two can never drift apart.
 
+// Video volume through a googlevideo connection; see the youtube-video-volume rule.
+const YOUTUBE_VIDEO_VOLUME_URL = 'https://redirector.googlevideo.com/?unblock=volume';
+
 const REQUIRED_YOUTUBE_ENDPOINTS = Object.freeze([
   'https://www.youtube.com/',
-  'https://redirector.googlevideo.com/'
+  'https://redirector.googlevideo.com/',
+  YOUTUBE_VIDEO_VOLUME_URL
 ]);
 
 const REQUIRED_DISCORD_ENDPOINTS = Object.freeze([
   'https://discord.com/api/v10/gateway',
-  'https://cdn.discordapp.com/embed/avatars/0.png'
+  'https://cdn.discordapp.com/embed/avatars/0.png',
+  'https://discord.com/app'
 ]);
 
 // Bytes of the body worth reading for validation. Enough for a YouTube shell
@@ -88,6 +93,44 @@ const PROBE_RULES = Object.freeze([
     statuses: Object.freeze([200]),
     // A real CDN asset is a PNG, not an HTML notice.
     hexPrefix: PNG_MAGIC
+  }),
+  Object.freeze({
+    kind: 'youtube-video-volume',
+    service: 'youtube',
+    tier: 'full',  // ~900 KB, like the YouTube shell
+    url: YOUTUBE_VIDEO_VOLUME_URL,
+    label: 'YouTube video (googlevideo, volume)',
+    // The 404 screen above proves only that a googlevideo handshake gets
+    // through. The ISP throttles video by the googlevideo SNI after the
+    // handshake, so a strategy could pass it while video never loaded (#84):
+    // the interface opened and the player spun. Here TLS still goes to
+    // redirector.googlevideo.com, so the DPI treats the connection as video,
+    // but Google's front is asked for the YouTube shell in the Host header and
+    // answers ~900 KB. The whole body has to arrive within the probe timeout.
+    requestHost: 'www.youtube.com',
+    wholeBody: true,
+    statuses: Object.freeze([200, 404]),
+    // A 200 must be the real shell. A 404 means the front declined to serve
+    // another host, or the runtime cannot set Host without changing the SNI
+    // (.NET HttpWebRequest, the elevated Windows batch): it then proves only
+    // the handshake, as the screen probe does, and never less.
+    bodyPattern: 'ytcfg|ytInitialData|<title>[^<]*YouTube'
+  }),
+  Object.freeze({
+    kind: 'discord-app',
+    service: 'discord',
+    tier: 'full',  // ~77 KB
+    url: 'https://discord.com/app',
+    label: 'Discord Web (volume)',
+    // The API answers 35 bytes and the CDN avatar about a kilobyte, both well
+    // under the ~16 KB after which DPI commonly freezes a connection. Then the
+    // checks passed while discord.com did not open in the browser and the
+    // client hung on "Checking for updates" (#46). The web app shell is ~77 KB
+    // and has to arrive in full.
+    wholeBody: true,
+    statuses: Object.freeze([200]),
+    // Its bootstrap config, near the top of the page.
+    bodyPattern: 'GLOBAL_ENV'
   })
 ]);
 
@@ -162,6 +205,7 @@ function validateProbe(url, status, body = '', bodyHex = '') {
   if (!rule) return status >= 200 && status < 400 && !looksLikeBlockNotice(body);
 
   if (!rule.statuses.includes(status)) return false;
+  if (rule.requestHost && status === 404) return !looksLikeBlockNotice(body);
   if (rule.bodyPattern && !matches(rule.bodyPattern, body)) return false;
   if (rule.rejectBodyPattern && matches(rule.rejectBodyPattern, body)) return false;
   if (rule.hexPrefix && !String(bodyHex).toLowerCase().startsWith(rule.hexPrefix)) return false;
@@ -176,6 +220,17 @@ function probeLabel(url) {
 function probeKind(url) {
   const rule = RULES_BY_URL.get(url);
   return rule ? rule.kind : null;
+}
+
+// How a runtime must send the request: `requestHost` goes in the Host header
+// while TLS keeps the URL's host as SNI, and `wholeBody` means the body has to
+// be read to its end rather than to the validation sample.
+function probeRequest(url) {
+  const rule = RULES_BY_URL.get(url);
+  return {
+    requestHost: (rule && rule.requestHost) || null,
+    wholeBody: Boolean(rule && rule.wholeBody)
+  };
 }
 
 // Escapes a value for a single-quoted PowerShell string literal.
@@ -203,6 +258,8 @@ function buildPowerShellProbeScript() {
     '$text = ""',
     '$hex = ""',
     '',
+    `$wholeBody = @(${PROBE_RULES.filter((rule) => rule.wholeBody).map((rule) => psQuote(rule.kind)).join(', ')}) -contains $Kind`,
+    '',
     'function Read-Body($response) {',
     '  $stream = $response.GetResponseStream()',
     '  $buffer = New-Object byte[] $sampleBytes',
@@ -211,6 +268,11 @@ function buildPowerShellProbeScript() {
     '    $read = $stream.Read($buffer, $total, $sampleBytes - $total)',
     '    if ($read -le 0) { break }',
     '    $total += $read',
+    '  }',
+    '  # A volume probe checks that the whole body arrives, not just the sample.',
+    '  if ($wholeBody -and $total -eq $sampleBytes) {',
+    '    $rest = New-Object byte[] 65536',
+    '    while ($stream.Read($rest, 0, $rest.Length) -gt 0) { }',
     '  }',
     '  $stream.Close()',
     '  if ($total -le 0) { return @("", "") }',
@@ -244,13 +306,18 @@ function buildPowerShellProbeScript() {
     '  }',
     '} catch { }',
     '',
+    `$notice = ($text -imatch ${psQuote(NOTICE_TITLE_PATTERN)}) -or ($text.Length -lt ${NOTICE_PAGE_MAX_CHARS} -and $text -imatch ${psQuote(BLOCK_NOTICE_PATTERN)})`,
+    '',
     'switch ($Kind) {'
   ];
 
   for (const rule of PROBE_RULES) {
     const statusList = rule.statuses.map((s) => String(s)).join(', ');
     const checks = [`@(${statusList}) -contains $status`];
-    if (rule.bodyPattern) checks.push(`$text -imatch ${psQuote(rule.bodyPattern)}`);
+    // HttpWebRequest puts its Host into the SNI as well, so the request goes
+    // out without it and the front answers 404: the same proof as the screen.
+    if (rule.requestHost) checks.push(`(($status -eq 404 -and -not $notice) -or $text -imatch ${psQuote(rule.bodyPattern)})`);
+    else if (rule.bodyPattern) checks.push(`$text -imatch ${psQuote(rule.bodyPattern)}`);
     if (rule.rejectBodyPattern) checks.push(`-not ($text -imatch ${psQuote(rule.rejectBodyPattern)})`);
     if (rule.hexPrefix) checks.push(`$hex.ToLower().StartsWith(${psQuote(rule.hexPrefix)})`);
     lines.push(`  ${psQuote(rule.kind)} {`);
@@ -261,7 +328,6 @@ function buildPowerShellProbeScript() {
 
   lines.push('}');
   lines.push('# Custom target: HTTPS response without following redirects.');
-  lines.push(`$notice = ($text -imatch ${psQuote(NOTICE_TITLE_PATTERN)}) -or ($text.Length -lt ${NOTICE_PAGE_MAX_CHARS} -and $text -imatch ${psQuote(BLOCK_NOTICE_PATTERN)})`);
   lines.push('if ($status -ge 200 -and $status -lt 400 -and -not $notice) { exit 0 }');
   lines.push('exit 1');
 
@@ -279,9 +345,11 @@ module.exports = {
   REQUIRED_DISCORD_ENDPOINTS,
   REQUIRED_YOUTUBE_ENDPOINTS,
   buildPowerShellProbeScript,
+  YOUTUBE_VIDEO_VOLUME_URL,
   endpointsByService,
   probeKind,
   probeLabel,
+  probeRequest,
   serviceOfUrl,
   validateProbe
 };
