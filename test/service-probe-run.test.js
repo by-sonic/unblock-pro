@@ -7,8 +7,10 @@ const { runServiceProbes } = require('../src/main/service-probe-run');
 
 const YT_HOME = 'https://www.youtube.com/';
 const YT_VIDEO = 'https://redirector.googlevideo.com/';
+const YT_VOLUME = 'https://redirector.googlevideo.com/?unblock=volume';
 const DC_API = 'https://discord.com/api/v10/gateway';
 const DC_CDN = 'https://cdn.discordapp.com/embed/avatars/0.png';
+const DC_APP = 'https://discord.com/app';
 
 // Builds probe functions that pass exactly the listed urls, and records the
 // order in which they were called.
@@ -21,7 +23,7 @@ function probes(passing, calls = []) {
 }
 
 test('everything passing is a full outcome', async () => {
-  const { screen, full } = probes([YT_HOME, YT_VIDEO, DC_API, DC_CDN]);
+  const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME, DC_API, DC_CDN, DC_APP]);
   const { outcome, failed } = await runServiceProbes({ screen, full });
 
   assert.equal(outcome.level, 'full');
@@ -29,7 +31,7 @@ test('everything passing is a full outcome', async () => {
 });
 
 test('Discord blocked, YouTube fine — a partial result instead of a rejection', async () => {
-  const { screen, full } = probes([YT_HOME, YT_VIDEO]);
+  const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME]);
   const { outcome, failed } = await runServiceProbes({ screen, full });
 
   assert.equal(outcome.level, 'partial');
@@ -38,7 +40,7 @@ test('Discord blocked, YouTube fine — a partial result instead of a rejection'
 });
 
 test('YouTube blocked, Discord fine — the mirror case is also partial', async () => {
-  const { screen, full } = probes([DC_API, DC_CDN]);
+  const { screen, full } = probes([DC_API, DC_CDN, DC_APP]);
   const { outcome } = await runServiceProbes({ screen, full });
 
   assert.deepEqual(outcome.services, { youtube: false, discord: true });
@@ -46,7 +48,7 @@ test('YouTube blocked, Discord fine — the mirror case is also partial', async 
 
 test('a service that fails screening does not pay for the expensive probe', async () => {
   const calls = [];
-  const { screen, full } = probes([DC_API, DC_CDN], calls);
+  const { screen, full } = probes([DC_API, DC_CDN, DC_APP], calls);
   await runServiceProbes({ screen, full });
 
   assert.ok(calls.includes(YT_VIDEO), 'дешёвая проба YouTube всё же выполняется');
@@ -63,7 +65,7 @@ test('when both services fail screening nothing else runs at all', async () => {
 });
 
 test('a failing gateway WebSocket disqualifies Discord even when HTTP passed', async () => {
-  const { screen, full } = probes([YT_HOME, YT_VIDEO, DC_API, DC_CDN]);
+  const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME, DC_API, DC_CDN, DC_APP]);
   const { outcome, failed } = await runServiceProbes({
     screen,
     full,
@@ -77,7 +79,7 @@ test('a failing gateway WebSocket disqualifies Discord even when HTTP passed', a
 
 test('the gateway check is skipped when Discord is already out', async () => {
   let called = false;
-  const { screen, full } = probes([YT_HOME, YT_VIDEO]);
+  const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME]);
   await runServiceProbes({
     screen,
     full,
@@ -91,12 +93,12 @@ test('failures are reported by human label, for the log and the error text', asy
   const { screen, full } = probes([YT_VIDEO, DC_API]);
   const { failed } = await runServiceProbes({ screen, full });
 
-  assert.deepEqual(failed.sort(), ['Discord CDN', 'YouTube Web']);
+  assert.deepEqual(failed.sort(), ['Discord CDN', 'Discord Web (volume)', 'YouTube Web', 'YouTube video (googlevideo, volume)']);
 });
 
 test('what is logged names the probes that failed', async () => {
   const entries = [];
-  const { screen, full } = probes([YT_HOME, YT_VIDEO]);
+  const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME]);
   await runServiceProbes({ screen, full, log: (e) => entries.push(e) });
 
   assert.equal(entries.length, 1);
@@ -106,7 +108,7 @@ test('what is logged names the probes that failed', async () => {
 
 test('a clean run logs nothing', async () => {
   const entries = [];
-  const { screen, full } = probes([YT_HOME, YT_VIDEO, DC_API, DC_CDN]);
+  const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME, DC_API, DC_CDN, DC_APP]);
   await runServiceProbes({ screen, full, log: (e) => entries.push(e) });
 
   assert.deepEqual(entries, []);

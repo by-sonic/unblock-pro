@@ -49,6 +49,7 @@ const {
   PROBE_TIMEOUTS,
   PATIENT_TIMEOUTS,
   buildPowerShellProbeScript,
+  probeRequest,
   validateProbe
 } = require('./connectivity-probes');
 const {
@@ -1931,6 +1932,9 @@ function testSingleConnection(port, timeoutSec, url) {
       `unblock-probe-${process.pid}-${probeCounter++}.bin`
     );
     const cleanup = () => { try { fs.unlinkSync(bodyFile); } catch (e) {} };
+    // curl keeps the URL's host as SNI when Host is overridden, which is what
+    // the googlevideo volume probe needs. It always reads the whole body.
+    const { requestHost } = probeRequest(url);
 
     execFile(
       'curl',
@@ -1940,6 +1944,7 @@ function testSingleConnection(port, timeoutSec, url) {
         '--max-time', String(timeoutSec + 5),
         '-s', '-o', bodyFile,
         '-w', '%{http_code}',
+        ...(requestHost ? ['-H', `Host: ${requestHost}`] : []),
         url
       ],
       { timeout: (timeoutSec + 8) * 1000 },
@@ -1977,22 +1982,29 @@ function testSingleDirectConnection(url, timeoutSec = 10) {
 
     try {
       const urlObj = new URL(url);
+      const { requestHost, wholeBody } = probeRequest(url);
+      const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' };
+      if (requestHost) headers.Host = requestHost;
       req = https.get({
         hostname: urlObj.hostname,
+        // Node takes the SNI from a Host header when there is one; the volume
+        // probe needs it from the URL.
+        servername: urlObj.hostname,
         path: urlObj.pathname + urlObj.search,
         family: 4, lookup: ipv4Lookup,
         timeout: timeoutSec * 1000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
+        headers
       }, (res) => {
         // Read a bounded sample so the body can be validated, then stop early —
-        // a status code alone does not prove the real service answered.
+        // a status code alone does not prove the real service answered. A
+        // volume probe keeps reading to the end: the volume is what it checks.
         const chunks = [];
         let size = 0;
         res.on('data', (chunk) => {
           if (size >= BODY_SAMPLE_BYTES) return;
           chunks.push(chunk);
           size += chunk.length;
-          if (size >= BODY_SAMPLE_BYTES) {
+          if (size >= BODY_SAMPLE_BYTES && !wholeBody) {
             res.destroy();
           }
         });
