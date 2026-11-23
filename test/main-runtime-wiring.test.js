@@ -103,7 +103,7 @@ function startLifecycle(overrides = {}) {
   assert.ok(start >= 0 && end > start && stopStart >= 0 && stopEnd > stopStart);
   const context = vm.createContext({
     stopPromise: null, cleanupFailed: false, isSearching: false, searchCompletion: null,
-    quitRequested: false, quicBlockEnabled: false, pfEnableToken: null, originalDnsSettings: {},
+    quitRequested: false, quicBlockEnabled: false, pfEnableToken: null, macNetworkSettings: null,
     isConnected: false, cancelRequested: false, activeTargetUrl: '', lastError: null, lastErrorCode: null,
     updateTrayMenu: () => {}, sendStatus: () => {}, sendLog: () => {},
     loadSettings: () => ({}), normalizeTargetUrl: (value) => value,
@@ -186,20 +186,18 @@ test('cleanup invoked inside a failed search does not wait for itself and preser
 
 test('an early failed search restores already-applied network changes even without cancellation', async () => {
   let cleaned = 0;
+  let pending = false;
   const context = startLifecycle({
+    macNetworkSettings: { hasPending: () => pending },
     runProxyStartAttempt: async () => {
-      context.quicBlockEnabled = true;
-      context.pfEnableToken = '1234';
-      context.originalDnsSettings = { WiFi: 'original' };
+      pending = true;
       context.lastError = 'Port 1080 is occupied';
       context.lastErrorCode = 'PORT_IN_USE';
       return { success: false, error: context.lastError };
     },
     performStopProxy: async () => {
       cleaned++;
-      context.quicBlockEnabled = false;
-      context.pfEnableToken = null;
-      context.originalDnsSettings = {};
+      pending = false;
       context.lastError = null;
       context.lastErrorCode = null;
       return { success: true };
@@ -208,7 +206,7 @@ test('an early failed search restores already-applied network changes even witho
   await context.startProxy();
   assert.equal(cleaned, 1);
   assert.equal(context.lastErrorCode, 'PORT_IN_USE');
-  assert.equal(context.quicBlockEnabled, false);
+  assert.equal(pending, false);
 });
 
 test('quit prevents a new start both immediately and after an already-pending cleanup', async () => {

@@ -21,6 +21,7 @@ const {
 const { copyFileResilient } = require('./safe-copy');
 const { inspectProtectedWindowsRuntime, systemPowerShellPath } = require('./windows-protected-runtime');
 const { runMacCleanup, runMacConnect } = require('./macos-cleanup');
+const { createMacNetworkSettings, listNetworkServices, networkSetup } = require('./mac-network-settings');
 const { DEFAULT_PROXY_PORT, normalizeProxyPort, resolveProxyPort } = require('./proxy-port');
 const { appendLogLine, buildLogReport, readLogTail } = require('./log-report');
 const {
@@ -1816,21 +1817,19 @@ async function disableQuicBlock(hostsCleanup = null) {
 
 // ============= SYSTEM PROXY (macOS) =============
 
-let proxyEnabledServices = [];
-let originalDnsSettings = {};
+const macNetworkSettings = process.platform === 'darwin'
+  ? createMacNetworkSettings(path.join(app.getPath('userData'), 'mac-network-restore.json'))
+  : null;
 
 function getActiveNetworkServices() {
   if (process.platform !== 'darwin') return [];
   try {
-    const output = execSync('networksetup -listallnetworkservices', { encoding: 'utf8', stdio: 'pipe' });
-    const allServices = output.split('\n')
-      .filter(line => line.trim() && !line.startsWith('An asterisk'))
-      .map(line => line.trim());
+    const allServices = listNetworkServices().filter(line => !line.startsWith('*'));
     
     const active = [];
     for (const service of allServices) {
       try {
-        const info = execSync(`networksetup -getinfo "${service}"`, { encoding: 'utf8', stdio: 'pipe' });
+        const info = networkSetup('-getinfo', service);
         // Service is active if it has a real IP address
         if (/IP address:\s*\d+\.\d+\.\d+\.\d+/.test(info)) {
           active.push(service);
@@ -1843,60 +1842,21 @@ function getActiveNetworkServices() {
   }
 }
 
-function enableSystemProxy(port = tpwsPort) {
-  if (process.platform !== 'darwin') return;
+function enableSystemProxy(port) {
   const services = getActiveNetworkServices();
-  proxyEnabledServices = [];
-  
-  for (const service of services) {
-    try {
-      execSync(`networksetup -setsocksfirewallproxy "${service}" 127.0.0.1 ${port}`, { stdio: 'pipe' });
-      execSync(`networksetup -setsocksfirewallproxystate "${service}" on`, { stdio: 'pipe' });
-      proxyEnabledServices.push(service);
-    } catch (e) {}
+  const { applied } = macNetworkSettings.setProxy(services, port);
+  if (applied < services.length) {
+    sendLog({ type: 'warning', message: 'Не для всех активных служб удалось настроить SOCKS-прокси' });
   }
+  return applied > 0;
 }
 
-function disableSystemProxy() {
-  if (process.platform !== 'darwin') return;
-  const services = [...new Set([...proxyEnabledServices, ...getActiveNetworkServices()])];
-  
-  for (const service of services) {
-    try {
-      execSync(`networksetup -setsocksfirewallproxystate "${service}" off`, { stdio: 'pipe' });
-    } catch (e) {}
+function logPendingNetworkRestore(result) {
+  if (result?.pendingService) {
+    sendLog({ type: 'warning', message: 'Сетевая служба с сохранёнными настройками SOCKS-прокси или DNS недоступна. Если она была переименована, верните исходное имя и повторите отключение' });
   }
-  proxyEnabledServices = [];
-}
-
-function setCleanDns(services) {
-  if (process.platform !== 'darwin') return;
-  originalDnsSettings = {};
-  for (const service of services) {
-    try {
-      const info = execSync(`networksetup -getdnsservers "${service}"`, { encoding: 'utf8', stdio: 'pipe' }).trim();
-      originalDnsSettings[service] = info;
-      execSync(`networksetup -setdnsservers "${service}" 1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4`, { stdio: 'pipe' });
-    } catch (e) {}
-  }
-}
-
-function restoreDns() {
-  if (process.platform !== 'darwin') return;
-  // Restore only services changed by this session. Repeated quit/cleanup must
-  // never reset unrelated custom DNS to DHCP after the snapshot was consumed.
-  const services = Object.keys(originalDnsSettings);
-  for (const service of services) {
-    try {
-      const orig = originalDnsSettings[service];
-      if (orig && !orig.includes("aren't any") && !orig.includes('Error')) {
-        const servers = orig.split('\n').map(s => s.trim()).filter(Boolean).join(' ');
-        execSync(`networksetup -setdnsservers "${service}" ${servers}`, { stdio: 'pipe' });
-      } else {
-        execSync(`networksetup -setdnsservers "${service}" Empty`, { stdio: 'pipe' });
-      }
-      delete originalDnsSettings[service];
-    } catch (e) {}
+  if (result?.pendingLocation) {
+    sendLog({ type: 'warning', message: 'Для восстановления SOCKS-прокси или DNS выберите исходное сетевое размещение и повторите отключение' });
   }
 }
 
@@ -2424,7 +2384,7 @@ async function startProxy() {
   } finally {
     // A cancelled search may still have an outstanding elevation callback.
     try {
-      if (!isConnected && (cancelRequested || quicBlockEnabled || pfEnableToken !== null || Object.keys(originalDnsSettings).length > 0)) {
+      if (!isConnected && (cancelRequested || quicBlockEnabled || pfEnableToken !== null || macNetworkSettings?.hasPending())) {
         const error = lastError;
         const errorCode = lastErrorCode;
         const cleanup = await stopProxy();
@@ -2529,8 +2489,11 @@ async function runProxyStartAttempt() {
     if (!runCheck.ok) return await failMacRuntime(runCheck.reason);
 
     // Set clean DNS (1.1.1.1, 8.8.8.8) to avoid ISP DNS poisoning for Discord
-    setCleanDns(services);
-    sendLog({ type: 'info', message: 'DNS установлен на 1.1.1.1 / 8.8.8.8 (защита от подмены)' });
+    const dnsSettings = macNetworkSettings.setDns(services);
+    if (dnsSettings.changed) sendLog({ type: 'info', message: 'DNS установлен на 1.1.1.1 / 8.8.8.8 (защита от подмены)' });
+    if (dnsSettings.applied < services.length) {
+      sendLog({ type: 'warning', message: 'Не для всех активных служб удалось настроить DNS' });
+    }
     // Block QUIC (UDP 443) so YouTube uses TCP which goes through tpws, and put
     // the hosts block in place: one password dialog for both.
     await prepareMacSystem();
@@ -2803,10 +2766,8 @@ async function runProxyStartAttempt() {
           continue; // tpws not listening, skip this strategy
         }
 
-        // Enable system SOCKS proxy so all traffic goes through tpws
-        enableSystemProxy(tpwsPort);
-
-        // Actually test what works through the proxy, service by service.
+        // The probes use the local SOCKS port directly. Update system proxy
+        // preferences once, when the candidate is ready to carry user traffic.
         const { outcome, failed } = await testProxyConnection(tpwsPort, timeouts);
         tallyFailures(probeFailures, failed);
 
@@ -2814,7 +2775,6 @@ async function runProxyStartAttempt() {
         // in the meantime. Committing now would switch the system proxy back on
         // behind their back.
         if (cancelRequested) {
-          disableSystemProxy();
           proxyProcess = null;
           await terminateChild(child);
           break;
@@ -2824,7 +2784,6 @@ async function runProxyStartAttempt() {
         // outcome or save it for partial replay once its process is gone.
         const repeatedCrash = macCrashGuard.record(child);
         if (hasExited(child)) {
-          disableSystemProxy();
           if (generation === proxyGeneration) proxyProcess = null;
           const reason = describeChildExit(child, stderrTail);
           sendLog({ type: 'warning', message: `${strategy.name}: процесс завершился во время проверки — ${reason}` });
@@ -2833,6 +2792,14 @@ async function runProxyStartAttempt() {
         }
 
         if (isAcceptable(outcome, acceptPartial)) {
+          if (!enableSystemProxy(tpwsPort)) {
+            const cleanup = await stopProxy();
+            if (!cleanup.success) return cleanup;
+            lastError = 'Не удалось настроить системный SOCKS-прокси для активного подключения';
+            lastErrorCode = 'SYSTEM_PROXY_FAILED';
+            sendLog({ type: 'error', message: lastError });
+            return { success: false, error: lastError };
+          }
           commitConnectedStrategy(strategy.name, outcome);
           sendStatus({ searching: false });
           return { success: true, strategy: strategy.name, outcome };
@@ -2847,7 +2814,6 @@ async function runProxyStartAttempt() {
           } else {
             sendLog({ type: 'warning', message: `${strategy.name}: не прошла проверку соединения` });
           }
-          disableSystemProxy();
           proxyProcess = null;
           await terminateChild(child);
           continue;
@@ -3011,11 +2977,8 @@ async function performStopProxy() {
     try { fs.writeFileSync(elevatedCancelFile, 'cancel', 'ascii'); } catch (e) {}
   }
 
-  // Disable system proxy FIRST (before killing tpws)
-  disableSystemProxy();
-  
-  // Restore original DNS settings
-  restoreDns();
+  // Restore the system proxy before killing its listener.
+  const networkCleanup = macNetworkSettings?.restore() || { ok: true };
 
   // Take our Discord block back out of hosts. Prepared unelevated so that when
   // there is no block the elevated step below is skipped entirely.
@@ -3057,16 +3020,16 @@ async function performStopProxy() {
   connectedSince = null;
   strategyProgress = null;
   const cleanup = await macCleanup;
-  const dnsPending = Object.keys(originalDnsSettings).length > 0;
-  cleanupFailed = !cleanup.ok || !windowsCleanup.ok || dnsPending;
+  cleanupFailed = !cleanup.ok || !windowsCleanup.ok || !networkCleanup.ok;
   if (cleanupFailed) {
-    lastError = cleanup.error || windowsCleanup.error || (dnsPending ? 'Не удалось восстановить исходные DNS. Повторите отключение.' : 'Не удалось восстановить системные настройки');
+    lastError = cleanup.error || windowsCleanup.error || networkCleanup.error || 'Не удалось восстановить системные настройки';
     lastErrorCode = 'CLEANUP_FAILED';
     updateTrayMenu();
     sendStatus();
     return { success: false, error: lastError };
   }
   clearError();
+  logPendingNetworkRestore(networkCleanup);
   updateTrayMenu();
   sendLog({ type: 'info', message: 'Отключено пользователем' });
   sendStatus();
@@ -3723,9 +3686,8 @@ if (!gotTheLock) {
   // ============= APP LIFECYCLE =============
 
   app.whenReady().then(async () => {
-    // Clean up stale proxy/DNS settings from previous crash
-    disableSystemProxy();
-    restoreDns();
+    // Interrupted sessions leave their original proxy and DNS values on disk.
+    const recoveredNetwork = macNetworkSettings?.restore();
     
     createWindow();
     createTray();
@@ -3733,6 +3695,14 @@ if (!gotTheLock) {
     // Send initial status
     const binaryExists = fs.existsSync(getBinaryPath() || '');
     sendLog({ type: 'info', message: 'Приложение запущено' });
+    if (recoveredNetwork && !recoveredNetwork.ok) {
+      cleanupFailed = true;
+      lastError = recoveredNetwork.error;
+      lastErrorCode = 'CLEANUP_FAILED';
+      sendLog({ type: 'warning', message: lastError });
+    } else {
+      logPendingNetworkRestore(recoveredNetwork);
+    }
     sendStatus({ binaryExists });
     
     // Setup auto-updater
@@ -3791,8 +3761,7 @@ if (!gotTheLock) {
 
   // Ensure proxy cleanup on any exit scenario
   function emergencyCleanup() {
-    try { disableSystemProxy(); } catch (e) {}
-    try { restoreDns(); } catch (e) {}
+    try { macNetworkSettings?.restore(); } catch (e) {}
     // Normal quit awaits privileged cleanup in before-quit. The process exit
     // event cannot await a password dialog, so do not report false success here.
     try { stopWinwsMonitor(); } catch (e) {}
