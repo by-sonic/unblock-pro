@@ -2,7 +2,7 @@ name: Verify released macOS Firefox and SOCKS behaviour
 on:
   push:
     branches: [qa/macos-firefox-issues-20261122]
-    paths: ['qa/firefox.py', 'qa/settings.py', '.github/workflows/macos-issue-validation.yml']
+    paths: ['qa/firefox.py', 'qa/settings.py', 'qa/services.py', '.github/workflows/macos-issue-validation.yml']
 permissions:
   contents: read
 jobs:
@@ -61,3 +61,9 @@ jobs:
           ditto -x -k "$RUNNER_TEMP/UnblockPro-2.0.31-mac-x64.zip" "$RUNNER_TEMP/unpacked"
           "$RUNNER_TEMP/webdriver/bin/pip" -q install playwright
           "$RUNNER_TEMP/webdriver/bin/python" qa/settings.py
+      - name: Observe actual YouTube playback and Discord web access from this runner
+        if: success() || failure()
+        run: '"$RUNNER_TEMP/webdriver/bin/python" qa/services.py'
+      - name: Count app elevation requests for real pf and hosts changes and restoration on isolated macOS
+        if: success() || failure()
+        run: node qa/authorization.js

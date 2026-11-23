@@ -33,6 +33,12 @@ with sync_playwright() as client:
             field = page.locator("#proxyPort")
             expect(field).to_be_visible(timeout=20000)
             if visit == 1:
+                page.locator("#logsToggle").click()
+                page.locator("#logsCopy").click()
+                expect(page.locator("#logsCopyLabel")).to_contain_text("Скопирован")
+                clipboard = subprocess.check_output(["/usr/bin/pbpaste"]).decode()
+                assert "UnblockPro" in clipboard and "macOS" in clipboard and "Стратегия:" in clipboard
+                print("Copied app report through visible log controls into the macOS clipboard", flush=True)
                 field.fill("38481")
                 page.locator("#savePortBtn").click()
                 expect(page.locator("#portMessage")).to_contain_text("Сохранено. Порт 38481")
@@ -42,4 +48,8 @@ with sync_playwright() as client:
                 print("Packaged UI reopened with 38481 in the port field", flush=True)
         finally:
             process.terminate()
-            process.wait(timeout=20)
+            try:
+                process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=4)
