@@ -64,6 +64,19 @@ test('when both services fail screening nothing else runs at all', async () => {
   assert.deepEqual(calls.sort(), [DC_API, YT_VIDEO].sort());
 });
 
+test('slow screening of one service does not delay the other service', async () => {
+  const pending = new Map();
+  const result = runServiceProbes({
+    screen: (url) => new Promise((resolve) => pending.set(url, resolve)),
+    full: () => assert.fail('full probes should be skipped after failed screening')
+  });
+
+  assert.deepEqual([...pending.keys()].sort(), [YT_VIDEO, DC_API].sort());
+  pending.get(DC_API)(false);
+  pending.get(YT_VIDEO)(false);
+  assert.deepEqual((await result).failed, ['YouTube video (googlevideo)', 'Discord API']);
+});
+
 test('a failing gateway WebSocket disqualifies Discord even when HTTP passed', async () => {
   const { screen, full } = probes([YT_HOME, YT_VIDEO, YT_VOLUME, DC_API, DC_CDN, DC_APP]);
   const { outcome, failed } = await runServiceProbes({
