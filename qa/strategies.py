@@ -8,6 +8,8 @@ import time
 
 directory = Path(os.environ["RUNNER_TEMP"])
 (directory / "list-all.txt").write_text("example.com\n")
+(directory / "list-general.txt").write_text("example.com\n")
+(directory / "list-discord.txt").write_text("discord.com\n")
 (directory / "list-exclude.txt").write_text("localhost\n")
 js = """
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
