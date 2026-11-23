@@ -15,7 +15,8 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 
 directory = Path(os.environ["RUNNER_TEMP"])
-hostname = "example.com"
+hostname = "raw.githubusercontent.com"
+url = "https://" + hostname + "/by-sonic/unblock-pro/28c43e98fe8ab49a759b1351755a548970d0a14d/README.md"
 relay_port = 38481
 runtime_port = 38482
 
@@ -38,7 +39,7 @@ class Relay(socketserver.BaseRequestHandler):
                         if source is self.request:
                             if len(prefix) < 300:
                                 prefix = (prefix + data)[:300]
-                                if prefix.startswith(b"\x04\x01") and prefix[4:7] == b"\0\0\0" and prefix[7:8] != b"\0" and b"example.com\0" in prefix:
+                                if prefix.startswith(b"\x04\x01") and prefix[4:7] == b"\0\0\0" and prefix[7:8] != b"\0" and hostname.encode() + b"\0" in prefix:
                                     self.server.saw_hostname.set()
                             target.sendall(data)
                         else:
@@ -69,13 +70,14 @@ def check_version(release, expected, relay):
         with webdriver.Firefox(options=opts, service=Service(str(directory / "geckodriver"))) as driver:
             driver.set_page_load_timeout(28)
             try:
-                driver.get("https://example.com/?unblockpro=issue81-" + release)
-                success = driver.title == "Example Domain" and "Example Domain" in driver.find_element("tag name","body").text
+                driver.get(url)
+                body = driver.find_element("tag name","body").text
+                success = "ROSEVPN-BANNER-END" in body and "# UnblockPro" in body
             except WebDriverException as err:
                 print("Page load:", err.msg.splitlines()[0], flush=True)
                 success = False
-            print(f"release={release} firefox={driver.capabilities['browserVersion']} nondefault_port={relay_port} title={driver.title!r} SOCKS4a_example_com={relay.saw_hostname.is_set()} loaded={success}", flush=True)
-            assert relay.saw_hostname.is_set(), "Did not see Firefox send example.com in a SOCKS4a CONNECT via the system proxy"
+            print(f"release={release} firefox={driver.capabilities['browserVersion']} nondefault_port={relay_port} title={driver.title!r} SOCKS4a_host={hostname} observed={relay.saw_hostname.is_set()} repo_readme_loaded={success}", flush=True)
+            assert relay.saw_hostname.is_set(), "Did not see Firefox request our repository host in a SOCKS4a CONNECT via the system proxy"
             assert success == expected, f"Browser result for {release} differed from expectation"
     finally:
         proc.terminate()
