@@ -11,9 +11,11 @@ const run = vm.runInNewContext('let probeCounter = 0;\n' + readAndTest + '\ntest
   path:require('node:path'), execFile:require('node:child_process').execFile
 });
 async function main() {
+  require('node:assert/strict').throws(() => normalizeTargetUrl('youtube.com'), /Некорректный URL/);
+  console.log('Format: bare youtube.com rejected as expected; the UI asks for an HTTPS URL');
   const screen = (url) => run(38486, methods.PROBE_TIMEOUTS.screenTimeoutSec, url);
   const full = (url) => run(38486, methods.PROBE_TIMEOUTS.fullTimeoutSec, url);
-  for (const targetUrl of [normalizeTargetUrl('youtube.com'), normalizeTargetUrl('www.youtube.com/?issue=76'), '']) {
+  for (const targetUrl of [normalizeTargetUrl('https://youtube.com/'), normalizeTargetUrl('https://www.youtube.com/?issue=76'), '']) {
     console.log(JSON.stringify({targetUrl: targetUrl || '(default)', ...(await runServiceProbes({screen, full, targetUrl}))}));
   }
 }
