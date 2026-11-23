@@ -1,0 +1,19 @@
+name: Check released ARM runtimes on macOS 27
+on:
+  push:
+    branches: [qa/macos-firefox-issues-20261122]
+    paths: ['qa/arm-validation.sh', 'qa/strategies.py', '.github/workflows/macos-27-runtime.yml']
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: xcode-27
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test ordinary domain resolution and listen on every release strategy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash qa/arm-validation.sh

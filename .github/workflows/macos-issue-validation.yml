@@ -2,6 +2,7 @@ name: Verify released macOS Firefox and SOCKS behaviour
 on:
   push:
     branches: [qa/macos-firefox-issues-20261122]
+    paths: ['qa/firefox.py', 'qa/settings.py', '.github/workflows/macos-issue-validation.yml']
 permissions:
   contents: read
 jobs:
