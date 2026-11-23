@@ -55,3 +55,8 @@ jobs:
         run: |
           sw_vers
           "$RUNNER_TEMP/webdriver/bin/python" qa/firefox.py
+      - name: Save the alternative port in the packaged app and verify it after restarting
+        run: |
+          ditto -x -k "$RUNNER_TEMP/UnblockPro-2.0.31-mac-x64.zip" "$RUNNER_TEMP/unpacked"
+          "$RUNNER_TEMP/webdriver/bin/pip" -q install playwright
+          "$RUNNER_TEMP/webdriver/bin/python" qa/settings.py
