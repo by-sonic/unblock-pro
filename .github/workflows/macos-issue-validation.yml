@@ -8,6 +8,8 @@ permissions:
 jobs:
   firefox:
     runs-on: macos-15-intel
+    env:
+      QA_RELEASE: 2.0.33
     timeout-minutes: 22
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +20,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd "$RUNNER_TEMP"
-          for v in 2.0.26 2.0.31; do
+          for attempt in {1..24}; do
+            if gh release view "v$QA_RELEASE" -R by-sonic/unblock-pro --json assets --jq '.assets | length' | grep -qx 12; then break; fi
+            sleep 10
+          done
+          for v in 2.0.26 "$QA_RELEASE"; do
             file="UnblockPro-$v-mac-x64.zip"
             gh release download "v$v" -R by-sonic/unblock-pro -p "$file"
             sha=$(gh release view "v$v" -R by-sonic/unblock-pro --json assets --jq ".assets[] | select(.name==\"$file\") | .digest")
@@ -28,10 +34,14 @@ jobs:
             file "tpws-$v"
             codesign --verify "tpws-$v"
           done
+      - name: Use the shipped application source and its own test suite
+        run: |
+          git fetch --depth=1 origin "refs/tags/v$QA_RELEASE"
+          git restore --source FETCH_HEAD -- src scripts test
       - name: Qualify macOS app strategy arguments, custom target, recovery and privilege request count
         run: |
-          node --test test/proxy-port.test.js test/macos-cleanup.test.js test/mac-network-settings.test.js test/custom-target.test.js test/connectivity-probes.test.js
-          node scripts/check-mac-runtime.js "$RUNNER_TEMP/tpws-2.0.31"
+          node --test test/proxy-port.test.js test/macos-cleanup.test.js test/mac-network-settings.test.js test/custom-target.test.js test/connectivity-probes.test.js test/service-probe-run.test.js test/strategy-outcome.test.js
+          node scripts/check-mac-runtime.js "$RUNNER_TEMP/tpws-$QA_RELEASE"
           python3 qa/strategies.py
       - name: Prepare real Firefox and WebDriver before switching system proxy
         env:
@@ -58,7 +68,7 @@ jobs:
           "$RUNNER_TEMP/webdriver/bin/python" qa/firefox.py
       - name: Save the alternative port in the packaged app and verify it after restarting
         run: |
-          ditto -x -k "$RUNNER_TEMP/UnblockPro-2.0.31-mac-x64.zip" "$RUNNER_TEMP/unpacked"
+          ditto -x -k "$RUNNER_TEMP/UnblockPro-$QA_RELEASE-mac-x64.zip" "$RUNNER_TEMP/unpacked"
           "$RUNNER_TEMP/webdriver/bin/pip" -q install playwright
           "$RUNNER_TEMP/webdriver/bin/python" qa/settings.py
       - name: Observe actual YouTube playback and Discord web access from this runner

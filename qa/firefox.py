@@ -107,7 +107,7 @@ with Listener(("127.0.0.1", relay_port), Relay) as listener:
         print(sc, flush=True)
         assert re.search(r"SOCKSEnable\s*:\s*1", sc) and str(relay_port) in sc
         check_version("2.0.26", False, listener)
-        check_version("2.0.31", True, listener)
+        check_version(os.environ["QA_RELEASE"], True, listener)
     finally:
         settings("restore", name)
         after = command("/usr/sbin/networksetup", "-getsocksfirewallproxy", name)

@@ -23,8 +23,9 @@ const code = main.match(/^function buildDarwinStrategies\\(listsDir\\) \\{[\\s\\
 console.log(JSON.stringify(vm.runInNewContext(code + ';buildDarwinStrategies(dir)', {path, tpwsPort:38486, dir}).find(s => s.name === 'combined-v6').args));
 """
 args = json.loads(subprocess.check_output(["node", "-e", js], text=True))
-proc = subprocess.Popen([directory / "tpws-2.0.31", "--bind-addr=127.0.0.1", *args], stdout=subprocess.DEVNULL)
+proc = subprocess.Popen([directory / ("tpws-" + os.environ["QA_RELEASE"]), "--bind-addr=127.0.0.1", *args], stdout=subprocess.DEVNULL)
 try:
+    subprocess.run(["node", "qa/service-checks.js"], check=True)
     opts = Options()
     opts.binary_location = os.environ["FIREFOX_BIN"]
     opts.add_argument("-headless")
@@ -60,6 +61,18 @@ error:document.querySelector('.ytp-error-content-wrap, ytd-player-error-message-
                         break
                     time.sleep(3)
                 print("YouTube Firefox player samples:", json.dumps(samples, ensure_ascii=False), flush=True)
+            if label == "discord":
+                hello = driver.execute_async_script("""
+const done=arguments[arguments.length-1];
+const ws=new WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
+let settled=false;
+function finish(value) { if(settled) return; settled=true; ws.close(); done(value); }
+ws.onmessage=e=>{ const msg=JSON.parse(e.data);
+  finish({op:msg.op, heartbeat_interval:msg.d?.heartbeat_interval || null}); };
+ws.onerror=()=>finish({error:'Connection failed'});
+setTimeout(()=>finish({error:'No HELLO before timeout'}),8000);
+""")
+                print("Discord public WebSocket HELLO:", json.dumps(hello), flush=True)
             print(label, "page:", driver.title, "visible text:", driver.find_element("tag name", "body").text[:230], flush=True)
             assert proc.poll() is None
 finally:
