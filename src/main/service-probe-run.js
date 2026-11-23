@@ -30,10 +30,13 @@ async function runServiceProbes({ screen, full, targetUrl = '', shouldAbort = ()
   const alive = {};
 
   const screening = endpointsByService('screen');
-  for (const service of SERVICES) {
+  // Both screens are tiny. If both hang, pay their timeout only once.
+  const screens = await Promise.all(SERVICES.map(async (service) => {
     const urls = screening[service] || [];
     const results = await Promise.all(urls.map((url) => screen(url)));
-    const bad = urls.filter((_, i) => !results[i]);
+    return { service, bad: urls.filter((_, i) => !results[i]) };
+  }));
+  for (const { service, bad } of screens) {
     for (const url of bad) failed.push(probeLabel(url));
     alive[service] = bad.length === 0;
   }
