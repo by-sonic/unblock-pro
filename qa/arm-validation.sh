@@ -1,7 +1,7 @@
 set -euo pipefail
 sw_vers
 sysctl -n machdep.cpu.brand_string
-for v in 2.0.20 2.0.23 2.0.33; do
+for v in 2.0.20 2.0.21 2.0.23 2.0.33; do
   file="UnblockPro-$v-mac-arm64.zip"
   gh release download "v$v" -R by-sonic/unblock-pro -p "$file" -D "$RUNNER_TEMP"
   sha=$(gh release view "v$v" -R by-sonic/unblock-pro --json assets --jq ".assets[] | select(.name==\"$file\") | .digest")
