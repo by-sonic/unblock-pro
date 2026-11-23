@@ -22,47 +22,13 @@ function loadFunctions(names, bindings) {
   return context;
 }
 
-test('restoreDns restores only tracked snapshots and does nothing on repeated cleanup', () => {
-  const calls = [];
-  const context = loadFunctions(['restoreDns'], {
-    process: { platform: 'darwin' },
-    originalDnsSettings: { 'Wi-Fi': '9.9.9.9\n149.112.112.112\n', Ethernet: "There aren't any DNS Servers set on Ethernet." },
-    getActiveNetworkServices: () => { throw new Error('must not discover or alter untracked services'); },
-    execSync: (command) => calls.push(command)
-  });
-  context.restoreDns();
-  assert.deepEqual(calls, [
-    'networksetup -setdnsservers "Wi-Fi" 9.9.9.9 149.112.112.112',
-    'networksetup -setdnsservers "Ethernet" Empty'
-  ]);
-  assert.equal(Object.keys(context.originalDnsSettings).length, 0);
-  context.restoreDns();
-  assert.equal(calls.length, 2, 'a consumed snapshot must not reset DNS to DHCP');
-});
-
-test('restoreDns retains a failed snapshot for a later successful retry', () => {
-  let fail = true;
-  const context = loadFunctions(['restoreDns'], {
-    process: { platform: 'darwin' },
-    originalDnsSettings: { 'Wi-Fi': '9.9.9.9' },
-    execSync: () => { if (fail) throw new Error('permission denied'); }
-  });
-  context.restoreDns();
-  assert.equal(context.originalDnsSettings['Wi-Fi'], '9.9.9.9');
-  fail = false;
-  context.restoreDns();
-  assert.equal(Object.keys(context.originalDnsSettings).length, 0);
-});
-
-function stopContext(overrides = {}, realDns = false) {
+function stopContext(overrides = {}) {
   const calls = [];
   const bindings = {
     process: { platform: 'darwin' },
     cancelRequested: false,
     elevatedCancelFile: null,
-    originalDnsSettings: {},
-    disableSystemProxy: () => calls.push('proxy-off'),
-    restoreDns: () => ({ ok: true }),
+    macNetworkSettings: { restore: () => { calls.push('network-restore'); return { ok: true }; } },
     prepareHostsRemoval: () => ({ changed: true }),
     disableQuicBlock: async () => ({ ok: true }),
     applyHostsRemovalWindows: () => ({ ok: true }),
@@ -81,10 +47,10 @@ function stopContext(overrides = {}, realDns = false) {
     clearError: () => calls.push('clear-error'),
     updateTrayMenu: () => {},
     sendStatus: () => calls.push('status'),
-    sendLog: () => {},
+    sendLog: (event) => calls.push(event),
     ...overrides
   };
-  return { calls, context: loadFunctions(realDns ? ['restoreDns', 'performStopProxy'] : ['performStopProxy'], bindings) };
+  return { calls, context: loadFunctions(['performStopProxy', 'logPendingNetworkRestore'], bindings) };
 }
 
 test('performStopProxy waits for macOS cleanup before reporting success', async () => {
@@ -96,7 +62,7 @@ test('performStopProxy waits for macOS cleanup before reporting success', async 
   await Promise.resolve();
   assert.equal(context.cancelRequested, true);
   assert.equal(settled, false, 'disconnect must await the elevated cleanup callback');
-  assert.deepEqual(calls, ['proxy-off', 'child-kill']);
+  assert.deepEqual(calls, ['network-restore', 'child-kill']);
   finishCleanup({ ok: true });
   const result = await stopped;
   assert.equal(result.success, true);
@@ -122,16 +88,23 @@ for (const platformCleanup of ['mac', 'windows']) {
   });
 }
 
-test('performStopProxy reports failed DNS restoration and retains the original DNS for retry', async () => {
+test('performStopProxy treats failed macOS network restoration as a cleanup failure', async () => {
   const { context } = stopContext({
-    originalDnsSettings: { 'Wi-Fi': '9.9.9.9' },
-    execSync: (command) => {
-      if (command.startsWith('networksetup')) throw new Error('DNS restore denied');
-    }
-  }, true);
+    macNetworkSettings: { restore: () => ({ ok: false, error: 'DNS restore denied' }) }
+  });
   const result = await context.performStopProxy();
   assert.equal(result.success, false);
+  assert.equal(result.error, 'DNS restore denied');
   assert.equal(context.cleanupFailed, true);
   assert.equal(context.lastErrorCode, 'CLEANUP_FAILED');
-  assert.equal(context.originalDnsSettings['Wi-Fi'], '9.9.9.9');
+});
+
+test('performStopProxy warns about an unavailable network service without blocking reconnect', async () => {
+  const { calls, context } = stopContext({
+    macNetworkSettings: { restore: () => ({ ok: true, pendingService: true }) }
+  });
+  const result = await context.performStopProxy();
+  assert.equal(result.success, true);
+  assert.equal(context.cleanupFailed, false);
+  assert.ok(calls.some((call) => call.type === 'warning' && call.message.includes('недоступна')));
 });
