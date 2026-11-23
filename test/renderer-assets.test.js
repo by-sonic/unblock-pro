@@ -19,6 +19,10 @@ const css = fs.readFileSync(path.join(rendererDir, 'styles.css'), 'utf8');
 const html = fs.readFileSync(path.join(rendererDir, 'index.html'), 'utf8');
 const js = fs.readFileSync(path.join(rendererDir, 'renderer.js'), 'utf8');
 
+test('the port save button invokes the renderer handler', () => {
+  assert.match(js, /savePortBtn\.addEventListener\('click',\s*saveProxyPort\)/);
+});
+
 // Braces inside strings, comments and url() would confuse a naive count; the
 // stylesheet uses none of those with braces, so a plain scan is honest here.
 function braceDepth(text) {

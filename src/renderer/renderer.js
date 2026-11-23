@@ -155,6 +155,7 @@ function setupEventListeners() {
   closeBtn.addEventListener('click', () => window.api.closeWindow());
   connectBtn.addEventListener('click', handleConnectClick);
   saveTargetBtn.addEventListener('click', saveCustomTarget);
+  savePortBtn.addEventListener('click', saveProxyPort);
   
   autostartToggle.addEventListener('change', async () => {
     await window.api.setAutoStart(autostartToggle.checked);
