@@ -1,0 +1,57 @@
+name: Verify released macOS Firefox and SOCKS behaviour
+on:
+  push:
+    branches: [qa/macos-firefox-issues-20261122]
+permissions:
+  contents: read
+jobs:
+  firefox:
+    runs-on: macos-15-intel
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch published Intel runtimes and verify asset digests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP"
+          for v in 2.0.26 2.0.31; do
+            file="UnblockPro-$v-mac-x64.zip"
+            gh release download "v$v" -R by-sonic/unblock-pro -p "$file"
+            sha=$(gh release view "v$v" -R by-sonic/unblock-pro --json assets --jq ".assets[] | select(.name==\"$file\") | .digest")
+            test "sha256:$(shasum -a 256 "$file" | cut -d' ' -f1)" = "$sha"
+            unzip -p "$file" '*/Contents/Resources/bin/tpws' > "tpws-$v"
+            chmod +x "tpws-$v"
+            file "tpws-$v"
+            codesign --verify "tpws-$v"
+          done
+      - name: Qualify macOS app strategy arguments, custom target, recovery and privilege request count
+        run: |
+          node --test test/proxy-port.test.js test/macos-cleanup.test.js test/mac-network-settings.test.js test/custom-target.test.js test/connectivity-probes.test.js
+          node scripts/check-mac-runtime.js "$RUNNER_TEMP/tpws-2.0.31"
+          python3 qa/strategies.py
+      - name: Prepare real Firefox and WebDriver before switching system proxy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -x /Applications/Firefox.app/Contents/MacOS/firefox ]; then
+            curl -fsSL --retry 2 'https://download.mozilla.org/?product=firefox-latest-ssl&os=osx&lang=en-US' -o "$RUNNER_TEMP/firefox.dmg"
+            hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/firefox-mount" "$RUNNER_TEMP/firefox.dmg"
+            export FIREFOX_BIN="$RUNNER_TEMP/firefox-mount/Firefox.app/Contents/MacOS/firefox"
+          else
+            export FIREFOX_BIN=/Applications/Firefox.app/Contents/MacOS/firefox
+          fi
+          echo "FIREFOX_BIN=$FIREFOX_BIN" >> "$GITHUB_ENV"
+          "$FIREFOX_BIN" --version
+          url=$(gh api repos/mozilla/geckodriver/releases/latest --jq '.assets[] | select(.name|endswith("-macos.tar.gz")) | .browser_download_url')
+          curl -fsSL --retry 2 "$url" -o "$RUNNER_TEMP/driver.tar.gz"
+          tar -xzf "$RUNNER_TEMP/driver.tar.gz" -C "$RUNNER_TEMP" geckodriver
+          "$RUNNER_TEMP/geckodriver" --version
+          python3 -m venv "$RUNNER_TEMP/webdriver"
+          "$RUNNER_TEMP/webdriver/bin/pip" -q install selenium
+      - name: Firefox system proxy with remote DNS against before and after releases
+        run: |
+          sw_vers
+          "$RUNNER_TEMP/webdriver/bin/python" qa/firefox.py
